@@ -260,6 +260,8 @@ class SSAHeritageTests(unittest.TestCase):
         self.assertTrue(result.valid, result.diagnostics)
         self.assertTrue(call.memory_clobber)
         self.assertTrue(call.call_effect_values)
+        self.assertIn("param_1", dict(call.call_argument_values))
+        self.assertTrue(dict(call.call_argument_values)["param_1"])
         effects = [result.value(value) for value in call.call_effect_values]
         self.assertTrue(any(value.kind == "call_return" for value in effects))
         self.assertTrue(any(value.kind == "call_stack_restore" for value in effects))

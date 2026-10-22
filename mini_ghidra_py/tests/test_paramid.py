@@ -225,6 +225,45 @@ class ParamIDTests(unittest.TestCase):
                 decompiler._paramid_analysis.measurements["param_1"].indirect_uses,
                 1,
             )
+            ssa_graph = decompiler.paramid_ssa_graph
+            self.assertIsNotNone(ssa_graph)
+            assert ssa_graph is not None
+            self.assertGreaterEqual(ssa_graph.measure("param_1").indirect_uses, 1)
+
+    def test_semantic_paramid_consumes_complete_ssa_pcode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "paramid-ssa.bin"
+            path.write_bytes(bytes.fromhex("48 89 f8 c3"))  # mov rax, rdi; ret
+            image = BinaryImage.load(path, raw_arch="x86_64", base=0x405800)
+            analyzer = Analyzer(image)
+            function = analyzer.functions[0x405800]
+            decompiler = SemanticDecompiler(analyzer)
+
+            decompiler.decompile(function)
+
+            analysis = decompiler._paramid_analysis
+            graph = decompiler.paramid_ssa_graph
+            self.assertIsNotNone(graph)
+            assert graph is not None
+            self.assertTrue(analysis.uses_ssa_pcode)
+            self.assertIs(analysis.graph, graph)
+            self.assertIs(graph.ssa_function, decompiler.ssa_function)
+            self.assertEqual(
+                graph.ssa_operation_count, len(decompiler.ssa_function.operations)
+            )
+            self.assertEqual(
+                sum(operation.evidence.startswith("ssa-pcode:") for operation in graph.ops),
+                graph.ssa_operation_count,
+            )
+            self.assertTrue(
+                any(
+                    operation.evidence == "ssa-abi-return-registers"
+                    for operation in graph.ops
+                )
+            )
+            measurement = analysis.measurements["param_1"]
+            self.assertEqual(measurement.rank, ParamRank.DIRECT_READ)
+            self.assertGreaterEqual(measurement.return_uses, 1)
 
     def test_call_flow_keeps_arguments_and_return_definition_distinct(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -254,6 +293,19 @@ class ParamIDTests(unittest.TestCase):
                     == call_flow.call_result
                     for index in call_flow.operation_indices
                 )
+            )
+            ssa_graph = decompiler.paramid_ssa_graph
+            self.assertIsNotNone(ssa_graph)
+            assert ssa_graph is not None
+            self.assertTrue(
+                any(
+                    operation.evidence.startswith("ssa-abi-call-argument:")
+                    for operation in ssa_graph.ops
+                )
+            )
+            self.assertGreaterEqual(
+                decompiler._paramid_analysis.measurements["param_2"].call_uses,
+                1,
             )
             self.assertTrue(
                 all(not trial.used for trial in decompiler._paramid_active.trials)

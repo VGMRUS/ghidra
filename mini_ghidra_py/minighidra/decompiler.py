@@ -30,6 +30,7 @@ except ImportError as exc:  # pragma: no cover - declared package dependency
 
 from .abi import (
     CallingConvention,
+    abi_argument_registers,
     calling_convention_for,
     callsite_register_writes,
     callsite_stack_writes,
@@ -45,7 +46,7 @@ from .model import (
 from .paramid import ParamActive, ParamIDAnalysis, ParamRank, PcodeLikeGraph
 from .prototype import PrototypeResolver
 from .sleigh import SleighInstruction, SleighTranslator, SleighVarnode
-from .ssa import SSAFunction, SSAHeritage
+from .ssa import SSAFunction, SSAHeritage, SSALocation
 from .typesys import StorageLocation, TypeDatabase, TypeKind
 
 
@@ -473,6 +474,13 @@ class SemanticDecompiler:
         return self._paramid_graph
 
     @property
+    def paramid_ssa_graph(self) -> PcodeLikeGraph | None:
+        """SSA p-code graph consumed by ParamID, if the last run built one."""
+        if self._paramid_analysis is None or not self._paramid_analysis.uses_ssa_pcode:
+            return None
+        return self._paramid_analysis.graph
+
+    @property
     def paramid_trials(self) -> ParamActive:
         """Expose active/selected/final-use trial state for inspection."""
         return self._paramid_active
@@ -510,6 +518,9 @@ class SemanticDecompiler:
             return_registers=(
                 *self._calling_convention.integer_return_registers,
                 *self._calling_convention.floating_return_registers,
+            ),
+            call_argument_registers=abi_argument_registers(
+                self._calling_convention
             ),
             no_return_calls=(
                 instruction.address
@@ -7253,9 +7264,73 @@ class SemanticDecompiler:
                     break
         return result
 
+    def _ssa_paramid_input_locations(
+        self,
+    ) -> tuple[dict[SSALocation, str], dict[str, int]]:
+        """Name the machine-state bytes that hold incoming ABI parameters."""
+        locations: dict[SSALocation, str] = {}
+        widths: dict[str, int] = {}
+
+        def bind(register: str, name: str) -> None:
+            varnode = self._sleigh_translator.registers.get(register.lower())
+            if varnode is None or not varnode.is_register:
+                return
+            widths[name] = max(widths.get(name, 0), varnode.size_bits)
+            for byte_offset in range(varnode.size):
+                locations.setdefault(
+                    SSALocation("register", varnode.offset + byte_offset), name
+                )
+
+        for name, register in abi_argument_registers(self._calling_convention):
+            bind(register, name)
+        return locations, widths
+
+    def _ssa_paramid_return_registers(self) -> tuple[str, ...]:
+        """Limit return sinks to the class/width selected by the inferred C type."""
+        if not self._saw_value_return:
+            return ()
+        type_name = (self._return_type or "").strip()
+        try:
+            return_type = self._type_database.resolve(type_name)
+        except KeyError:
+            return_type = None
+        if return_type is not None and return_type.kind in {
+            TypeKind.FLOAT,
+            TypeKind.VECTOR,
+        }:
+            registers = self._calling_convention.floating_return_registers[:1]
+        else:
+            registers = self._calling_convention.integer_return_registers
+            if return_type is None or return_type.size <= self.pointer_size:
+                registers = registers[:1]
+            else:
+                registers = registers[:2]
+        families: list[str] = []
+        for register in registers:
+            alias = self._register_alias(register)
+            name = alias[0] if alias is not None else register.lower()
+            if name.startswith(("xmm", "ymm", "zmm")):
+                match = re.match(r"(?:xmm|ymm|zmm)(\d+)", name)
+                if match is not None:
+                    name = f"xmm{match.group(1)}"
+            families.append(name)
+        return tuple(dict.fromkeys(families))
+
     def _parameter_specs(self, body: list[str]) -> list[FunctionParameter]:
         del body  # Candidate inputs come from the lifted value graph, not C text.
-        self._paramid_analysis = ParamIDAnalysis(self._paramid_graph)
+        paramid_graph = self._paramid_graph
+        if self._ssa_function is not None and self._ssa_function.valid:
+            parameter_locations, parameter_widths = (
+                self._ssa_paramid_input_locations()
+            )
+            paramid_graph = PcodeLikeGraph.from_ssa(
+                self._ssa_function,
+                parameter_locations,
+                parameter_widths=parameter_widths,
+                return_registers=self._ssa_paramid_return_registers(),
+                supplemental_graph=self._paramid_graph,
+            )
+        self._paramid_analysis = ParamIDAnalysis(paramid_graph)
         self._paramid_active = self._paramid_analysis.analyze()
         for trial in self._paramid_active.active_trials:
             self._used_parameter_names.add(trial.name)
@@ -7442,6 +7517,16 @@ class SemanticDecompiler:
         inference_evidence = {"parameters-from-live-in-dataflow"}
         if self._paramid_analysis is not None:
             inference_evidence.add("pcode-like-paramid-analysis")
+            if self._paramid_analysis.uses_ssa_pcode:
+                inference_evidence.add("ssa-pcode-paramid-analysis")
+                inference_evidence.add(
+                    "ssa-pcode-paramid-operations:"
+                    f"{self._paramid_analysis.graph.ssa_operation_count}"
+                )
+                if self._paramid_analysis.valid is False:
+                    inference_evidence.add("ssa-pcode-paramid-invalid-ssa")
+                if self._paramid_analysis.complete is False:
+                    inference_evidence.add("ssa-pcode-paramid-incomplete-cfg")
             inference_evidence.add(
                 "pcode-like-paramid-active-trials:"
                 f"{len(self._paramid_active.active_trials)}"

@@ -23,7 +23,12 @@ except ImportError as exc:  # pragma: no cover - dependency declared by the pack
         "Falta Capstone. Instálalo con: python -m pip install capstone"
     ) from exc
 
-from .abi import CallingConvention, calling_convention_by_name, calling_convention_for
+from .abi import (
+    CallingConvention,
+    abi_argument_registers,
+    calling_convention_by_name,
+    calling_convention_for,
+)
 from .function_starts import FunctionStartCandidate, find_function_start_candidates
 from .model import (
     AddressTable,
@@ -1251,6 +1256,7 @@ class Analyzer:
                 *convention.integer_return_registers,
                 *convention.floating_return_registers,
             ),
+            call_argument_registers=abi_argument_registers(convention),
             no_return_calls=(
                 instruction.address
                 for instruction in target.instructions

@@ -1,23 +1,22 @@
-"""Bounded ParamTrial/ParamActive-inspired analysis over expression p-code.
+"""Bounded ParamID-style walks over SLEIGH SSA p-code and compatibility data.
 
-The graph is deliberately smaller than Ghidra's real p-code graph: it records
-symbolic expression dependencies, MULTIEQUAL-like merges, instruction-level
-register/memory use-def summaries, and call/parameter-use sites produced by the
-semantic decompiler. Exact SLEIGH ops can be attached as separate per-instruction
-data, but this graph is not their lifter or a port of Ghidra's complete
-prototype-recovery pipeline.
+The primary graph preserves each operation/value from the Python SSA builder;
+a reduced symbolic graph remains supplemental for call-spec and stack evidence
+that the current SSA model does not resolve. Neither layer implements Ghidra's
+full heritage, type recovery, or prototype-recovery pipeline.
 """
 
 from __future__ import annotations
 
 import re
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
 from .sleigh import SleighInstruction, SleighPcodeOp
+from .ssa import SSAFunction, SSALocation
 from .typesys import StorageLocation
 
 _PARAM_NAME = re.compile(r"(?:float_)?param_\d+\Z")
@@ -49,7 +48,7 @@ class ParamRank(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class PcodeVarnode:
-    """A named value in the reduced p-code-like graph."""
+    """A named value from either the SSA graph or compatibility graph."""
 
     identifier: int
     name: str
@@ -59,7 +58,7 @@ class PcodeVarnode:
 
 @dataclass(frozen=True, slots=True)
 class PcodeOp:
-    """One expression definition, merge, or terminal use in the reduced graph."""
+    """One SSA p-code op, compatibility definition, merge, or use sink."""
 
     opcode: str
     inputs: tuple[int, ...]
@@ -68,6 +67,7 @@ class PcodeOp:
     terminal_rank: ParamRank | None = None
     evidence: str = ""
     mnemonic: str | None = None
+    input_ranks: tuple[ParamRank | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +133,7 @@ class ParamMeasurement:
 
 @dataclass(slots=True)
 class ParamTrial:
-    """A tentative ABI input range, measured against the reduced graph."""
+    """A tentative ABI input range measured against SSA and fallback evidence."""
 
     name: str
     slot: int
@@ -297,7 +297,7 @@ class ParamActive:
 
 
 class PcodeLikeGraph:
-    """Expression DAG plus p-code-like use sites for a single function body."""
+    """SSA p-code adapter or legacy expression/use-site graph for one function."""
 
     MAX_EXPRESSION_DEPTH = 10
 
@@ -313,7 +313,280 @@ class PcodeLikeGraph:
         self._temporary_counter = 0
         self._register_versions: dict[str, int] = defaultdict(int)
         self._instruction_records: dict[int, dict[str, Any]] = {}
+        self._source_widths: dict[str, int] = {}
+        self.ssa_function: SSAFunction | None = None
+        self.supplemental_graph: PcodeLikeGraph | None = None
         self.depth_limited_uses = 0
+
+    @classmethod
+    def from_ssa(
+        cls,
+        ssa_function: SSAFunction,
+        parameter_locations: Mapping[SSALocation, str],
+        *,
+        parameter_widths: Mapping[str, int] | None = None,
+        return_registers: Iterable[str] | None = None,
+        supplemental_graph: PcodeLikeGraph | None = None,
+    ) -> PcodeLikeGraph:
+        """Adapt the complete reachable SLEIGH SSA graph for ParamID walks.
+
+        Every p-code operation, phi input, output slice, and ABI return sink
+        remains linked to the original SSA value ids. ``return_registers`` can
+        restrict candidate sinks to families selected by the inferred return
+        type. ``supplemental_graph`` is only for evidence not yet represented by
+        SLEIGH SSA (notably outgoing stack arguments and call-spec locations).
+        """
+        graph = cls()
+        graph.ssa_function = ssa_function
+        graph.supplemental_graph = supplemental_graph
+        graph._source_widths = {
+            name: max(1, width) for name, width in (parameter_widths or {}).items()
+        }
+        for value in ssa_function.values:
+            name = (
+                parameter_locations.get(value.storage)
+                if value.kind == "input" and value.storage is not None
+                else None
+            )
+            size_bits = value.size_bits
+            if name is not None:
+                size_bits = max(size_bits, graph._source_widths.get(name, 1))
+                graph._source_widths[name] = max(
+                    graph._source_widths.get(name, 1), size_bits
+                )
+                graph._source_nodes[name].add(value.identifier)
+            graph.nodes.append(
+                PcodeVarnode(
+                    value.identifier,
+                    name or value.name,
+                    size_bits,
+                    "input" if name is not None else value.kind,
+                )
+            )
+
+        for item in ssa_function.blocks:
+            if item.reachable:
+                graph.begin_instruction(item.instruction_address, item.instruction_mnemonic)
+
+        values_by_id = ssa_function.value_by_id
+        callother_passthrough_sources: dict[int, int] = {}
+        round_width_by_mnemonic = {
+            "roundss": 4,
+            "roundsd": 8,
+            "roundps": 16,
+            "roundpd": 16,
+        }
+        for operation in ssa_function.operations:
+            mnemonic = operation.instruction_mnemonic.lower()
+            round_source_bytes = (
+                round_width_by_mnemonic.get(mnemonic)
+                if operation.opcode == "CALLOTHER"
+                else None
+            )
+            is_round_userop = round_source_bytes is not None
+            inputs: list[int] = []
+            input_ranks: list[ParamRank | None] = []
+            for input_index, operand in enumerate(operation.inputs):
+                if operand.kind in {"constant", "address", "memory"}:
+                    continue
+                input_values = operand.values
+                if operation.opcode == "SUBPIECE" and input_index == 0:
+                    byte_offset = (
+                        operation.inputs[1].constant
+                        if len(operation.inputs) > 1
+                        and operation.inputs[1].constant is not None
+                        else 0
+                    )
+                    output_bits = (
+                        values_by_id[operation.output_value].size_bits
+                        if operation.output_value is not None
+                        else operand.size_bits
+                    )
+                    output_bytes = max(1, (output_bits + 7) // 8)
+                    input_values = input_values[
+                        byte_offset : byte_offset + output_bytes
+                    ]
+                rank = (
+                    None
+                    if is_round_userop
+                    else _ssa_input_rank(
+                        operation.opcode,
+                        input_index,
+                        input_values,
+                        operation.output_value is not None,
+                    )
+                )
+                inputs.extend(input_values)
+                input_ranks.extend(rank for _ in input_values)
+            graph._set_definition(
+                PcodeOp(
+                    operation.opcode,
+                    tuple(inputs),
+                    operation.output_value,
+                    address=operation.instruction_address,
+                    evidence=f"ssa-pcode:{operation.opcode.lower()}",
+                    mnemonic=operation.instruction_mnemonic,
+                    input_ranks=(
+                        tuple(input_ranks)
+                        if is_round_userop or any(
+                            rank is not None for rank in input_ranks
+                        )
+                        else ()
+                    ),
+                )
+            )
+            if is_round_userop and len(operation.inputs) > 2:
+                destination_values = (
+                    operation.inputs[1].values
+                    if len(operation.inputs) > 1
+                    else ()
+                )
+                source_values = operation.inputs[2].values[:round_source_bytes]
+                for byte_index, value_id in enumerate(source_values):
+                    if byte_index < len(operation.output_parts):
+                        callother_passthrough_sources[
+                            operation.output_parts[byte_index]
+                        ] = value_id
+                if mnemonic in {"roundss", "roundsd"}:
+                    for byte_index in range(
+                        round_source_bytes,
+                        min(len(destination_values), len(operation.output_parts)),
+                    ):
+                        callother_passthrough_sources[
+                            operation.output_parts[byte_index]
+                        ] = destination_values[byte_index]
+                if source_values:
+                    graph._append_operation(
+                        PcodeOp(
+                            "CALLOTHER_INPUT",
+                            tuple(source_values),
+                            address=operation.instruction_address,
+                            terminal_rank=ParamRank.DIRECT_READ,
+                            evidence="ssa-round-source-read",
+                            mnemonic=operation.instruction_mnemonic,
+                        )
+                    )
+            for argument_name, value_ids in operation.call_argument_values:
+                defined_values = tuple(
+                    value_id
+                    for value_id in value_ids
+                    if values_by_id[value_id].kind not in {"input", "memory_input"}
+                )
+                if defined_values:
+                    graph._append_operation(
+                        PcodeOp(
+                            "CALL",
+                            tuple(dict.fromkeys(defined_values)),
+                            address=operation.instruction_address,
+                            terminal_rank=ParamRank.SUBFUNCTION_PARAMETER,
+                            evidence=f"ssa-abi-call-argument:{argument_name}",
+                            mnemonic=operation.instruction_mnemonic,
+                        )
+                    )
+
+        blocks = ssa_function.block_by_id
+        for value in ssa_function.values:
+            address = value.instruction_address
+            mnemonic = None
+            if value.block_id is not None and value.block_id in blocks:
+                block = blocks[value.block_id]
+                address = address or block.instruction_address
+                mnemonic = block.instruction_mnemonic
+            if value.kind == "phi":
+                graph._set_definition(
+                    PcodeOp(
+                        "MULTIEQUAL",
+                        tuple(incoming for _predecessor, incoming in value.incoming),
+                        value.identifier,
+                        address=address,
+                        evidence="ssa-phi",
+                        mnemonic=mnemonic,
+                    )
+                )
+            elif value.kind == "slice" and value.source is not None:
+                pass_through = callother_passthrough_sources.get(value.identifier)
+                if pass_through is None:
+                    graph._set_definition(
+                        PcodeOp(
+                            "SUBPIECE",
+                            (value.source,),
+                            value.identifier,
+                            address=address,
+                            evidence="ssa-byte-slice",
+                            mnemonic=mnemonic,
+                            input_ranks=(None,),
+                        )
+                    )
+                else:
+                    graph._set_definition(
+                        PcodeOp(
+                            "COPY",
+                            (pass_through,),
+                            value.identifier,
+                            address=address,
+                            evidence="ssa-callother-passthrough",
+                            mnemonic=mnemonic,
+                            input_ranks=(None,),
+                        )
+                    )
+            elif value.kind == "call_stack_restore" and value.source is not None:
+                graph._set_definition(
+                    PcodeOp(
+                        "COPY",
+                        (value.source,),
+                        value.identifier,
+                        address=address,
+                        evidence="ssa-call-stack-restore",
+                        mnemonic=mnemonic,
+                        input_ranks=(None,),
+                    )
+                )
+            elif value.kind in {"call_return", "call_clobber"}:
+                graph._set_definition(
+                    PcodeOp(
+                        "CALL_RESULT",
+                        (),
+                        value.identifier,
+                        address=address,
+                        evidence=f"ssa-{value.kind}",
+                        mnemonic=mnemonic,
+                    )
+                )
+
+        allowed_return_registers = (
+            None
+            if return_registers is None
+            else {register.lower() for register in return_registers}
+        )
+        for site in ssa_function.return_sites:
+            return_values = tuple(
+                value_id
+                for register, operand in site.register_values
+                if allowed_return_registers is None
+                or register.lower() in allowed_return_registers
+                for value_id in operand.values
+                if values_by_id[value_id].kind not in {"input", "memory_input"}
+            )
+            if return_values:
+                graph._append_operation(
+                    PcodeOp(
+                        "RETURN",
+                        tuple(dict.fromkeys(return_values)),
+                        address=site.instruction_address,
+                        terminal_rank=ParamRank.FUNCTION_RETURN,
+                        evidence="ssa-abi-return-registers",
+                        mnemonic="ret",
+                    )
+                )
+        return graph
+
+    @property
+    def is_ssa_backed(self) -> bool:
+        return self.ssa_function is not None
+
+    @property
+    def ssa_operation_count(self) -> int:
+        return len(self.ssa_function.operations) if self.ssa_function else 0
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -664,6 +937,19 @@ class PcodeLikeGraph:
         best = ParamRank.UNREFERENCED
         direct_reads = call_uses = return_uses = indirect_uses = 0
         depth_limited = False
+
+        def count_rank(rank: ParamRank) -> None:
+            nonlocal best, direct_reads, call_uses, return_uses, indirect_uses
+            best = min(best, rank)
+            if rank == ParamRank.DIRECT_READ:
+                direct_reads += 1
+            elif rank == ParamRank.SUBFUNCTION_PARAMETER:
+                call_uses += 1
+            elif rank == ParamRank.FUNCTION_RETURN:
+                return_uses += 1
+            elif rank == ParamRank.INDIRECT:
+                indirect_uses += 1
+
         while queue:
             node, depth = queue.popleft()
             if node in visited:
@@ -681,6 +967,14 @@ class PcodeLikeGraph:
                     if operation.output not in visited:
                         queue.append((operation.output, depth + 1))
                     continue
+                if operation.evidence in {
+                    "ssa-byte-slice",
+                    "ssa-call-stack-restore",
+                    "ssa-callother-passthrough",
+                }:
+                    if operation.output is not None:
+                        queue.append((operation.output, depth + 1))
+                    continue
                 if operation.opcode == "CALL" and operation.terminal_rank is None:
                     # The structural call's result is not derived from its
                     # caller-side arguments. Ranked CALL sinks are distinct ops.
@@ -688,25 +982,31 @@ class PcodeLikeGraph:
                 if operation.opcode == "LOAD":
                     # A load consumes its address indirectly; its result is not
                     # a copy of that address. Stack-content loads use LOAD_STACK.
-                    best = min(best, ParamRank.INDIRECT)
-                    indirect_uses += 1
+                    count_rank(ParamRank.INDIRECT)
                     continue
                 if operation.terminal_rank is not None:
-                    best = min(best, operation.terminal_rank)
-                    if operation.terminal_rank == ParamRank.DIRECT_READ:
-                        direct_reads += 1
-                    elif operation.terminal_rank == ParamRank.SUBFUNCTION_PARAMETER:
-                        call_uses += 1
-                    elif operation.terminal_rank == ParamRank.FUNCTION_RETURN:
-                        return_uses += 1
-                    elif operation.terminal_rank == ParamRank.INDIRECT:
-                        indirect_uses += 1
+                    count_rank(operation.terminal_rank)
+                    continue
+                if operation.input_ranks:
+                    matched_ranks = tuple(
+                        dict.fromkeys(
+                            operation.input_ranks[index]
+                            for index, input_node in enumerate(operation.inputs)
+                            if input_node == node
+                            and index < len(operation.input_ranks)
+                        )
+                    )
+                    for rank in matched_ranks:
+                        if rank is not None:
+                            count_rank(rank)
                     continue
                 if operation.output is not None:
-                    # ParamMeasure treats ordinary p-code consumers as direct
-                    # reads; only MULTIEQUAL is followed through as a merge.
-                    best = min(best, ParamRank.DIRECT_READ)
-                    direct_reads += 1
+                    # A normal p-code consumer reads its input. The SSA-backed
+                    # walk also follows the result to recover later call/return
+                    # sinks reached through COPY, arithmetic, and phi values.
+                    count_rank(ParamRank.DIRECT_READ)
+                    if self.is_ssa_backed and operation.output not in visited:
+                        queue.append((operation.output, depth + 1))
 
         return ParamMeasurement(
             name=name,
@@ -894,23 +1194,79 @@ class PcodeLikeGraph:
 
 
 class ParamIDAnalysis:
-    """Build trial rankings and an active-input set from a p-code-like graph."""
+    """Build trial rankings over exact SSA p-code, with a reduced-graph fallback."""
 
     def __init__(self, graph: PcodeLikeGraph, max_depth: int = 10) -> None:
         self.graph = graph
+        self.supplemental_graph = graph.supplemental_graph
         self.max_depth = max(1, max_depth)
         self.input_active = ParamActive()
         self.measurements: dict[str, ParamMeasurement] = {}
 
+    @property
+    def uses_ssa_pcode(self) -> bool:
+        return self.graph.is_ssa_backed
+
+    @property
+    def valid(self) -> bool | None:
+        if self.graph.ssa_function is None:
+            return None
+        return self.graph.ssa_function.valid
+
+    @property
+    def complete(self) -> bool | None:
+        if self.graph.ssa_function is None:
+            return None
+        return self.graph.ssa_function.complete
+
     def analyze(self) -> ParamActive:
         self.input_active = ParamActive()
         self.measurements = {}
-        for name in self.graph.parameter_names:
-            measurement = self.graph.measure(name, self.max_depth)
+        names = set(self.graph.parameter_names)
+        if self.supplemental_graph is not None:
+            names.update(self.supplemental_graph.parameter_names)
+        for name in sorted(names, key=_parameter_order):
+            measurement = self._measure(name)
             self.measurements[name] = measurement
-            trial = self.input_active.register_trial(name, _source_width(self.graph, name))
+            width = _source_width(self.graph, name)
+            if self.supplemental_graph is not None:
+                width = max(width, _source_width(self.supplemental_graph, name))
+            trial = self.input_active.register_trial(name, width)
             self._apply_measurement(trial, measurement)
         return self.input_active
+
+    def _measure(self, name: str) -> ParamMeasurement:
+        primary = self.graph.measure(name, self.max_depth)
+        fallback_graph = self.supplemental_graph
+        if fallback_graph is None or name not in fallback_graph.parameter_names:
+            return primary
+        fallback = fallback_graph.measure(name, self.max_depth)
+        if primary.rank == ParamRank.UNREFERENCED:
+            rank = fallback.rank
+        else:
+            rank = primary.rank
+            # Full SSA p-code is authoritative for ordinary reads and memory
+            # indirection. The compatibility graph only contributes call/return
+            # sinks that SSA's current CALL model does not encode as inputs.
+            if fallback.call_uses:
+                rank = min(rank, ParamRank.SUBFUNCTION_PARAMETER)
+            if fallback.return_uses:
+                rank = min(rank, ParamRank.FUNCTION_RETURN)
+        primary_is_active = primary.rank != ParamRank.UNREFERENCED
+        return ParamMeasurement(
+            name,
+            rank,
+            direct_reads=(
+                primary.direct_reads if primary_is_active else fallback.direct_reads
+            ),
+            call_uses=max(primary.call_uses, fallback.call_uses),
+            return_uses=max(primary.return_uses, fallback.return_uses),
+            indirect_uses=(
+                primary.indirect_uses if primary_is_active else fallback.indirect_uses
+            ),
+            traversed_nodes=primary.traversed_nodes + fallback.traversed_nodes,
+            depth_limited=primary.depth_limited or fallback.depth_limited,
+        )
 
     def bind_parameters(self, parameters: Iterable[Any]) -> ParamActive:
         """Attach resolved ABI storage to active and positional-placeholder trials."""
@@ -955,6 +1311,32 @@ class ParamIDAnalysis:
             trial.mark_active()
         else:
             trial.mark_inactive()
+
+
+def _ssa_input_rank(
+    opcode: str,
+    input_index: int,
+    values: tuple[int, ...],
+    has_output: bool,
+) -> ParamRank | None:
+    """Classify data uses whose p-code op has no ordinary output read."""
+    if not values:
+        return None
+    if opcode == "STORE":
+        if input_index == 1:
+            return ParamRank.INDIRECT
+        if input_index == 2:
+            return ParamRank.DIRECT_READ
+        return None
+    if opcode == "LOAD":
+        return ParamRank.INDIRECT if input_index == 1 else None
+    if opcode == "CBRANCH":
+        return ParamRank.DIRECT_READ if input_index == 1 else None
+    if opcode in {"BRANCH", "BRANCHIND", "CALLIND"}:
+        return ParamRank.INDIRECT if input_index == 0 else None
+    if opcode in {"CALL", "RETURN", "IMARK"}:
+        return None
+    return ParamRank.DIRECT_READ if not has_output else None
 
 
 def _role_description(role: str) -> tuple[str, ParamRank]:

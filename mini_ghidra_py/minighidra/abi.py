@@ -218,6 +218,32 @@ WINDOWS_X64_THISCALL = replace(
 )
 
 
+def abi_argument_registers(
+    convention: CallingConvention,
+) -> tuple[tuple[str, str], ...]:
+    """Return ABI register/name pairs used to seed callsite argument snapshots."""
+    result: list[tuple[str, str]] = []
+    if convention.register_argument_groups:
+        for index, group in enumerate(convention.register_argument_groups, start=1):
+            result.extend((f"param_{index}", register) for register in group)
+    else:
+        result.extend(
+            (f"param_{index}", register)
+            for index, register in enumerate(convention.argument_registers, start=1)
+        )
+        for index, register in enumerate(
+            convention.vector_argument_registers, start=1
+        ):
+            result.append(
+                (
+                    convention.vector_parameter_name(register)
+                    or f"float_param_{index}",
+                    register,
+                )
+            )
+    return tuple(dict.fromkeys(result))
+
+
 def default_calling_convention(analyzer: Any) -> CallingConvention:
     """Return the ABI selected by Ghidra's architecture/compiler-spec defaults."""
     bits = int(analyzer.image.bits)

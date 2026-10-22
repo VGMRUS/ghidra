@@ -140,6 +140,7 @@ class SSAOperation:
     memory_clobber: bool = False
     call_effect_values: tuple[int, ...] = ()
     pcode: SleighPcodeOp | None = None
+    call_argument_values: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +255,7 @@ class SSAHeritage:
         *,
         caller_saved_registers: Iterable[str] = (),
         return_registers: Iterable[str] = (),
+        call_argument_registers: Iterable[tuple[str, str]] = (),
         no_return_calls: Iterable[int] = (),
         registers: Mapping[str, SleighVarnode] | None = None,
     ) -> None:
@@ -267,6 +269,10 @@ class SSAHeritage:
         } | {"__flags__"}
         self._return_register_names = tuple(
             dict.fromkeys(register.lower() for register in return_registers)
+        )
+        self._call_argument_registers = tuple(
+            (name, register.lower())
+            for name, register in call_argument_registers
         )
         self._return_register_order = tuple(
             dict.fromkeys(
@@ -805,6 +811,15 @@ class SSAHeritage:
                     self._uses[item.identifier].add(MEMORY_LOCATION)
 
                 if self._is_call_operation(item, operation):
+                    for _name, register in self._call_argument_registers:
+                        varnode = self._abi_registers.get(register)
+                        if varnode is None or varnode.space != "register":
+                            continue
+                        for location in self._locations_for_varnode(
+                            varnode, item.instruction_address
+                        ):
+                            if location not in seen_definitions:
+                                self._uses[item.identifier].add(location)
                     call_locations = set(self._call_register_families)
                     call_locations.update(
                         self._call_stack_locations.get(item.instruction_address, ())
@@ -987,6 +1002,23 @@ class SSAHeritage:
             self._input_values[location] = value
         return value
 
+    def _call_argument_values(
+        self, instruction_address: int
+    ) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for name, register in self._call_argument_registers:
+            varnode = self._abi_registers.get(register)
+            if varnode is None or varnode.space != "register":
+                continue
+            for location in self._locations_for_varnode(
+                varnode, instruction_address
+            ):
+                grouped[name].append(self._current_value(location))
+        return tuple(
+            (name, tuple(dict.fromkeys(values)))
+            for name, values in grouped.items()
+        )
+
     def _return_register_values(self) -> tuple[tuple[str, SSAOperand], ...]:
         locations_by_family: dict[str, list[SSALocation]] = defaultdict(list)
         for location, family in self._call_register_families.items():
@@ -1093,6 +1125,11 @@ class SSAHeritage:
                         )
                     )
                 is_call = self._is_call_operation(item, operation)
+                call_argument_values = (
+                    self._call_argument_values(item.instruction_address)
+                    if is_call
+                    else ()
+                )
                 reads_memory, writes_memory, clobbers_memory = self._memory_effects(
                     operation, item
                 )
@@ -1242,6 +1279,7 @@ class SSAHeritage:
                     memory_clobber=clobbers_memory,
                     call_effect_values=tuple(call_effect_values),
                     pcode=operation,
+                    call_argument_values=call_argument_values,
                 )
                 self._operation_list.append(ssa_operation)
                 self._operation_results[block_id].append(ssa_operation)
@@ -1472,6 +1510,15 @@ class SSAHeritage:
                         operation.block_id,
                         operation.sequence,
                         f"memory operand {operation.instruction_address:#x}",
+                    )
+            for argument_name, value_ids in operation.call_argument_values:
+                for value_id in value_ids:
+                    check_use(
+                        value_id,
+                        operation.block_id,
+                        operation.sequence,
+                        f"call argument {argument_name} "
+                        f"at {operation.instruction_address:#x}",
                     )
             for memory_value in operation.memory_inputs:
                 check_use(
