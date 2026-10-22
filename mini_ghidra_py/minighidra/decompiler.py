@@ -17,6 +17,7 @@ import math
 import re
 import struct
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
@@ -626,14 +627,39 @@ class SemanticDecompiler:
         resolved_signature = self._prototype_resolver.resolve(
             signature, self._calling_convention
         ).signature
+        if self._declared_signature is not None:
+            justproto_names = [
+                parameter.name for parameter in resolved_signature.parameters
+            ]
+            if resolved_signature.hidden_return_location is not None:
+                justproto_names.append("__hidden_return")
+            self._run_paramid_analysis(
+                justproto=True,
+                input_names=justproto_names,
+            )
+        if self._paramid_analysis is not None:
+            paramid_parameters = list(resolved_signature.parameters)
+            if (
+                self._declared_signature is not None
+                and resolved_signature.hidden_return_location is not None
+            ):
+                hidden_location = resolved_signature.hidden_return_location
+                paramid_parameters.append(
+                    FunctionParameter(
+                        "__hidden_return",
+                        f"{resolved_signature.return_type} *",
+                        locations=(hidden_location,),
+                        implicit=True,
+                    )
+                )
+            self._paramid_active = self._paramid_analysis.bind_parameters(
+                paramid_parameters
+            )
+            self._paramid_active.finalize_selected_trials()
+            resolved_signature = self._annotate_paramid_signature(
+                resolved_signature
+            )
         if self._declared_signature is None:
-            if self._paramid_analysis is not None:
-                self._paramid_active = self._paramid_analysis.bind_parameters(
-                    resolved_signature.parameters
-                )
-                resolved_signature = self._annotate_paramid_signature(
-                    resolved_signature
-                )
             resolved_signature = self._annotate_inferred_signature(
                 function, resolved_signature
             )
@@ -7281,15 +7307,36 @@ class SemanticDecompiler:
                     SSALocation("register", varnode.offset + byte_offset), name
                 )
 
-        for name, register in abi_argument_registers(self._calling_convention):
-            bind(register, name)
+        if self._declared_signature is not None:
+            for parameter in self._declared_signature.parameters:
+                for location in parameter.locations:
+                    if location.register is not None:
+                        bind(location.register, parameter.name)
+                data_type = parameter.data_type
+                if data_type is not None:
+                    widths[parameter.name] = max(
+                        widths.get(parameter.name, 0), data_type.size * 8
+                    )
+            hidden_location = self._declared_signature.hidden_return_location
+            if hidden_location is not None:
+                if hidden_location.register is not None:
+                    bind(hidden_location.register, "__hidden_return")
+                widths["__hidden_return"] = self.bits
+        else:
+            for name, register in abi_argument_registers(self._calling_convention):
+                bind(register, name)
         return locations, widths
 
     def _ssa_paramid_return_registers(self) -> tuple[str, ...]:
         """Limit return sinks to the class/width selected by the inferred C type."""
         if not self._saw_value_return:
             return ()
-        type_name = (self._return_type or "").strip()
+        type_name = (
+            self._declared_signature.return_type
+            if self._declared_signature is not None
+            else self._return_type
+            or ""
+        ).strip()
         try:
             return_type = self._type_database.resolve(type_name)
         except KeyError:
@@ -7316,8 +7363,13 @@ class SemanticDecompiler:
             families.append(name)
         return tuple(dict.fromkeys(families))
 
-    def _parameter_specs(self, body: list[str]) -> list[FunctionParameter]:
-        del body  # Candidate inputs come from the lifted value graph, not C text.
+    def _run_paramid_analysis(
+        self,
+        *,
+        justproto: bool = False,
+        input_names: Iterable[str] | None = None,
+    ) -> None:
+        """Build the SSA-first ParamID view for inferred or declared formals."""
         paramid_graph = self._paramid_graph
         if self._ssa_function is not None and self._ssa_function.valid:
             parameter_locations, parameter_widths = (
@@ -7329,12 +7381,32 @@ class SemanticDecompiler:
                 parameter_widths=parameter_widths,
                 return_registers=self._ssa_paramid_return_registers(),
                 supplemental_graph=self._paramid_graph,
+                stack_parameter_names=(
+                    self._input_parameter_names_by_stack
+                    if self._declared_signature is not None
+                    else None
+                ),
             )
         self._paramid_analysis = ParamIDAnalysis(paramid_graph)
-        self._paramid_active = self._paramid_analysis.analyze()
+        self._paramid_active = self._paramid_analysis.analyze(
+            justproto=justproto,
+            input_names=input_names,
+        )
+
+    def _parameter_specs(self, body: list[str]) -> list[FunctionParameter]:
+        del body  # Candidate inputs come from the lifted value graph, not C text.
+        self._run_paramid_analysis()
+        active_names = {
+            trial.name for trial in self._paramid_active.active_trials
+        }
         for trial in self._paramid_active.active_trials:
-            self._used_parameter_names.add(trial.name)
             self._parameter_evidence[trial.name].update(trial.evidence)
+        if self._paramid_analysis.uses_ssa_pcode:
+            # Do not let the legacy C-like propagation resurrect an input that
+            # the SSA ParamMeasure pass proved unreferenced.
+            self._used_parameter_names = active_names
+        else:
+            self._used_parameter_names.update(active_names)
 
         used = {
             int(match.group(1))

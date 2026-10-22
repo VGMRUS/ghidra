@@ -1,9 +1,10 @@
-"""Bounded ParamID-style walks over SLEIGH SSA p-code and compatibility data.
+"""Ghidra-compatible ParamID measurements over SLEIGH SSA p-code.
 
-The primary graph preserves each operation/value from the Python SSA builder;
-a reduced symbolic graph remains supplemental for call-spec and stack evidence
-that the current SSA model does not resolve. Neither layer implements Ghidra's
-full heritage, type recovery, or prototype-recovery pipeline.
+The rank walk ports ``ParamMeasure``'s directional input/output rules, bounded
+phi traversal, and loop-edge suppression. The SSA graph is authoritative for
+instruction uses; the reduced symbolic graph supplements stack-slot input
+identity and call-spec evidence not represented by raw SLEIGH p-code. This
+module does not port Ghidra's separate prototype-model resolution pipeline.
 """
 
 from __future__ import annotations
@@ -11,25 +12,29 @@ from __future__ import annotations
 import re
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from enum import IntEnum
+from dataclasses import dataclass, replace
+from enum import Enum, IntEnum
 from typing import Any
 
 from .sleigh import SleighInstruction, SleighPcodeOp
-from .ssa import SSAFunction, SSALocation
+from .ssa import SSAFunction, SSALocation, _register_family
 from .typesys import StorageLocation
 
 _PARAM_NAME = re.compile(r"(?:float_)?param_\d+\Z")
+PARAMID_MAX_DEPTH = 10
 
 
 class ParamRank(IntEnum):
-    """Input-use ranking corresponding to the useful ParamMeasure ranks."""
+    """Numeric ranks shared by ParamMeasure's input and output directions."""
 
     DIRECT_WRITE_WITHOUT_READ = 1
     DIRECT_READ = 2
+    DIRECT_WRITE_WITH_READ = 2
     DIRECT_WRITE_UNKNOWN_READ = 3
     SUBFUNCTION_PARAMETER = 4
+    THIS_FUNCTION_PARAMETER = 4
     FUNCTION_RETURN = 5
+    SUBFUNCTION_RETURN = 5
     INDIRECT = 6
     UNREFERENCED = 7
 
@@ -44,6 +49,13 @@ class ParamRank(IntEnum):
             ParamRank.INDIRECT: "indirect",
             ParamRank.UNREFERENCED: "unreferenced",
         }[self]
+
+
+class ParamDirection(str, Enum):
+    """Whether a ParamMeasure walks uses forward or definitions backward."""
+
+    INPUT = "input"
+    OUTPUT = "output"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +80,7 @@ class PcodeOp:
     evidence: str = ""
     mnemonic: str | None = None
     input_ranks: tuple[ParamRank | None, ...] = ()
+    loop_inputs: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +113,7 @@ class InstructionDataFlow:
 
 @dataclass(frozen=True, slots=True)
 class ParamMeasurement:
-    """Best input-use rank and bounded use counts for one entry value."""
+    """Directional ParamID rank and bounded use counts for one storage."""
 
     name: str
     rank: ParamRank
@@ -110,14 +123,37 @@ class ParamMeasurement:
     indirect_uses: int = 0
     traversed_nodes: int = 0
     depth_limited: bool = False
+    direction: ParamDirection = ParamDirection.INPUT
 
     @property
     def active(self) -> bool:
         return self.rank != ParamRank.UNREFERENCED
 
     @property
+    def numcalls(self) -> int:
+        """Expose Ghidra ParamMeasure's ``numcalls`` under its source name."""
+        return self.call_uses
+
+    @property
+    def rank_label(self) -> str:
+        if self.direction == ParamDirection.INPUT:
+            return self.rank.label
+        return {
+            ParamRank.DIRECT_WRITE_WITHOUT_READ: "direct-write-without-read",
+            ParamRank.DIRECT_READ: "direct-write-with-read",
+            ParamRank.DIRECT_WRITE_UNKNOWN_READ: "direct-write-unknown-read",
+            ParamRank.SUBFUNCTION_PARAMETER: "this-function-parameter",
+            ParamRank.FUNCTION_RETURN: "subfunction-return",
+            ParamRank.INDIRECT: "indirect",
+            ParamRank.UNREFERENCED: "unreferenced",
+        }[self.rank]
+
+    @property
     def evidence(self) -> tuple[str, ...]:
-        result = [f"paramid-rank:{self.rank.label}"]
+        result = [
+            f"paramid-{self.direction.value}-rank:{self.rank_label}",
+            f"paramid-rank:{self.rank_label}",
+        ]
         if self.direct_reads:
             result.append(f"paramid-direct-reads:{self.direct_reads}")
         if self.call_uses:
@@ -147,6 +183,14 @@ class ParamTrial:
     definitely_not_used: bool = False
     evidence: tuple[str, ...] = ()
     measurement: ParamMeasurement | None = None
+    unreferenced: bool = False
+    killed_by_call: bool = False
+    rem_formed: bool = False
+    indirect_created: bool = False
+    conditional_execution: bool = False
+    ancestor_realistic: bool = False
+    ancestor_solid: bool = False
+    fixed_position: int | None = None
 
     def mark_active(self) -> None:
         self.checked = True
@@ -177,6 +221,29 @@ class ParamTrial:
         self.used = False
         self.definitely_not_used = True
 
+    def mark_unreferenced(self) -> None:
+        self.unreferenced = True
+        self.checked = True
+        self.slot = -1
+
+    def mark_killed_by_call(self) -> None:
+        self.killed_by_call = True
+
+    def mark_rem_formed(self) -> None:
+        self.rem_formed = True
+
+    def mark_indirect_created(self) -> None:
+        self.indirect_created = True
+
+    def mark_conditional_execution(self) -> None:
+        self.conditional_execution = True
+
+    def mark_ancestor_realistic(self) -> None:
+        self.ancestor_realistic = True
+
+    def mark_ancestor_solid(self) -> None:
+        self.ancestor_solid = True
+
     def is_checked(self) -> bool:
         return self.checked
 
@@ -197,6 +264,13 @@ class ParamActive:
         self.recover_subcalls = recover_subcalls
         self._trials: list[ParamTrial] = []
         self._by_name: dict[str, ParamTrial] = {}
+        self._slot_base = 1
+        self._placeholder_slot: int | None = None
+        self._passes = 0
+        self._max_pass = 0
+        self._fully_checked = False
+        self._needs_final_check = False
+        self._join_most_sig_first = False
 
     @property
     def trials(self) -> tuple[ParamTrial, ...]:
@@ -214,6 +288,26 @@ class ParamActive:
     def selected_trials(self) -> tuple[ParamTrial, ...]:
         return tuple(trial for trial in self._trials if trial.selected)
 
+    @property
+    def num_passes(self) -> int:
+        return self._passes
+
+    @property
+    def max_pass(self) -> int:
+        return self._max_pass
+
+    @property
+    def fully_checked(self) -> bool:
+        return self._fully_checked
+
+    @property
+    def needs_final_check(self) -> bool:
+        return self._needs_final_check
+
+    @property
+    def join_most_sig_first(self) -> bool:
+        return self._join_most_sig_first
+
     def register_trial(
         self,
         name: str,
@@ -227,16 +321,82 @@ class ParamActive:
             found.size_bits = max(found.size_bits, size_bits)
             if supplied_locations:
                 found.locations = supplied_locations
+                if any(location.register is not None for location in supplied_locations):
+                    found.mark_killed_by_call()
             return found
         trial = ParamTrial(
             name=name,
-            slot=len(self._trials) + 1,
+            slot=self._slot_base,
             size_bits=size_bits,
             locations=supplied_locations,
         )
+        if any(location.register is not None for location in supplied_locations):
+            trial.mark_killed_by_call()
+        self._slot_base += 1
         self._trials.append(trial)
         self._by_name[name] = trial
         return trial
+
+    def clear(self) -> None:
+        """Reset all trials and ParamActive pass state."""
+        self._trials.clear()
+        self._by_name.clear()
+        self._slot_base = 1
+        self._placeholder_slot = None
+        self._passes = 0
+        self._max_pass = 0
+        self._fully_checked = False
+        self._needs_final_check = False
+        self._join_most_sig_first = False
+
+    def reregister_trial(self, old_trial: ParamTrial) -> ParamTrial:
+        """Copy a trial's state while assigning the next input slot."""
+        trial = replace(old_trial, slot=self._slot_base)
+        self._slot_base += 1
+        self._trials.append(trial)
+        self._by_name[trial.name] = trial
+        return trial
+
+    def set_max_pass(self, value: int) -> None:
+        self._max_pass = max(0, value)
+
+    def finish_pass(self) -> None:
+        self._passes += 1
+
+    def mark_fully_checked(self) -> None:
+        self._fully_checked = True
+
+    def mark_needs_final_check(self) -> None:
+        self._needs_final_check = True
+
+    def set_join_most_sig_first(self) -> None:
+        self._join_most_sig_first = True
+
+    def set_placeholder_slot(self) -> int:
+        """Reserve a positional placeholder before registering stack trials."""
+        if self._placeholder_slot is not None and self._placeholder_slot >= 0:
+            raise RuntimeError("ParamActive ya tiene un placeholder de pila")
+        self._placeholder_slot = self._slot_base
+        self._slot_base += 1
+        return self._placeholder_slot
+
+    def free_placeholder_slot(self) -> None:
+        if self._placeholder_slot is None or self._placeholder_slot < 0:
+            return
+        for trial in self._trials:
+            if trial.slot > self._placeholder_slot:
+                trial.slot -= 1
+        self._placeholder_slot = -2
+        self._slot_base = max(1, self._slot_base - 1)
+
+    def finalize_selected_trials(self) -> tuple[ParamTrial, ...]:
+        """Mark storage-backed, active selected candidates as final parameters."""
+        finalized: list[ParamTrial] = []
+        for trial in self._trials:
+            if trial.selected and trial.active and trial.locations:
+                trial.mark_used()
+                finalized.append(trial)
+        return tuple(finalized)
 
     def get_trial(self, name: str) -> ParamTrial | None:
         return self._by_name.get(name)
@@ -286,6 +446,21 @@ class ParamActive:
         self._trials.sort(key=lambda trial: _parameter_order(trial.name))
         for slot, trial in enumerate(self._trials, start=1):
             trial.slot = slot
+        self._slot_base = len(self._trials) + 1
+        self._by_name = {trial.name: trial for trial in self._trials}
+
+    def sort_by_fixed_position(self) -> None:
+        """Sort fixed variadic formals first, preserving ordinary trial order."""
+        self._trials.sort(
+            key=lambda trial: (
+                trial.fixed_position is None,
+                trial.fixed_position if trial.fixed_position is not None else 0,
+                _parameter_order(trial.name),
+            )
+        )
+        for slot, trial in enumerate(self._trials, start=1):
+            trial.slot = slot
+        self._slot_base = len(self._trials) + 1
         self._by_name = {trial.name: trial for trial in self._trials}
 
     def delete_unused_trials(self) -> None:
@@ -294,6 +469,7 @@ class ParamActive:
         self._by_name = {trial.name: trial for trial in self._trials}
         for slot, trial in enumerate(self._trials, start=1):
             trial.slot = slot
+        self._slot_base = len(self._trials) + 1
 
 
 class PcodeLikeGraph:
@@ -314,6 +490,8 @@ class PcodeLikeGraph:
         self._register_versions: dict[str, int] = defaultdict(int)
         self._instruction_records: dict[int, dict[str, Any]] = {}
         self._source_widths: dict[str, int] = {}
+        self._output_values: dict[str, set[int]] = defaultdict(set)
+        self._output_sink_operations: dict[str, set[int]] = defaultdict(set)
         self.ssa_function: SSAFunction | None = None
         self.supplemental_graph: PcodeLikeGraph | None = None
         self.depth_limited_uses = 0
@@ -327,14 +505,16 @@ class PcodeLikeGraph:
         parameter_widths: Mapping[str, int] | None = None,
         return_registers: Iterable[str] | None = None,
         supplemental_graph: PcodeLikeGraph | None = None,
+        stack_parameter_names: Mapping[int, str] | None = None,
     ) -> PcodeLikeGraph:
         """Adapt the complete reachable SLEIGH SSA graph for ParamID walks.
 
         Every p-code operation, phi input, output slice, and ABI return sink
         remains linked to the original SSA value ids. ``return_registers`` can
         restrict candidate sinks to families selected by the inferred return
-        type. ``supplemental_graph`` is only for evidence not yet represented by
-        SLEIGH SSA (notably outgoing stack arguments and call-spec locations).
+        type. ``stack_parameter_names`` binds declared stack formals to loads
+        identified by the compatibility graph; the supplement also supplies
+        outgoing stack-argument and call-spec evidence not represented by SSA.
         """
         graph = cls()
         graph.ssa_function = ssa_function
@@ -342,14 +522,78 @@ class PcodeLikeGraph:
         graph._source_widths = {
             name: max(1, width) for name, width in (parameter_widths or {}).items()
         }
+        values_by_id = ssa_function.value_by_id
+        stack_input_by_value: dict[int, set[str]] = defaultdict(set)
+        if supplemental_graph is not None:
+            legacy_source_names = {
+                node_id: name
+                for name, node_ids in supplemental_graph._source_nodes.items()
+                for node_id in node_ids
+            }
+            stack_sources_by_address: dict[int, set[str]] = defaultdict(set)
+            for legacy_operation in supplemental_graph.ops:
+                if (
+                    legacy_operation.address is None
+                    or legacy_operation.opcode not in {"LOAD_STACK", "LOAD"}
+                    or not legacy_operation.evidence.startswith("memory-read:stack[")
+                ):
+                    continue
+                source_names = {
+                    legacy_source_names[node_id]
+                    for node_id in legacy_operation.inputs
+                    if node_id in legacy_source_names
+                }
+                offset_match = re.search(
+                    r"memory-read:stack\[([+-])0x([0-9A-Fa-f]+)\]",
+                    legacy_operation.evidence,
+                )
+                if offset_match is not None and stack_parameter_names is not None:
+                    offset = int(offset_match.group(2), 16)
+                    if offset_match.group(1) == "-":
+                        offset = -offset
+                    declared_name = stack_parameter_names.get(offset)
+                    if declared_name is not None:
+                        source_names.add(declared_name)
+                stack_sources_by_address[legacy_operation.address].update(source_names)
+            ssa_load_count_by_address: dict[int, int] = defaultdict(int)
+            for operation in ssa_function.operations:
+                if operation.opcode == "LOAD":
+                    ssa_load_count_by_address[operation.instruction_address] += 1
+            for operation in ssa_function.operations:
+                if (
+                    operation.opcode != "LOAD"
+                    or operation.output_value is None
+                    or ssa_load_count_by_address[operation.instruction_address] != 1
+                ):
+                    continue
+                names = stack_sources_by_address.get(
+                    operation.instruction_address, ()
+                )
+                stack_input_by_value[operation.output_value].update(names)
+                for name in names:
+                    graph._source_widths[name] = max(
+                        graph._source_widths.get(name, 1),
+                        _source_width(supplemental_graph, name),
+                    )
+
         for value in ssa_function.values:
-            name = (
+            register_name = (
                 parameter_locations.get(value.storage)
                 if value.kind == "input" and value.storage is not None
                 else None
             )
+            source_names = (
+                (register_name,)
+                if register_name is not None
+                else tuple(
+                    sorted(
+                        stack_input_by_value.get(value.identifier, ()),
+                        key=_parameter_order,
+                    )
+                )
+            )
             size_bits = value.size_bits
-            if name is not None:
+            for name in source_names:
                 size_bits = max(size_bits, graph._source_widths.get(name, 1))
                 graph._source_widths[name] = max(
                     graph._source_widths.get(name, 1), size_bits
@@ -358,9 +602,9 @@ class PcodeLikeGraph:
             graph.nodes.append(
                 PcodeVarnode(
                     value.identifier,
-                    name or value.name,
+                    source_names[0] if source_names else value.name,
                     size_bits,
-                    "input" if name is not None else value.kind,
+                    "input" if source_names else value.kind,
                 )
             )
 
@@ -368,7 +612,6 @@ class PcodeLikeGraph:
             if item.reachable:
                 graph.begin_instruction(item.instruction_address, item.instruction_mnemonic)
 
-        values_by_id = ssa_function.value_by_id
         callother_passthrough_sources: dict[int, int] = {}
         round_width_by_mnemonic = {
             "roundss": 4,
@@ -428,9 +671,9 @@ class PcodeLikeGraph:
                     mnemonic=operation.instruction_mnemonic,
                     input_ranks=(
                         tuple(input_ranks)
-                        if is_round_userop or any(
-                            rank is not None for rank in input_ranks
-                        )
+                        if is_round_userop
+                        or operation.opcode in {"RETURN", "IMARK"}
+                        or any(rank is not None for rank in input_ranks)
                         else ()
                     ),
                 )
@@ -481,10 +724,29 @@ class PcodeLikeGraph:
                             terminal_rank=ParamRank.SUBFUNCTION_PARAMETER,
                             evidence=f"ssa-abi-call-argument:{argument_name}",
                             mnemonic=operation.instruction_mnemonic,
+                            input_ranks=tuple(
+                                ParamRank.SUBFUNCTION_PARAMETER
+                                for _value in defined_values
+                            ),
                         )
                     )
 
         blocks = ssa_function.block_by_id
+        immediate_dominators = {
+            block.identifier: block.immediate_dominator
+            for block in ssa_function.blocks
+        }
+
+        def is_loop_input(phi_block: int, predecessor: int | None) -> bool:
+            current = predecessor
+            visited_blocks: set[int] = set()
+            while current is not None and current not in visited_blocks:
+                if current == phi_block:
+                    return True
+                visited_blocks.add(current)
+                current = immediate_dominators.get(current)
+            return False
+
         for value in ssa_function.values:
             address = value.instruction_address
             mnemonic = None
@@ -501,6 +763,10 @@ class PcodeLikeGraph:
                         address=address,
                         evidence="ssa-phi",
                         mnemonic=mnemonic,
+                        loop_inputs=tuple(
+                            is_loop_input(value.block_id, predecessor)
+                            for predecessor, _incoming in value.incoming
+                        ),
                     )
                 )
             elif value.kind == "slice" and value.source is not None:
@@ -556,28 +822,35 @@ class PcodeLikeGraph:
         allowed_return_registers = (
             None
             if return_registers is None
-            else {register.lower() for register in return_registers}
+            else {_register_family(register.lower()) for register in return_registers}
         )
         for site in ssa_function.return_sites:
-            return_values = tuple(
-                value_id
-                for register, operand in site.register_values
-                if allowed_return_registers is None
-                or register.lower() in allowed_return_registers
-                for value_id in operand.values
-                if values_by_id[value_id].kind not in {"input", "memory_input"}
-            )
-            if return_values:
-                graph._append_operation(
+            for register, operand in site.register_values:
+                normalized_register = _register_family(register.lower())
+                if (
+                    allowed_return_registers is not None
+                    and normalized_register not in allowed_return_registers
+                ):
+                    continue
+                return_name = f"return_{normalized_register}"
+                return_values = tuple(dict.fromkeys(operand.values))
+                if not return_values:
+                    continue
+                graph._output_values[return_name].update(return_values)
+                sink_index = graph._append_operation(
                     PcodeOp(
                         "RETURN",
-                        tuple(dict.fromkeys(return_values)),
+                        return_values,
                         address=site.instruction_address,
                         terminal_rank=ParamRank.FUNCTION_RETURN,
                         evidence="ssa-abi-return-registers",
                         mnemonic="ret",
+                        input_ranks=tuple(
+                            ParamRank.FUNCTION_RETURN for _value in return_values
+                        ),
                     )
                 )
+                graph._output_sink_operations[return_name].add(sink_index)
         return graph
 
     @property
@@ -591,6 +864,11 @@ class PcodeLikeGraph:
     @property
     def parameter_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._source_nodes, key=_parameter_order))
+
+    @property
+    def output_names(self) -> tuple[str, ...]:
+        """Return ABI output storage names observed at reachable return sites."""
+        return tuple(sorted(self._output_values))
 
     @property
     def operation_count(self) -> int:
@@ -852,6 +1130,12 @@ class PcodeLikeGraph:
                 address=address,
                 evidence=evidence,
                 mnemonic=mnemonic,
+                input_ranks=(
+                    (ParamRank.DIRECT_READ,) if target_node is not None else ()
+                )
+                + tuple(
+                    ParamRank.SUBFUNCTION_PARAMETER for _argument in argument_nodes
+                ),
             )
         )
         record = self._instruction_record(address, mnemonic)
@@ -867,9 +1151,14 @@ class PcodeLikeGraph:
         values: Iterable[Any],
         size_bits: int,
         address: int | None = None,
+        *,
+        loop_inputs: Iterable[bool] = (),
     ) -> None:
-        """Add/update a MULTIEQUAL-like definition for a CFG merge value."""
+        """Add/update a MULTIEQUAL with optional loop-backedge annotations."""
         value_list = tuple(values)
+        loop_flags = tuple(loop_inputs)
+        if loop_flags and len(loop_flags) != len(value_list):
+            raise ValueError("loop_inputs debe tener un flag por cada entrada phi")
         output = self._variable_node(name, size_bits, "merge")
         inputs = tuple(
             self._materialize(value, 0, self._expression_sources(value))
@@ -880,7 +1169,13 @@ class PcodeLikeGraph:
         ) if value_list else set()
         self._source_names[name].update(sources)
         self._set_definition(
-            PcodeOp("MULTIEQUAL", inputs, output, address=address)
+            PcodeOp(
+                "MULTIEQUAL",
+                inputs,
+                output,
+                address=address,
+                loop_inputs=loop_flags,
+            )
         )
 
     def record_use(
@@ -917,106 +1212,225 @@ class PcodeLikeGraph:
                 terminal_rank=rank,
                 evidence=evidence,
                 mnemonic=mnemonic,
+                input_ranks=(rank,),
             )
         )
 
     def measure(self, name: str, max_depth: int = 10) -> ParamMeasurement:
-        """Walk forward from entry varnodes using bounded ParamMeasure ranks."""
+        """Measure an input by Ghidra's forward ``walkforward`` rank rules."""
         starts = self._source_nodes.get(name, set())
         if not starts:
             return ParamMeasurement(name, ParamRank.UNREFERENCED)
+        result = self._walk_forward(
+            starts,
+            max_depth=max_depth,
+            best=True,
+            ignore_operations=frozenset(),
+            stop_rank=None,
+        )
+        return ParamMeasurement(
+            name=name,
+            rank=result[0],
+            direct_reads=result[1],
+            call_uses=result[2],
+            return_uses=result[3],
+            indirect_uses=result[4],
+            traversed_nodes=result[5],
+            depth_limited=result[6],
+            direction=ParamDirection.INPUT,
+        )
 
-        users: dict[int, list[PcodeOp]] = defaultdict(list)
-        for operation in self.ops:
-            for input_node in operation.inputs:
-                users[input_node].append(operation)
-
-        queue = deque((node, 0) for node in starts)
-        visited: set[int] = set()
-        visited_operations: set[int] = set()
-        best = ParamRank.UNREFERENCED
-        direct_reads = call_uses = return_uses = indirect_uses = 0
+    def measure_output(
+        self,
+        name: str,
+        values: Iterable[int] | None = None,
+        max_depth: int = 10,
+    ) -> ParamMeasurement:
+        """Measure a return storage by Ghidra's backward ``walkbackward`` rules."""
+        start_values = set(
+            self._output_values.get(name, ()) if values is None else values
+        )
+        if not start_values:
+            return ParamMeasurement(
+                name, ParamRank.UNREFERENCED, direction=ParamDirection.OUTPUT
+            )
+        ignore_operations = frozenset(self._output_sink_operations.get(name, ()))
+        visited: set[tuple[int, int | None]] = set()
         depth_limited = False
 
-        def count_rank(rank: ParamRank) -> None:
-            nonlocal best, direct_reads, call_uses, return_uses, indirect_uses
-            best = min(best, rank)
-            if rank == ParamRank.DIRECT_READ:
-                direct_reads += 1
-            elif rank == ParamRank.SUBFUNCTION_PARAMETER:
-                call_uses += 1
-            elif rank == ParamRank.FUNCTION_RETURN:
-                return_uses += 1
-            elif rank == ParamRank.INDIRECT:
-                indirect_uses += 1
+        def walk_back(value_id: int, ignore_operation: int | None) -> ParamRank:
+            nonlocal depth_limited
+            state = (value_id, ignore_operation)
+            if state in visited:
+                return ParamRank.UNREFERENCED
+            visited.add(state)
+            if value_id < 0 or value_id >= len(self.nodes):
+                return ParamRank.UNREFERENCED
+            value = self.nodes[value_id]
+            if value.kind in {"input", "memory_input"}:
+                return ParamRank.THIS_FUNCTION_PARAMETER
+            definition_index = self._definitions.get(value_id)
+            if definition_index is None:
+                return ParamRank.THIS_FUNCTION_PARAMETER
+            operation = self.ops[definition_index]
+            if operation.opcode in {
+                "BRANCH",
+                "BRANCHIND",
+                "CBRANCH",
+                "CALL",
+                "CALLIND",
+                "CALL_RESULT",
+            }:
+                return ParamRank.UNREFERENCED
+            if operation.opcode == "CALLOTHER":
+                return ParamRank.DIRECT_READ
+            if operation.opcode == "RETURN":
+                return ParamRank.FUNCTION_RETURN
+            if operation.opcode == "INDIRECT":
+                return ParamRank.INDIRECT
+            if operation.opcode == "MULTIEQUAL":
+                ranks = [
+                    walk_back(input_id, definition_index)
+                    for input_index, input_id in enumerate(operation.inputs)
+                    if input_index >= len(operation.loop_inputs)
+                    or not operation.loop_inputs[input_index]
+                ]
+                return min(ranks, default=ParamRank.UNREFERENCED)
+
+            ignored = {definition_index, *ignore_operations}
+            if ignore_operation is not None:
+                ignored.add(ignore_operation)
+            forward = self._walk_forward(
+                (value_id,),
+                max_depth=max_depth,
+                best=False,
+                ignore_operations=frozenset(ignored),
+                stop_rank=ParamRank.INDIRECT,
+            )
+            depth_limited = depth_limited or forward[6]
+            return (
+                ParamRank.DIRECT_READ
+                if forward[0] == ParamRank.DIRECT_READ
+                else ParamRank.DIRECT_WRITE_WITHOUT_READ
+            )
+
+        ranks = [walk_back(value_id, None) for value_id in sorted(start_values)]
+        rank = min(ranks, default=ParamRank.UNREFERENCED)
+        forward = self._walk_forward(
+            start_values,
+            max_depth=max_depth,
+            best=False,
+            ignore_operations=ignore_operations,
+            stop_rank=ParamRank.INDIRECT,
+        )
+        depth_limited = depth_limited or forward[6]
+        return ParamMeasurement(
+            name=name,
+            rank=rank,
+            direct_reads=forward[1],
+            call_uses=forward[2],
+            return_uses=forward[3],
+            indirect_uses=forward[4],
+            traversed_nodes=len(visited) + forward[5],
+            depth_limited=depth_limited,
+            direction=ParamDirection.OUTPUT,
+        )
+
+    def _walk_forward(
+        self,
+        starts: Iterable[int],
+        *,
+        max_depth: int,
+        best: bool,
+        ignore_operations: frozenset[int],
+        stop_rank: ParamRank | None,
+    ) -> tuple[ParamRank, int, int, int, int, int, bool]:
+        """Bounded forward walk, following only MULTIEQUAL and SSA aliases."""
+        limit = min(PARAMID_MAX_DEPTH, max(1, max_depth))
+        users: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for operation_index, operation in enumerate(self.ops):
+            for input_index, input_node in enumerate(operation.inputs):
+                users[input_node].append((operation_index, input_index))
+
+        queue = deque((node, 0) for node in sorted(set(starts)))
+        visited_nodes: set[int] = set()
+        visited_edges: set[tuple[int, int, int]] = set()
+        best_rank = ParamRank.UNREFERENCED if best else ParamRank.DIRECT_WRITE_WITHOUT_READ
+        direct_reads = call_uses = return_uses = indirect_uses = 0
+        counted_sites: set[tuple[int, ParamRank]] = set()
+        depth_limited = False
 
         while queue:
             node, depth = queue.popleft()
-            if node in visited:
+            if node in visited_nodes:
                 continue
-            visited.add(node)
-            if depth >= max_depth:
-                if users.get(node):
+            visited_nodes.add(node)
+            if depth >= limit:
+                if any(
+                    operation_index not in ignore_operations
+                    for operation_index, _slot in users.get(node, ())
+                ):
                     depth_limited = True
                 continue
-            for operation in users.get(node, ()):
-                if id(operation) in visited_operations:
+
+            for operation_index, input_index in users.get(node, ()):
+                if operation_index in ignore_operations:
                     continue
-                visited_operations.add(id(operation))
-                if operation.opcode == "MULTIEQUAL" and operation.output is not None:
-                    if operation.output not in visited:
+                edge = (node, operation_index, input_index)
+                if edge in visited_edges:
+                    continue
+                visited_edges.add(edge)
+                operation = self.ops[operation_index]
+
+                if operation.opcode == "MULTIEQUAL":
+                    is_loop_input = (
+                        input_index < len(operation.loop_inputs)
+                        and operation.loop_inputs[input_index]
+                    )
+                    if (
+                        not is_loop_input
+                        and operation.output is not None
+                        and operation.output not in visited_nodes
+                    ):
                         queue.append((operation.output, depth + 1))
                     continue
+
                 if operation.evidence in {
                     "ssa-byte-slice",
                     "ssa-call-stack-restore",
                     "ssa-callother-passthrough",
                 }:
-                    if operation.output is not None:
+                    if operation.output is not None and operation.output not in visited_nodes:
                         queue.append((operation.output, depth + 1))
                     continue
-                if operation.opcode == "CALL" and operation.terminal_rank is None:
-                    # The structural call's result is not derived from its
-                    # caller-side arguments. Ranked CALL sinks are distinct ops.
-                    continue
-                if operation.opcode == "LOAD":
-                    # A load consumes its address indirectly; its result is not
-                    # a copy of that address. Stack-content loads use LOAD_STACK.
-                    count_rank(ParamRank.INDIRECT)
-                    continue
-                if operation.terminal_rank is not None:
-                    count_rank(operation.terminal_rank)
-                    continue
-                if operation.input_ranks:
-                    matched_ranks = tuple(
-                        dict.fromkeys(
-                            operation.input_ranks[index]
-                            for index, input_node in enumerate(operation.inputs)
-                            if input_node == node
-                            and index < len(operation.input_ranks)
-                        )
-                    )
-                    for rank in matched_ranks:
-                        if rank is not None:
-                            count_rank(rank)
-                    continue
-                if operation.output is not None:
-                    # A normal p-code consumer reads its input. The SSA-backed
-                    # walk also follows the result to recover later call/return
-                    # sinks reached through COPY, arithmetic, and phi values.
-                    count_rank(ParamRank.DIRECT_READ)
-                    if self.is_ssa_backed and operation.output not in visited:
-                        queue.append((operation.output, depth + 1))
 
-        return ParamMeasurement(
-            name=name,
-            rank=best,
-            direct_reads=direct_reads,
-            call_uses=call_uses,
-            return_uses=return_uses,
-            indirect_uses=indirect_uses,
-            traversed_nodes=len(visited),
-            depth_limited=depth_limited,
+                rank = _operation_input_rank(operation, input_index)
+                if rank is None:
+                    continue
+                site = (operation_index, rank)
+                if site not in counted_sites:
+                    counted_sites.add(site)
+                    if rank == ParamRank.DIRECT_READ:
+                        direct_reads += 1
+                    elif rank == ParamRank.SUBFUNCTION_PARAMETER:
+                        call_uses += 1
+                    elif rank == ParamRank.FUNCTION_RETURN:
+                        return_uses += 1
+                    elif rank == ParamRank.INDIRECT:
+                        indirect_uses += 1
+                best_rank = min(best_rank, rank) if best else max(best_rank, rank)
+                if stop_rank is not None and rank == stop_rank:
+                    queue.clear()
+                    break
+
+        return (
+            best_rank,
+            direct_reads,
+            call_uses,
+            return_uses,
+            indirect_uses,
+            len(visited_nodes),
+            depth_limited,
         )
 
     def _materialize(
@@ -1196,12 +1610,14 @@ class PcodeLikeGraph:
 class ParamIDAnalysis:
     """Build trial rankings over exact SSA p-code, with a reduced-graph fallback."""
 
-    def __init__(self, graph: PcodeLikeGraph, max_depth: int = 10) -> None:
+    def __init__(self, graph: PcodeLikeGraph, max_depth: int = PARAMID_MAX_DEPTH) -> None:
         self.graph = graph
         self.supplemental_graph = graph.supplemental_graph
-        self.max_depth = max(1, max_depth)
+        self.max_depth = min(PARAMID_MAX_DEPTH, max(1, max_depth))
         self.input_active = ParamActive()
         self.measurements: dict[str, ParamMeasurement] = {}
+        self.output_measurements: dict[str, ParamMeasurement] = {}
+        self.justproto = False
 
     @property
     def uses_ssa_pcode(self) -> bool:
@@ -1219,12 +1635,31 @@ class ParamIDAnalysis:
             return None
         return self.graph.ssa_function.complete
 
-    def analyze(self) -> ParamActive:
+    def analyze(
+        self,
+        *,
+        justproto: bool = False,
+        input_names: Iterable[str] | None = None,
+    ) -> ParamActive:
+        """Measure input trials and ABI outputs.
+
+        ``justproto=True`` mirrors Ghidra's diagnostic mode for a recovered
+        prototype: pass its formal storage names in ``input_names`` to avoid
+        measuring unmodeled live-in locations. With ``justproto=False`` all
+        discovered SSA and compatibility-graph inputs are measured.
+        """
+        if justproto and input_names is None:
+            raise ValueError("justproto=True requiere los nombres de los formales")
         self.input_active = ParamActive()
         self.measurements = {}
-        names = set(self.graph.parameter_names)
-        if self.supplemental_graph is not None:
-            names.update(self.supplemental_graph.parameter_names)
+        self.output_measurements = {}
+        self.justproto = justproto
+        if input_names is None:
+            names = set(self.graph.parameter_names)
+            if self.supplemental_graph is not None:
+                names.update(self.supplemental_graph.parameter_names)
+        else:
+            names = set(input_names)
         for name in sorted(names, key=_parameter_order):
             measurement = self._measure(name)
             self.measurements[name] = measurement
@@ -1233,6 +1668,11 @@ class ParamIDAnalysis:
                 width = max(width, _source_width(self.supplemental_graph, name))
             trial = self.input_active.register_trial(name, width)
             self._apply_measurement(trial, measurement)
+
+        for name in self.graph.output_names:
+            self.output_measurements[name] = self.graph.measure_output(
+                name, max_depth=self.max_depth
+            )
         return self.input_active
 
     def _measure(self, name: str) -> ParamMeasurement:
@@ -1319,24 +1759,55 @@ def _ssa_input_rank(
     values: tuple[int, ...],
     has_output: bool,
 ) -> ParamRank | None:
-    """Classify data uses whose p-code op has no ordinary output read."""
+    """Preserve Ghidra's input-slot exceptions in raw SLEIGH p-code."""
+    del has_output  # Ordinary p-code inputs are direct reads with or without output.
     if not values:
         return None
-    if opcode == "STORE":
-        if input_index == 1:
-            return ParamRank.INDIRECT
-        if input_index == 2:
-            return ParamRank.DIRECT_READ
-        return None
-    if opcode == "LOAD":
-        return ParamRank.INDIRECT if input_index == 1 else None
+    if opcode in {"BRANCH", "BRANCHIND"}:
+        return ParamRank.DIRECT_READ if input_index == 0 else None
     if opcode == "CBRANCH":
-        return ParamRank.DIRECT_READ if input_index == 1 else None
-    if opcode in {"BRANCH", "BRANCHIND", "CALLIND"}:
-        return ParamRank.INDIRECT if input_index == 0 else None
-    if opcode in {"CALL", "RETURN", "IMARK"}:
+        return ParamRank.DIRECT_READ if input_index < 2 else None
+    if opcode in {"CALL", "CALLIND"}:
+        if input_index == 0:
+            return ParamRank.DIRECT_READ
+        return ParamRank.SUBFUNCTION_PARAMETER
+    if opcode == "CALLOTHER":
+        return ParamRank.DIRECT_READ
+    if opcode == "INDIRECT":
+        return ParamRank.INDIRECT
+    if opcode in {"RETURN", "IMARK"}:
         return None
-    return ParamRank.DIRECT_READ if not has_output else None
+    return None
+
+
+def _operation_input_rank(
+    operation: PcodeOp, input_index: int
+) -> ParamRank | None:
+    """Classify one ParamMeasure use, honoring explicit adapter annotations."""
+    if input_index < len(operation.input_ranks):
+        return operation.input_ranks[input_index]
+    if operation.terminal_rank is not None:
+        return operation.terminal_rank
+    opcode = operation.opcode
+    if opcode in {"BRANCH", "BRANCHIND"}:
+        return ParamRank.DIRECT_READ if input_index == 0 else None
+    if opcode == "CBRANCH":
+        return ParamRank.DIRECT_READ if input_index < 2 else None
+    if opcode in {"CALL", "CALLIND"}:
+        return (
+            ParamRank.DIRECT_READ
+            if input_index == 0
+            else ParamRank.SUBFUNCTION_PARAMETER
+        )
+    if opcode == "CALLOTHER":
+        return ParamRank.DIRECT_READ
+    if opcode == "RETURN":
+        return ParamRank.FUNCTION_RETURN
+    if opcode == "INDIRECT":
+        return ParamRank.INDIRECT
+    if opcode in {"MULTIEQUAL", "IMARK", "CALL_RESULT"}:
+        return None
+    return ParamRank.DIRECT_READ
 
 
 def _role_description(role: str) -> tuple[str, ParamRank]:
