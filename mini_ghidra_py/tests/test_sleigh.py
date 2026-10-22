@@ -9,6 +9,18 @@ from minighidra.decompiler import SemanticDecompiler
 
 
 class SleighTranslationTests(unittest.TestCase):
+    def test_sleigh_translator_exposes_register_alias_metadata(self) -> None:
+        for bits, register, size in (
+            (32, "eax", 4),
+            (64, "rax", 8),
+            (64, "xmm0", 16),
+        ):
+            with self.subTest(bits=bits, register=register):
+                varnode = SleighTranslator(bits).registers[register]
+                self.assertEqual(varnode.space, "register")
+                self.assertEqual(varnode.size, size)
+                self.assertTrue(varnode.display)
+
     def test_real_sleigh_pcode_for_x86_32(self) -> None:
         instruction = SleighTranslator(32).translate_instruction(
             bytes.fromhex("83 c0 01"),

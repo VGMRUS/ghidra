@@ -45,6 +45,7 @@ from .model import (
 from .paramid import ParamActive, ParamIDAnalysis, ParamRank, PcodeLikeGraph
 from .prototype import PrototypeResolver
 from .sleigh import SleighInstruction, SleighTranslator, SleighVarnode
+from .ssa import SSAFunction, SSAHeritage
 from .typesys import StorageLocation, TypeDatabase, TypeKind
 
 
@@ -426,6 +427,7 @@ class SemanticDecompiler:
         self._sleigh_translator = SleighTranslator(self.bits)
         self._sleigh_instructions: tuple[SleighInstruction, ...] = ()
         self._sleigh_instruction_by_address: dict[int, SleighInstruction] = {}
+        self._ssa_function: SSAFunction | None = None
         mode = CS_MODE_32 if self.bits == 32 else CS_MODE_64
         self._md = Cs(CS_ARCH_X86, mode)
         self._md.detail = True
@@ -480,6 +482,11 @@ class SemanticDecompiler:
         """Exact upstream SLEIGH translations from the latest decompilation."""
         return self._sleigh_instructions
 
+    @property
+    def ssa_function(self) -> SSAFunction | None:
+        """The validated p-code SSA/heritage graph from the latest decompilation."""
+        return self._ssa_function
+
     def decompile(self, function: Function) -> str:
         self._function = function
         self._calling_convention = calling_convention_for(self.analyzer, function)
@@ -496,6 +503,22 @@ class SemanticDecompiler:
         self._sleigh_instruction_by_address = {
             item.address: item for item in self._sleigh_instructions
         }
+        self._ssa_function = SSAHeritage(
+            function,
+            self._sleigh_instructions,
+            caller_saved_registers=self._calling_convention.caller_saved_registers,
+            return_registers=(
+                *self._calling_convention.integer_return_registers,
+                *self._calling_convention.floating_return_registers,
+            ),
+            no_return_calls=(
+                instruction.address
+                for instruction in function.instructions
+                if self.analyzer._call_is_noreturn(instruction)
+                and instruction.branch_target != instruction.next_address
+            ),
+            registers=self._sleigh_translator.registers,
+        ).build()
         self._paramid_graph.attach_sleigh_instructions(self._sleigh_instructions)
         self._paramid_analysis = None
         self._paramid_active = ParamActive()
@@ -956,9 +979,7 @@ class SemanticDecompiler:
                 size_bits=width,
                 evidence=evidence,
                 mnemonic=(
-                    instruction.mnemonic.lower()
-                    if instruction is not None
-                    else None
+                    instruction.mnemonic.lower() if instruction is not None else None
                 ),
             )
         return sources
@@ -1164,8 +1185,7 @@ class SemanticDecompiler:
             return False
         end = offset + (bits + 7) // 8
         return any(
-            stored_offset < end
-            and offset < stored_offset + (stored_bits + 7) // 8
+            stored_offset < end and offset < stored_offset + (stored_bits + 7) // 8
             for stored_offset, stored_bits in state.stack
         )
 
@@ -1197,7 +1217,9 @@ class SemanticDecompiler:
                 byte_values.append(self._initial_stack_byte(byte_offset))
             else:
                 stored_offset, value = stored
-                byte_values.append(_extract(value, (byte_offset - stored_offset) * 8, 8))
+                byte_values.append(
+                    _extract(value, (byte_offset - stored_offset) * 8, 8)
+                )
 
         result = byte_values[0]
         for byte_value in byte_values[1:]:
@@ -1265,11 +1287,7 @@ class SemanticDecompiler:
             return int(address.value) & _mask(self.bits)
         if address.kind == "address":
             value = address.value
-            if (
-                isinstance(value, tuple)
-                and len(value) == 2
-                and value[0] == "absolute"
-            ):
+            if isinstance(value, tuple) and len(value) == 2 and value[0] == "absolute":
                 offset = int(value[1])
                 if 0 <= offset < 1 << self.bits:
                     return offset
@@ -1300,14 +1318,11 @@ class SemanticDecompiler:
             return False
         end = offset + (bits + 7) // 8
         return any(
-            stored_offset < end
-            and offset < stored_offset + (stored_bits + 7) // 8
+            stored_offset < end and offset < stored_offset + (stored_bits + 7) // 8
             for stored_offset, stored_bits in state.memory
         )
 
-    def _read_absolute_memory(
-        self, state: _State, address: _Expr, bits: int
-    ) -> _Expr:
+    def _read_absolute_memory(self, state: _State, address: _Expr, bits: int) -> _Expr:
         offset = self._absolute_memory_offset(address)
         if (
             offset is None
@@ -1342,7 +1357,9 @@ class SemanticDecompiler:
                 byte_values.append(_extract(initial, (byte_offset - offset) * 8, 8))
             else:
                 stored_offset, value = stored
-                byte_values.append(_extract(value, (byte_offset - stored_offset) * 8, 8))
+                byte_values.append(
+                    _extract(value, (byte_offset - stored_offset) * 8, 8)
+                )
 
         result = byte_values[0]
         for byte_value in byte_values[1:]:
@@ -1507,9 +1524,7 @@ class SemanticDecompiler:
         width: int,
         instruction: Instruction,
     ) -> _Expr:
-        vector = state.xmm_registers.get(
-            register, self._initial_xmm_register(register)
-        )
+        vector = state.xmm_registers.get(register, self._initial_xmm_register(register))
         value = _extract(vector, offset, width)
         sources = self._record_parameter_sources(
             value,
@@ -1536,9 +1551,7 @@ class SemanticDecompiler:
                 value = state.mmx_registers.get(
                     operand.reg, _var(f"in_{operand.reg}", 64)
                 )
-                self._record_pcode_register_read(
-                    operand.reg, value, width, instruction
-                )
+                self._record_pcode_register_read(operand.reg, value, width, instruction)
                 self._record_parameter_sources(
                     value,
                     f"register-read:{operand.reg}",
@@ -3036,9 +3049,7 @@ class SemanticDecompiler:
             or operation.inputs[0].space != "const"
         ):
             return None
-        return {0x11: "LOCK", 0x12: "UNLOCK"}.get(
-            operation.inputs[0].offset
-        )
+        return {0x11: "LOCK", 0x12: "UNLOCK"}.get(operation.inputs[0].offset)
 
     @staticmethod
     def _sleigh_round_userop_name(operation) -> str | None:
@@ -3101,7 +3112,9 @@ class SemanticDecompiler:
         if sleigh is None or sleigh.error or not sleigh.ops:
             return False
         operations = sleigh.ops
-        if any(operation.opcode not in self._SLEIGH_OPCODES for operation in operations):
+        if any(
+            operation.opcode not in self._SLEIGH_OPCODES for operation in operations
+        ):
             return False
         for operation in operations:
             if operation.opcode == "CALLOTHER":
@@ -3113,9 +3126,7 @@ class SemanticDecompiler:
                     or len(operation.inputs) != 4
                     or operation.output is None
                     or operation.output.space != "register"
-                    or not re.fullmatch(
-                        r"xmm\d+", operation.output.display.lower()
-                    )
+                    or not re.fullmatch(r"xmm\d+", operation.output.display.lower())
                     or operation.output.size_bits != 128
                     or operation.inputs[3].space != "const"
                     or operation.inputs[3].offset & 0x4
@@ -3147,18 +3158,22 @@ class SemanticDecompiler:
                 if (
                     operation.output is not None
                     or target.space not in {"const", "ram"}
-                    or (target.space == "ram" and target.offset != instruction.next_address)
+                    or (
+                        target.space == "ram"
+                        and target.offset != instruction.next_address
+                    )
                 ):
                     return False
-            elif operation.opcode not in {"IMARK", "CALLOTHER"} and operation.output is None:
+            elif (
+                operation.opcode not in {"IMARK", "CALLOTHER"}
+                and operation.output is None
+            ):
                 return False
 
         lock_markers = self._sleigh_lock_marker_positions(operations)
         if lock_markers is None:
             return False
-        if any(
-            operation.opcode in {"BRANCH", "CBRANCH"} for operation in operations
-        ):
+        if any(operation.opcode in {"BRANCH", "CBRANCH"} for operation in operations):
             if lock_markers:
                 lock_index, unlock_index = lock_markers
                 for index, operation in enumerate(operations):
@@ -3328,18 +3343,10 @@ class SemanticDecompiler:
             name: set(widths) for name, widths in self._parameter_read_widths.items()
         }
         self._paramid_recording_enabled = False
-        worklist = [
-            _SleighExecutionPath(
-                0, initial.copy(), {}, {}, _const(1, 1)
-            )
-        ]
+        worklist = [_SleighExecutionPath(0, initial.copy(), {}, {}, _const(1, 1))]
         completed: list[_SleighExecutionPath] = []
-        memory_reads: dict[
-            tuple[_Expr, _Expr], tuple[_Expr, _Expr, str]
-        ] = {}
-        load_snapshots: list[
-            tuple[_Expr, _Expr, _Expr, _Expr, int, str]
-        ] = []
+        memory_reads: dict[tuple[_Expr, _Expr], tuple[_Expr, _Expr, str]] = {}
+        load_snapshots: list[tuple[_Expr, _Expr, _Expr, _Expr, int, str]] = []
         load_snapshot_indices: dict[tuple[_Expr, _Expr, int, int], int] = {}
         load_index = 0
         max_paths = max(128, self.bits + 16)
@@ -3382,9 +3389,7 @@ class SemanticDecompiler:
                             break
                         output = operation.output
                         value = _resize(value, output.size_bits)
-                        self._write_sleigh_varnode_scratch(
-                            path.scratch, output, value
-                        )
+                        self._write_sleigh_varnode_scratch(path.scratch, output, value)
                         if output.space == "register":
                             self._write_sleigh_register(
                                 path.state,
@@ -3541,7 +3546,9 @@ class SemanticDecompiler:
                                 )
                                 load_index += 1
                                 temporary = _var(name, operation.output.size_bits)
-                                load_snapshot_indices[snapshot_key] = len(load_snapshots)
+                                load_snapshot_indices[snapshot_key] = len(
+                                    load_snapshots
+                                )
                                 load_snapshots.append(
                                     (
                                         path.condition,
@@ -3594,9 +3601,7 @@ class SemanticDecompiler:
                                             f"{instruction.address:X}_{load_index}"
                                         )
                                         load_index += 1
-                                        temporary = _var(
-                                            name, varnode.size_bits
-                                        )
+                                        temporary = _var(name, varnode.size_bits)
                                         load_snapshot_indices[snapshot_key] = len(
                                             load_snapshots
                                         )
@@ -3630,9 +3635,7 @@ class SemanticDecompiler:
                         break
                     output = operation.output
                     value = _resize(value, output.size_bits)
-                    self._write_sleigh_varnode_scratch(
-                        path.scratch, output, value
-                    )
+                    self._write_sleigh_varnode_scratch(path.scratch, output, value)
                     if output.space == "ram":
                         address = _const(output.offset, self.bits)
                         self._sleigh_store(
@@ -3699,16 +3702,10 @@ class SemanticDecompiler:
             self._paramid_recording_enabled = original_recording
 
         memory_writes = {
-            store: store
-            for path in completed
-            for store in path.memory_stores
+            store: store for path in completed for store in path.memory_stores
         }
-        merged = self._merge_sleigh_execution_paths(
-            initial, completed, instruction
-        )
-        self._summarize_sleigh_bit_scan(
-            merged, initial, instruction, load_snapshots
-        )
+        merged = self._merge_sleigh_execution_paths(initial, completed, instruction)
+        self._summarize_sleigh_bit_scan(merged, initial, instruction, load_snapshots)
         state.__dict__.update(merged.__dict__)
         if original_recording:
             self._record_branched_sleigh_register_effects(
@@ -3737,7 +3734,13 @@ class SemanticDecompiler:
                 if condition.kind != "const":
                     assignment = f"if ({self._render(condition)}) {assignment}"
                 emitted.append(assignment)
-            for condition, address, value, size_bits, location in memory_writes.values():
+            for (
+                condition,
+                address,
+                value,
+                size_bits,
+                location,
+            ) in memory_writes.values():
                 if location.startswith("stack[") or (
                     condition.kind == "const" and int(condition.value) == 0
                 ):
@@ -3761,9 +3764,7 @@ class SemanticDecompiler:
     ) -> _State:
         merged = initial.copy()
 
-        def merge_expression(
-            get_value, fallback: _Expr
-        ) -> _Expr:
+        def merge_expression(get_value, fallback: _Expr) -> _Expr:
             result = fallback
             for path in reversed(paths):
                 candidate = get_value(path.state)
@@ -3868,9 +3869,7 @@ class SemanticDecompiler:
                 for candidate in memory_states
             ):
                 continue
-            address = _Expr(
-                "address", value=("absolute", start), bits=self.bits
-            )
+            address = _Expr("address", value=("absolute", start), bits=self.bits)
             fallback = self._read_absolute_memory(initial, address, width)
             value = fallback
             for path in reversed(paths):
@@ -3894,6 +3893,7 @@ class SemanticDecompiler:
         if all(flag == flags[0] for flag in flags):
             merged.flags = flags[0]
         elif any(flag is not None for flag in flags):
+
             def merge_flag(name: str) -> _Expr:
                 fallback = self._sleigh_flag_value(paths[0].state.flags, name)
                 return merge_expression(
@@ -4023,9 +4023,7 @@ class SemanticDecompiler:
                 written_registers.add(_sleigh_varnode_key(operation.output))
         self._current_pcode_read_nodes.clear()
         for address, value, location in memory_reads:
-            self._record_pcode_memory_load(
-                value, address, location, (), instruction
-            )
+            self._record_pcode_memory_load(value, address, location, (), instruction)
         for varnode in read_registers.values():
             self._read_sleigh_varnode(initial, varnode, {}, instruction)
         inputs = tuple(self._current_pcode_read_nodes)
@@ -4081,8 +4079,7 @@ class SemanticDecompiler:
         if not flag_updates:
             return previous_flags
         preserve_unwritten = (
-            self._decode(instruction).mnemonic
-            in self._SLEIGH_PRESERVED_FLAG_MNEMONICS
+            self._decode(instruction).mnemonic in self._SLEIGH_PRESERVED_FLAG_MNEMONICS
         )
 
         def updated_flag(name: str) -> _Expr:
@@ -4194,12 +4191,16 @@ class SemanticDecompiler:
                 args=(source,),
                 bits=output_bits,
             )
-        if opcode in {
-            "FLOAT_EQUAL",
-            "FLOAT_NOTEQUAL",
-            "FLOAT_LESS",
-            "FLOAT_LESSEQUAL",
-        } and len(values) == 2:
+        if (
+            opcode
+            in {
+                "FLOAT_EQUAL",
+                "FLOAT_NOTEQUAL",
+                "FLOAT_LESS",
+                "FLOAT_LESSEQUAL",
+            }
+            and len(values) == 2
+        ):
             if any(value.bits not in {32, 64} for value in values):
                 return None
             comparison = {
@@ -4208,9 +4209,7 @@ class SemanticDecompiler:
                 "FLOAT_LESS": "lt",
                 "FLOAT_LESSEQUAL": "le",
             }[opcode]
-            left, right = (
-                _simd_float(value, value.bits) for value in values
-            )
+            left, right = (_simd_float(value, value.bits) for value in values)
             return _fp_compare(comparison, left, right)
         if opcode in {"FLOAT_ADD", "FLOAT_DIV", "FLOAT_MULT", "FLOAT_SUB"}:
             if (
@@ -4225,9 +4224,7 @@ class SemanticDecompiler:
                 "FLOAT_MULT": "mul",
                 "FLOAT_SUB": "sub",
             }[opcode]
-            left, right = (
-                _simd_float(value, value.bits) for value in values
-            )
+            left, right = (_simd_float(value, value.bits) for value in values)
             return _fp_to_bits(_fp_binary(operation, left, right), output_bits)
         if opcode == "FLOAT_NAN" and len(values) == 1:
             if values[0].bits not in {32, 64}:
@@ -4254,14 +4251,9 @@ class SemanticDecompiler:
             cast = _Expr("fp_cast", output_bits, args=(source,), bits=80)
             return _fp_to_bits(cast, output_bits)
         if opcode == "FLOAT_TRUNC" and len(values) == 1:
-            if (
-                values[0].bits not in {32, 64}
-                or output_bits not in {8, 16, 32, 64}
-            ):
+            if values[0].bits not in {32, 64} or output_bits not in {8, 16, 32, 64}:
                 return None
-            return _simd_cvtt_to_int(
-                values[0], output_bits, input_bits=values[0].bits
-            )
+            return _simd_cvtt_to_int(values[0], output_bits, input_bits=values[0].bits)
         if opcode in {"FLOAT_CEIL", "FLOAT_FLOOR", "FLOAT_ROUND"} and len(values) == 1:
             if values[0].bits not in {32, 64} or output_bits not in {32, 64}:
                 return None
@@ -4308,9 +4300,7 @@ class SemanticDecompiler:
                     return _const(0, output_bits)
                 return _binary(binary[opcode], source, amount, output_bits)
             shifted = _binary(binary[opcode], source, amount, output_bits)
-            in_range = _binary(
-                "ult", amount, _const(source.bits, amount.bits), 1
-            )
+            in_range = _binary("ult", amount, _const(source.bits, amount.bits), 1)
             if opcode == "INT_SRIGHT":
                 sign = _binary("slt", source, _const(0, source.bits), 1)
                 too_large = _unary("neg", _resize(sign, output_bits), output_bits)
@@ -4372,9 +4362,7 @@ class SemanticDecompiler:
             )
             if stored is None:
                 byte_values.append(
-                    _var(
-                        f"pcode_tmp_{instruction.address:X}_{byte_offset:X}", 8
-                    )
+                    _var(f"pcode_tmp_{instruction.address:X}_{byte_offset:X}", 8)
                 )
             else:
                 stored_offset, _stored_size, value = stored
@@ -4403,11 +4391,7 @@ class SemanticDecompiler:
         remaining: dict[tuple[str, int, int], _Expr] = {}
         for (space, stored_offset, stored_size), stored_value in scratch.items():
             stored_end = stored_offset + stored_size
-            if (
-                space != "unique"
-                or stored_end <= offset
-                or stored_offset >= end
-            ):
+            if space != "unique" or stored_end <= offset or stored_offset >= end:
                 remaining[(space, stored_offset, stored_size)] = stored_value
                 continue
             if stored_offset < offset:
@@ -4465,9 +4449,7 @@ class SemanticDecompiler:
             if name in self._PCODE_FLAG_NAMES:
                 return self._sleigh_flag_value(state.flags, name)
             if self._register_alias(name) is not None:
-                return _resize(
-                    self._read_register(state, name, instruction), size_bits
-                )
+                return _resize(self._read_register(state, name, instruction), size_bits)
             vector_slice = self._sleigh_vector_register_slice(name)
             if vector_slice is not None:
                 register, offset, slice_bits = vector_slice
@@ -4505,9 +4487,7 @@ class SemanticDecompiler:
                 )
                 return _resize(value, size_bits)
             if re.fullmatch(r"xmm\d+", name):
-                value = state.xmm_registers.get(
-                    name, self._initial_xmm_register(name)
-                )
+                value = state.xmm_registers.get(name, self._initial_xmm_register(name))
                 sources = self._record_parameter_sources(
                     value,
                     f"vector-live-in-read:{name}",
@@ -4516,7 +4496,9 @@ class SemanticDecompiler:
                     use_kind="direct" if track_parameter_sources else "none",
                 )
                 if track_parameter_sources:
-                    self._record_pcode_register_read(name, value, size_bits, instruction)
+                    self._record_pcode_register_read(
+                        name, value, size_bits, instruction
+                    )
                 expected = self._calling_convention.vector_parameter_name(name)
                 if (
                     track_parameter_sources
@@ -4547,9 +4529,7 @@ class SemanticDecompiler:
             return self._sleigh_load(
                 state, _const(varnode.offset, self.bits), size_bits, instruction
             )
-        return _var(
-            f"unknown_{varnode.space}_{varnode.offset:X}", size_bits
-        )
+        return _var(f"unknown_{varnode.space}_{varnode.offset:X}", size_bits)
 
     def _write_sleigh_register(
         self,
@@ -4580,18 +4560,14 @@ class SemanticDecompiler:
                 register, self._initial_xmm_register(register)
             )
             width = min(slice_bits, size_bits)
-            updated = _insert_bits(
-                old_value, value, offset, width, 128
-            )
+            updated = _insert_bits(old_value, value, offset, width, 128)
             state.xmm_registers[register] = updated
             state.xmm_widths[register] = max(
                 state.xmm_widths.get(register, 0), offset + width
             )
             if register in self._tracked_argument_registers:
                 state.dirty_arguments.add(register)
-            self._record_pcode_register_definition(
-                register, updated, 128, instruction
-            )
+            self._record_pcode_register_definition(register, updated, 128, instruction)
             return
         if re.fullmatch(r"mm[0-7]", name):
             state.mmx_registers[name] = _resize(value, 64)
@@ -4600,9 +4576,7 @@ class SemanticDecompiler:
             )
             return
         if re.fullmatch(r"xmm\d+", name):
-            old_value = state.xmm_registers.get(
-                name, self._initial_xmm_register(name)
-            )
+            old_value = state.xmm_registers.get(name, self._initial_xmm_register(name))
             if size_bits < 128:
                 updated = _insert_bits(old_value, value, 0, size_bits, 128)
             else:
@@ -4639,7 +4613,11 @@ class SemanticDecompiler:
                 return int(left.value) + int(right.value)
             if right.kind == "stack_pointer" and left.kind == "const":
                 return int(right.value) + int(left.value)
-        if operation == "sub" and left.kind == "stack_pointer" and right.kind == "const":
+        if (
+            operation == "sub"
+            and left.kind == "stack_pointer"
+            and right.kind == "const"
+        ):
             return int(left.value) - int(right.value)
         return None
 
@@ -4747,9 +4725,17 @@ class SemanticDecompiler:
         if name == "pf":
             if flags.parity is not None:
                 return flags.parity
-            return _parity(flags.result) if flags.result is not None else _var("flag_pf", 1)
+            return (
+                _parity(flags.result)
+                if flags.result is not None
+                else _var("flag_pf", 1)
+            )
         if name == "zf":
-            if flags.kind == "cmp" and flags.left is not None and flags.right is not None:
+            if (
+                flags.kind == "cmp"
+                and flags.left is not None
+                and flags.right is not None
+            ):
                 return _binary("eq", flags.left, flags.right, 1)
             if flags.result is not None:
                 return _binary("eq", flags.result, _const(0, flags.bits), 1)
@@ -4966,9 +4952,7 @@ class SemanticDecompiler:
                 if collect:
                     self._call_results.add(result_name)
                 return_family = call_convention.integer_return_registers[0]
-                self._write_register(
-                    state, return_family, result, mark_argument=False
-                )
+                self._write_register(state, return_family, result, mark_argument=False)
             caller_saved = call_convention.caller_saved_registers
             return_family = call_convention.integer_return_registers[0]
             for family in caller_saved:
@@ -5421,9 +5405,7 @@ class SemanticDecompiler:
 
         # Use the local Ghidra SLEIGH semantics before conceding that an
         # instruction is unsupported by the higher-level lifters.
-        if self._execute_sleigh_semantics(
-            state, instruction, emitted, collect=collect
-        ):
+        if self._execute_sleigh_semantics(state, instruction, emitted, collect=collect):
             return emitted
 
         # Explicitly invalidate an unsupported destination instead of silently
@@ -5472,9 +5454,7 @@ class SemanticDecompiler:
                 mnemonic = self._decode(instruction).mnemonic
                 self._current_instruction = instruction
                 self._current_pcode_read_nodes = []
-                self._paramid_graph.begin_instruction(
-                    instruction.address, mnemonic
-                )
+                self._paramid_graph.begin_instruction(instruction.address, mnemonic)
             else:
                 self._current_instruction = None
             try:
@@ -5595,9 +5575,13 @@ class SemanticDecompiler:
             if end <= start:
                 continue
             width = (end - start) * 8
-            if not any(self._stack_has_written(source, start, width) for source in sources):
+            if not any(
+                self._stack_has_written(source, start, width) for source in sources
+            ):
                 continue
-            values = tuple(self._read_stack_value(source, start, width) for source in sources)
+            values = tuple(
+                self._read_stack_value(source, start, width) for source in sources
+            )
             location = f"stack_{start:+X}_{width}"
             value = self._merge_value(
                 block_start, location, values, record_phis=record_phis
@@ -5618,12 +5602,9 @@ class SemanticDecompiler:
                 self._memory_has_written(source, start, width) for source in sources
             ):
                 continue
-            address = _Expr(
-                "address", value=("absolute", start), bits=self.bits
-            )
+            address = _Expr("address", value=("absolute", start), bits=self.bits)
             values = tuple(
-                self._read_absolute_memory(source, address, width)
-                for source in sources
+                self._read_absolute_memory(source, address, width) for source in sources
             )
             location = f"memory_{start:X}_{width}"
             merged.memory[(start, width)] = self._merge_value(
@@ -6046,9 +6027,7 @@ class SemanticDecompiler:
                         "forwarded-as-call-argument"
                     )
                 return _resize(value, 128)
-            return self._read_register(
-                state, register, instruction, use_kind="none"
-            )
+            return self._read_register(state, register, instruction, use_kind="none")
 
         def typed_argument(register: str, parameter_name: str) -> _Expr:
             value = read_argument(register)
@@ -6183,9 +6162,7 @@ class SemanticDecompiler:
             stack_argument_offsets = [offset for offset, _value in pending]
         if self._paramid_recording_enabled:
             stack_register = "rsp" if self.bits == 64 else "esp"
-            for value, offset in zip(
-                stack_values, stack_argument_offsets, strict=True
-            ):
+            for value, offset in zip(stack_values, stack_argument_offsets, strict=True):
                 if offset is None:
                     continue
                 address_expression = _Expr(
@@ -6424,9 +6401,7 @@ class SemanticDecompiler:
                 )
                 self._record_pcode_register_read(register, value, 128, instruction)
                 return _resize(value, 128)
-            return self._read_register(
-                state, register, instruction, use_kind="none"
-            )
+            return self._read_register(state, register, instruction, use_kind="none")
 
         if convention.register_argument_groups:
             for group in convention.register_argument_groups:
@@ -6601,7 +6576,10 @@ class SemanticDecompiler:
             old_delta = state.stack_delta
             state.stack_delta -= self.pointer_size
             self._write_stack_value(state, state.stack_delta, self.bits, value)
-            if self._paramid_recording_enabled and self._current_instruction is not None:
+            if (
+                self._paramid_recording_enabled
+                and self._current_instruction is not None
+            ):
                 instruction = self._current_instruction
                 stack_register = "rsp" if self.bits == 64 else "esp"
                 old_sp = _Expr("stack_pointer", old_delta, bits=self.bits)
@@ -6635,7 +6613,10 @@ class SemanticDecompiler:
             result = _var("unknown_stack_value", self.bits)
         else:
             result = self._read_stack_value(state, offset, self.bits)
-            if self._paramid_recording_enabled and self._current_instruction is not None:
+            if (
+                self._paramid_recording_enabled
+                and self._current_instruction is not None
+            ):
                 instruction = self._current_instruction
                 stack_register = "rsp" if self.bits == 64 else "esp"
                 old_sp = _Expr("stack_pointer", offset, bits=self.bits)
@@ -6653,7 +6634,10 @@ class SemanticDecompiler:
                     instruction,
                 )
             state.stack_delta += self.pointer_size
-            if self._paramid_recording_enabled and self._current_instruction is not None:
+            if (
+                self._paramid_recording_enabled
+                and self._current_instruction is not None
+            ):
                 new_sp = _Expr("stack_pointer", state.stack_delta, bits=self.bits)
                 self._record_pcode_register_definition(
                     "rsp" if self.bits == 64 else "esp",
@@ -7353,9 +7337,7 @@ class SemanticDecompiler:
                     evidence.add("paramid-selected-candidate")
                 if trial.used:
                     evidence.add("paramid-used-final")
-            parameters.append(
-                replace(parameter, evidence=tuple(sorted(evidence)))
-            )
+            parameters.append(replace(parameter, evidence=tuple(sorted(evidence))))
         return replace(signature, parameters=tuple(parameters))
 
     def _annotate_inferred_signature(
@@ -7379,9 +7361,7 @@ class SemanticDecompiler:
             if location.stack_offset is not None
         }
         writes_by_stack_offset = (
-            callsite_stack_writes(
-                self.analyzer, call_sites, candidate_stack_offsets
-            )
+            callsite_stack_writes(self.analyzer, call_sites, candidate_stack_offsets)
             if call_sites and candidate_stack_offsets
             else {}
         )
@@ -7405,12 +7385,23 @@ class SemanticDecompiler:
                 for location in parameter.locations
                 if location.stack_offset is not None
             }
-            register_sites = set().union(
-                *(writes_by_register.get(register, set()) for register in registers)
-            ) if registers else set()
-            stack_sites = set().union(
-                *(writes_by_stack_offset.get(offset, set()) for offset in stack_offsets)
-            ) if stack_offsets else set()
+            register_sites = (
+                set().union(
+                    *(writes_by_register.get(register, set()) for register in registers)
+                )
+                if registers
+                else set()
+            )
+            stack_sites = (
+                set().union(
+                    *(
+                        writes_by_stack_offset.get(offset, set())
+                        for offset in stack_offsets
+                    )
+                )
+                if stack_offsets
+                else set()
+            )
             supplied_sites = register_sites | stack_sites
             if call_sites and supplied_sites:
                 ratio = len(supplied_sites) / len(call_sites)
@@ -7962,11 +7953,7 @@ def _sleigh_branch_fact(condition: _Expr):
         if shift is not None:
             source, amount = shift
             return "high", source, amount, comparison == "ne"
-        if (
-            left.kind == "op"
-            and left.value == "and"
-            and len(left.args) == 2
-        ):
+        if left.kind == "op" and left.value == "and" and len(left.args) == 2:
             shifted, mask = left.args
             if mask.kind == "const" and int(mask.value) == 1:
                 shift = _sleigh_shift_source(shifted)
@@ -8023,12 +8010,14 @@ def _sleigh_path_constraints_consistent(path: _SleighExecutionPath) -> bool:
         if value and zero_from is not None and bit >= zero_from:
             return False
     for source in path.zero_sources:
-        if any(bit_source == source and value for (bit_source, _), value in path.bit_facts.items()):
+        if any(
+            bit_source == source and value
+            for (bit_source, _), value in path.bit_facts.items()
+        ):
             return False
     for source in path.nonzero_sources:
         if all(
-            path.bit_facts.get((source, bit)) is False
-            for bit in range(source.bits)
+            path.bit_facts.get((source, bit)) is False for bit in range(source.bits)
         ):
             return False
         if path.zero_high_from.get(source, source.bits) <= 0:
@@ -8219,7 +8208,11 @@ def _binary(op: str, left: _Expr, right: _Expr, bits: int) -> _Expr:
         return _resize(left, bits)
     if op in {"add", "or", "xor"} and left.kind == "const" and int(left.value) == 0:
         return _resize(right, bits)
-    if op in {"shl", "lshr", "ashr"} and right.kind == "const" and int(right.value) == 0:
+    if (
+        op in {"shl", "lshr", "ashr"}
+        and right.kind == "const"
+        and int(right.value) == 0
+    ):
         return _resize(left, bits)
     if op == "xor" and left == right:
         return _const(0, bits)

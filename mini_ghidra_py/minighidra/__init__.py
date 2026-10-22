@@ -23,9 +23,22 @@ from .paramid import (
 from .project import ProjectState
 from .prototype import PrototypeLayout, PrototypeResolver
 from .sleigh import SleighInstruction, SleighPcodeOp, SleighTranslator, SleighVarnode
+from .ssa import (
+    MEMORY_LOCATION,
+    SSAControlBlock,
+    SSAFunction,
+    SSAHeritage,
+    SSALocation,
+    SSAOperand,
+    SSAOperation,
+    SSAPhi,
+    SSAReturnSite,
+    SSAValue,
+)
 from .typesys import CField, CType, StorageLocation, TypeDatabase, TypeKind
 
 __all__ = [
+    "MEMORY_LOCATION",
     "Analyzer",
     "BinaryImage",
     "CField",
@@ -46,6 +59,15 @@ __all__ = [
     "ProjectState",
     "PrototypeLayout",
     "PrototypeResolver",
+    "SSAControlBlock",
+    "SSAFunction",
+    "SSAHeritage",
+    "SSALocation",
+    "SSAOperand",
+    "SSAOperation",
+    "SSAPhi",
+    "SSAReturnSite",
+    "SSAValue",
     "SemanticDecompiler",
     "SleighInstruction",
     "SleighPcodeOp",

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import replace
-from typing import Iterable, Optional
 
 try:
     from capstone import (
@@ -19,7 +19,9 @@ try:
     )
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_REG_RIP
 except ImportError as exc:  # pragma: no cover - dependency declared by the package
-    raise RuntimeError("Falta Capstone. Instálalo con: python -m pip install capstone") from exc
+    raise RuntimeError(
+        "Falta Capstone. Instálalo con: python -m pip install capstone"
+    ) from exc
 
 from .abi import CallingConvention, calling_convention_by_name, calling_convention_for
 from .function_starts import FunctionStartCandidate, find_function_start_candidates
@@ -33,6 +35,7 @@ from .model import (
     Xref,
 )
 from .noreturn import NoReturnCatalog
+from .ssa import SSAFunction, SSAHeritage
 from .typesys import TypeDatabase, TypeKind
 
 _SCALAR_SENTINELS = frozenset(
@@ -61,7 +64,9 @@ class Analyzer:
             or isinstance(noreturn_evidence_threshold, bool)
             or noreturn_evidence_threshold < 1
         ):
-            raise ValueError("El umbral de evidencia no-return debe ser un entero positivo.")
+            raise ValueError(
+                "El umbral de evidencia no-return debe ser un entero positivo."
+            )
         self.image = image
         self.project_state = project_state
         self.type_database = TypeDatabase(image.bits, image.format)
@@ -174,7 +179,11 @@ class Analyzer:
                     memory = operand.mem
                     references = memory_references
                     if memory.base == X86_REG_RIP:
-                        target = raw_instruction.address + raw_instruction.size + int(memory.disp)
+                        target = (
+                            raw_instruction.address
+                            + raw_instruction.size
+                            + int(memory.disp)
+                        )
                     elif memory.base == 0:
                         target = int(memory.disp)
                         if memory.index:
@@ -227,7 +236,10 @@ class Analyzer:
             else:
                 kind = "jump"
             self._record_xref(instruction.address, instruction.branch_target, kind)
-        for target in (*instruction.memory_references, *instruction.indexed_memory_references):
+        for target in (
+            *instruction.memory_references,
+            *instruction.indexed_memory_references,
+        ):
             self._record_xref(instruction.address, target, "memory")
 
     def _find_strings(self, min_length: int = 4) -> None:
@@ -245,7 +257,9 @@ class Analyzer:
                 key = (section.start + match.start(), text, "ascii")
                 if key not in seen:
                     seen.add(key)
-                    self.strings.append(StringEntry(key[0], text, "ascii", section.name))
+                    self.strings.append(
+                        StringEntry(key[0], text, "ascii", section.name)
+                    )
 
             wide_candidates = []
             for match in wide_pattern.finditer(data):
@@ -255,7 +269,10 @@ class Analyzer:
                 # A final ASCII character + NUL can otherwise be mistaken for
                 # the first UTF-16 code unit. Lookahead preserves the real wide
                 # string immediately after that terminator.
-                if any(start < ascii_end and ascii_start < end for ascii_start, ascii_end in ascii_spans):
+                if any(
+                    start < ascii_end and ascii_start < end
+                    for ascii_start, ascii_end in ascii_spans
+                ):
                     continue
                 try:
                     text = raw_wide.decode("utf-16le")
@@ -273,10 +290,14 @@ class Analyzer:
                 key = (section.start + start, text, "utf-16le")
                 if key not in seen:
                     seen.add(key)
-                    self.strings.append(StringEntry(key[0], text, "utf-16le", section.name))
+                    self.strings.append(
+                        StringEntry(key[0], text, "utf-16le", section.name)
+                    )
         self.strings.sort(key=lambda item: item.address)
 
-    def _add_seed(self, address: Optional[int], name: str = "", source: str = "heuristic") -> None:
+    def _add_seed(
+        self, address: int | None, name: str = "", source: str = "heuristic"
+    ) -> None:
         if address is None or address < 0:
             return
         section = self.image.section_at(address, file_backed=True)
@@ -304,7 +325,9 @@ class Analyzer:
         # Ghidra's PE ExceptionDataDirectory marks non-chained x64 runtime
         # function entries at image-base + BeginAddress (an RVA).
         for start, _end in getattr(self.image, "pe_exception_function_ranges", ()):
-            self._add_seed(start, self._name_by_address.get(start, ""), "PE exception directory")
+            self._add_seed(
+                start, self._name_by_address.get(start, ""), "PE exception directory"
+            )
         for index, address in enumerate(getattr(self.image, "pe_tls_callbacks", ())):
             name = self._name_by_address.get(address, f"tls_callback_{index}")
             self._add_seed(address, name, "PE TLS callback")
@@ -319,11 +342,15 @@ class Analyzer:
                 # capture the return address rather than call a new function.
                 if target == instruction.next_address:
                     continue
-                self._add_seed(target, self._name_by_address.get(target, ""), "call target")
+                self._add_seed(
+                    target, self._name_by_address.get(target, ""), "call target"
+                )
         for instruction in self.instructions.values():
             for target in instruction.memory_references:
                 if target in self.instructions:
-                    self._add_seed(target, self._name_by_address.get(target, ""), "code reference")
+                    self._add_seed(
+                        target, self._name_by_address.get(target, ""), "code reference"
+                    )
 
         if not self.function_seeds and self.instructions:
             self._add_seed(min(self.instructions), "entry", "fallback")
@@ -335,11 +362,17 @@ class Analyzer:
                 section = self.image.section_at(target)
                 if section is None:
                     continue
-                if section.executable and target not in self.function_seeds and target not in self._name_by_address:
+                if (
+                    section.executable
+                    and target not in self.function_seeds
+                    and target not in self._name_by_address
+                ):
                     continue
                 self._record_xref(instruction.address, target, "scalar")
 
-    def _discover_address_tables(self, minimum_entries: int = 3, max_entries: int = 512) -> None:
+    def _discover_address_tables(
+        self, minimum_entries: int = 3, max_entries: int = 512
+    ) -> None:
         """Find referenced runs of absolute pointers into decoded code.
 
         This is a small, conservative subset of Ghidra's ``AddressTable`` and
@@ -376,7 +409,11 @@ class Analyzer:
                     break
                 target = int.from_bytes(section.data[entry_offset:entry_end], "little")
                 target_section = self.image.section_at(target, file_backed=True)
-                if target not in self.instructions or target_section is None or not target_section.executable:
+                if (
+                    target not in self.instructions
+                    or target_section is None
+                    or not target_section.executable
+                ):
                     break
                 targets.append(target)
 
@@ -406,9 +443,13 @@ class Analyzer:
                 continue
 
             computed_targets = tuple(
-                dict.fromkeys(target for table in linked_tables for target in table.targets)
+                dict.fromkeys(
+                    target for table in linked_tables for target in table.targets
+                )
             )
-            self.instructions[address] = replace(instruction, computed_targets=computed_targets)
+            self.instructions[address] = replace(
+                instruction, computed_targets=computed_targets
+            )
             for table in linked_tables:
                 jump_sources[table.address].append(address)
             for target in computed_targets:
@@ -472,7 +513,10 @@ class Analyzer:
             return False
         if instruction.branch_target in self.no_return_addresses:
             return True
-        return any(target in self.no_return_addresses for target in instruction.memory_references)
+        return any(
+            target in self.no_return_addresses
+            for target in instruction.memory_references
+        )
 
     def _discover_macho_function_starts(self) -> None:
         """Use Mach-O LC_FUNCTION_STARTS as a late, validated seed source.
@@ -536,7 +580,9 @@ class Analyzer:
                 continue
             self.function_start_candidates.append(candidate)
             name = candidate.label or self._name_by_address.get(candidate.address, "")
-            self._add_seed(candidate.address, name, f"Ghidra pattern: {candidate.pattern}")
+            self._add_seed(
+                candidate.address, name, f"Ghidra pattern: {candidate.pattern}"
+            )
             added = True
         if added:
             self._recover_functions()
@@ -625,7 +671,7 @@ class Analyzer:
             added = True
         return added
 
-    def _call_site_nonreturn_indicator(self, call: Instruction) -> Optional[str]:
+    def _call_site_nonreturn_indicator(self, call: Instruction) -> str | None:
         """Check a bounded fall-through chain for Ghidra-style warning signs."""
         address = call.next_address
         visited: set[int] = set()
@@ -666,7 +712,10 @@ class Analyzer:
     def _infer_no_return_wrappers(self) -> bool:
         added = False
         for function in list(self.functions.values()):
-            if function.address in self.no_return_addresses or not function.instructions:
+            if (
+                function.address in self.no_return_addresses
+                or not function.instructions
+            ):
                 continue
             if not self._function_paths_only_call_no_return(function):
                 continue
@@ -729,7 +778,10 @@ class Analyzer:
     def _jump_is_noreturn(self, instruction: Instruction) -> bool:
         return instruction.is_jump and (
             instruction.branch_target in self.no_return_addresses
-            or any(target in self.no_return_addresses for target in instruction.memory_references)
+            or any(
+                target in self.no_return_addresses
+                for target in instruction.memory_references
+            )
         )
 
     def _recover_functions(self) -> None:
@@ -788,8 +840,15 @@ class Analyzer:
             if not instruction.is_jump or instruction.is_conditional_jump:
                 return None
             body.append(instruction)
-            if instruction.branch_target is not None and instruction.branch_target != start:
-                return body, instruction.branch_target, self.name_at(instruction.branch_target)
+            if (
+                instruction.branch_target is not None
+                and instruction.branch_target != start
+            ):
+                return (
+                    body,
+                    instruction.branch_target,
+                    self.name_at(instruction.branch_target),
+                )
             for target in instruction.memory_references:
                 target_name = self.image.import_slots.get(target)
                 if target_name is None:
@@ -862,10 +921,16 @@ class Analyzer:
             if instruction.is_jump:
                 if instruction.branch_target in addresses:
                     boundaries.add(instruction.branch_target)
-                boundaries.update(target for target in instruction.computed_targets if target in addresses)
+                boundaries.update(
+                    target
+                    for target in instruction.computed_targets
+                    if target in addresses
+                )
                 if following in addresses:
                     boundaries.add(following)
-            elif (instruction.is_return or instruction.is_trap) and following in addresses:
+            elif (
+                instruction.is_return or instruction.is_trap
+            ) and following in addresses:
                 boundaries.add(following)
 
         chunks: list[list[Instruction]] = []
@@ -875,8 +940,10 @@ class Analyzer:
                 chunks.append(current)
                 current = []
             current.append(instruction)
-            if instruction.is_return or instruction.is_trap or (
-                instruction.is_jump and not instruction.is_conditional_jump
+            if (
+                instruction.is_return
+                or instruction.is_trap
+                or (instruction.is_jump and not instruction.is_conditional_jump)
             ):
                 chunks.append(current)
                 current = []
@@ -894,10 +961,16 @@ class Analyzer:
                     if last.branch_target is not None
                     else last.computed_targets
                 )
-                successors.extend(target for target in targets if target in block_starts)
+                successors.extend(
+                    target for target in targets if target in block_starts
+                )
                 if last.is_conditional_jump and last.next_address in block_starts:
                     successors.append(last.next_address)
-            elif not last.is_return and not last.is_trap and last.next_address in block_starts:
+            elif (
+                not last.is_return
+                and not last.is_trap
+                and last.next_address in block_starts
+            ):
                 successors.append(last.next_address)
             blocks.append(
                 BasicBlock(
@@ -943,7 +1016,7 @@ class Analyzer:
                 return candidate
         raise ValueError(f"No hay una función recuperada en {address:#x}.")
 
-    def name_at(self, address: int) -> Optional[str]:
+    def name_at(self, address: int) -> str | None:
         if self.project_state is not None and address in self.project_state.labels:
             return self.project_state.labels[address]
         if address in self._name_by_address:
@@ -952,7 +1025,7 @@ class Analyzer:
         return function.name if function else None
 
     def iter_instructions(
-        self, start: Optional[int] = None, count: Optional[int] = None
+        self, start: int | None = None, count: int | None = None
     ) -> list[Instruction]:
         addresses = self.instruction_addresses
         if start is not None:
@@ -963,10 +1036,14 @@ class Analyzer:
         return [self.instructions[address] for address in addresses]
 
     def xrefs_to(self, address: int) -> list[Xref]:
-        return sorted(self.xrefs_by_target.get(address, ()), key=lambda item: item.source)
+        return sorted(
+            self.xrefs_by_target.get(address, ()), key=lambda item: item.source
+        )
 
     def xrefs_from(self, address: int) -> list[Xref]:
-        return sorted(self.xrefs_by_source.get(address, ()), key=lambda item: item.target)
+        return sorted(
+            self.xrefs_by_source.get(address, ()), key=lambda item: item.target
+        )
 
     def strings_matching(self, query: str = "") -> list[StringEntry]:
         folded = query.casefold()
@@ -995,7 +1072,10 @@ class Analyzer:
             if target_name:
                 annotation = f"->{target_name}"
         if annotation is None:
-            for target in (*instruction.memory_references, *instruction.indexed_memory_references):
+            for target in (
+                *instruction.memory_references,
+                *instruction.indexed_memory_references,
+            ):
                 target_name = self.name_at(target)
                 if target_name:
                     annotation = f"[{target_name}]"
@@ -1006,7 +1086,11 @@ class Analyzer:
             target = instruction.scalar_references[0]
             target_name = self.name_at(target) or format(target, "#x")
             annotation = f"scalar->{target_name}"
-        comment = self.project_state.comments.get(instruction.address) if self.project_state else None
+        comment = (
+            self.project_state.comments.get(instruction.address)
+            if self.project_state
+            else None
+        )
         suffix = " ; " + annotation if annotation else ""
         if comment:
             suffix += (" " if suffix else " ; ") + comment
@@ -1016,7 +1100,9 @@ class Analyzer:
         markers = []
         if function.is_thunk:
             target = function.thunk_target_name or (
-                f"{function.thunk_target:#x}" if function.thunk_target is not None else "externa"
+                f"{function.thunk_target:#x}"
+                if function.thunk_target is not None
+                else "externa"
             )
             markers.append(f"THUNK -> {target}")
         if function.no_return:
@@ -1025,15 +1111,22 @@ class Analyzer:
             markers.append(f"STACK_PURGE={function.stack_purge_size}")
         if function.pe_unwind_info is not None:
             allocation = function.pe_unwind_info.stack_allocation_bytes
-            markers.append(f"UNWIND_STACK={allocation}" if allocation is not None else "UNWIND")
+            markers.append(
+                f"UNWIND_STACK={allocation}" if allocation is not None else "UNWIND"
+            )
         marker_text = f" [{' | '.join(markers)}]" if markers else ""
         lines = [
             f"{function.name} @ {function.address:#x}{marker_text}  "
             f"({len(function.instructions)} instrucciones, aprox. {function.size} bytes; origen: {function.source})"
         ]
         for instruction in function.instructions:
-            if instruction.address in self.function_seeds and instruction.address != function.address:
-                lines.append(f"\n{self.name_at(instruction.address) or f'loc_{instruction.address:X}'}:")
+            if (
+                instruction.address in self.function_seeds
+                and instruction.address != function.address
+            ):
+                lines.append(
+                    f"\n{self.name_at(instruction.address) or f'loc_{instruction.address:X}'}:"
+                )
             lines.append("  " + self.format_instruction(instruction))
         return "\n".join(lines)
 
@@ -1140,13 +1233,49 @@ class Analyzer:
 
         return SemanticDecompiler(self).decompile(function)
 
+    def ssa(self, function: int | Function) -> SSAFunction:
+        """Return the p-code SSA/heritage graph for a recovered function."""
+        from .sleigh import SleighTranslator
+
+        target = self.functions.get(function) if isinstance(function, int) else function
+        if target is None:
+            raise KeyError(f"No existe función en {function:#x}")
+        convention = calling_convention_for(self, target)
+        translator = SleighTranslator(self.image.bits)
+        translations = translator.translate_instructions(target.instructions)
+        return SSAHeritage(
+            target,
+            translations,
+            caller_saved_registers=convention.caller_saved_registers,
+            return_registers=(
+                *convention.integer_return_registers,
+                *convention.floating_return_registers,
+            ),
+            no_return_calls=(
+                instruction.address
+                for instruction in target.instructions
+                if self._call_is_noreturn(instruction)
+                and instruction.branch_target != instruction.next_address
+            ),
+            registers=translator.registers,
+        ).build()
+
     def cfg_dot(self, function: Function) -> str:
-        safe_name = function.name.replace('"', r'\"')
-        lines = ["digraph cfg {", "  rankdir=TB;", f'  label="{safe_name} @ {function.address:#x}";']
+        safe_name = function.name.replace('"', r"\"")
+        lines = [
+            "digraph cfg {",
+            "  rankdir=TB;",
+            f'  label="{safe_name} @ {function.address:#x}";',
+        ]
         for block in function.blocks:
-            label_lines = [f"{instruction.address:#x}: {instruction.mnemonic} {instruction.op_str}" for instruction in block.instructions]
-            label = "\\l".join(line.replace('"', r'\"') for line in label_lines) + "\\l"
-            lines.append(f'  n{block.start:x} [shape=box,fontname="monospace",label="{label}"];')
+            label_lines = [
+                f"{instruction.address:#x}: {instruction.mnemonic} {instruction.op_str}"
+                for instruction in block.instructions
+            ]
+            label = "\\l".join(line.replace('"', r"\"") for line in label_lines) + "\\l"
+            lines.append(
+                f'  n{block.start:x} [shape=box,fontname="monospace",label="{label}"];'
+            )
         for block in function.blocks:
             for successor in block.successors:
                 lines.append(f"  n{block.start:x} -> n{successor:x};")
@@ -1166,19 +1295,25 @@ class Analyzer:
             "functions": len(self.functions),
             "thunks": sum(function.is_thunk for function in self.functions.values()),
             "address_tables": len(self.address_tables),
-            "computed_jumps": sum(bool(item.computed_targets) for item in self.instructions.values()),
+            "computed_jumps": sum(
+                bool(item.computed_targets) for item in self.instructions.values()
+            ),
             "pattern_functions": len(self.function_start_candidates),
             "macho_function_starts": len(self.macho_function_start_candidates),
             "pe_exception_functions": len(
                 getattr(self.image, "pe_exception_function_ranges", ())
             ),
             "pe_unwind_functions": sum(
-                function.pe_unwind_info is not None for function in self.functions.values()
+                function.pe_unwind_info is not None
+                for function in self.functions.values()
             ),
             "pe_tls_callbacks": len(getattr(self.image, "pe_tls_callbacks", ())),
-            "no_return_functions": sum(function.no_return for function in self.functions.values()),
+            "no_return_functions": sum(
+                function.no_return for function in self.functions.values()
+            ),
             "stack_purge_functions": sum(
-                function.stack_purge_size is not None for function in self.functions.values()
+                function.stack_purge_size is not None
+                for function in self.functions.values()
             ),
             "no_return_imports": len(self.no_return_imports),
             "strings": len(self.strings),

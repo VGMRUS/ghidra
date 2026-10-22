@@ -110,6 +110,16 @@ class SleighTranslator:
         )
         language = pypcode.ArchLanguage(str(specs_dir), language_definition)
         self._context = pypcode.Context(language)
+        self.registers: dict[str, SleighVarnode] = {
+            name.lower(): SleighVarnode(
+                "register",
+                int(varnode.offset),
+                int(varnode.size),
+                name,
+            )
+            for name, varnode in getattr(self._context, "registers", {}).items()
+            if varnode.space.name == "register"
+        }
         # pypcode contexts carry translation state; serialize use in case an
         # Analyzer is shared by concurrent Python callers.
         self._lock = RLock()
