@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-ghidra-py"
+version = "0.1.0"
+description = "Analizador estatico educativo para binarios x86/x86-64, inspirado en Ghidra"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "MiniGhidraPy contributors" }]
+dependencies = [
+  "capstone>=5.0,<6",
+  "lief>=0.15,<1",
+]
+
+[project.scripts]
+minighidra = "minighidra.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["minighidra*"]
+
+[tool.setuptools.package-data]
+minighidra = ["data/noreturn/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
