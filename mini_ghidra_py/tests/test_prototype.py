@@ -6,7 +6,13 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 
-from minighidra import Analyzer, BinaryImage, FunctionParameter, FunctionSignature
+from minighidra import (
+    Analyzer,
+    BinaryImage,
+    CType,
+    FunctionParameter,
+    FunctionSignature,
+)
 from minighidra.abi import (
     SYSV_AMD64,
     WINDOWS_X64,
@@ -121,6 +127,36 @@ class PrototypeResolverTests(unittest.TestCase):
                 for location in returned.return_locations
             ],
             [("xmm0", 0), ("xmm1", 8)],
+        )
+
+        vector = types.add(CType("Vec128", TypeKind.VECTOR, 16, 16))
+        vector_argument = resolver.resolve(
+            FunctionSignature(
+                "void",
+                (FunctionParameter("vector", vector),),
+                SYSV_AMD64.name,
+            ),
+            SYSV_AMD64,
+        ).signature.parameters[0]
+        self.assertEqual(
+            [
+                (location.register, location.value_offset, location.register_offset)
+                for location in vector_argument.locations
+            ],
+            [("xmm0", 0, 0), ("xmm0", 8, 8)],
+        )
+        vector_return = resolver.resolve(
+            FunctionSignature(
+                "Vec128", (), SYSV_AMD64.name, return_data_type=vector
+            ),
+            SYSV_AMD64,
+        ).signature
+        self.assertEqual(
+            [
+                (location.register, location.value_offset, location.register_offset)
+                for location in vector_return.return_locations
+            ],
+            [("xmm0", 0, 0), ("xmm0", 8, 8)],
         )
 
     def test_sysv_unaligned_and_large_aggregates_use_memory(self) -> None:

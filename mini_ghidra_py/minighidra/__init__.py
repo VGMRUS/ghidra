@@ -20,6 +20,8 @@ from .paramid import (
     ParamMeasurement,
     ParamRank,
     ParamTrial,
+    ParamTrialEntry,
+    ParamTrialFlag,
     PcodeLikeGraph,
 )
 from .project import ProjectState
@@ -59,6 +61,8 @@ __all__ = [
     "ParamMeasurement",
     "ParamRank",
     "ParamTrial",
+    "ParamTrialEntry",
+    "ParamTrialFlag",
     "PcodeLikeGraph",
     "ProjectState",
     "PrototypeLayout",

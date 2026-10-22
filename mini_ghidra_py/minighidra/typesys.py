@@ -102,7 +102,12 @@ class CType:
 
 @dataclass(frozen=True, slots=True)
 class StorageLocation:
-    """One piece of a parameter/return value in a calling convention."""
+    """One piece of a parameter/return value in a calling convention.
+
+    ``register_offset`` identifies a subrange within a physical register (for
+    example, the upper SSEUP lane in ``xmm0``); ``value_offset`` remains the
+    corresponding byte offset in the logical value.
+    """
 
     kind: str
     size: int
@@ -111,6 +116,7 @@ class StorageLocation:
     value_offset: int = 0
     indirect: bool = False
     hidden: bool = False
+    register_offset: int = 0
 
     @property
     def is_register(self) -> bool:

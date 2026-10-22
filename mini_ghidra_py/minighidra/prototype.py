@@ -318,7 +318,9 @@ class PrototypeResolver:
                     return (StorageLocation("register", base.size, register="st0"),)
                 return (StorageLocation("register", base.size or 8, register="xmm0"),)
             if base.kind == TypeKind.VECTOR:
-                return (StorageLocation("register", base.size or 16, register="xmm0"),)
+                return self._sysv_return_locations(
+                    self._sysv_classes(base), base.size or 0
+                )
             if base.is_aggregate:
                 classes = self._sysv_classes(base)
                 return self._sysv_return_locations(classes, base.size or 0)
@@ -396,6 +398,7 @@ class PrototypeResolver:
                 else:
                     locations_list: list[StorageLocation] = []
                     pending_sse: str | None = None
+                    pending_sse_value_offset: int | None = None
                     for index, abi_class in enumerate(classes):
                         offset = index * 8
                         size = min(8, max(1, (dtype.size or 8) - offset))
@@ -411,10 +414,12 @@ class PrototypeResolver:
                                 )
                             )
                             pending_sse = None
+                            pending_sse_value_offset = None
                         elif abi_class == "SSE":
                             register = self._SYSV_FLOAT_ARGUMENTS[sse_index]
                             sse_index += 1
                             pending_sse = register
+                            pending_sse_value_offset = offset
                             locations_list.append(
                                 StorageLocation(
                                     "register",
@@ -429,6 +434,7 @@ class PrototypeResolver:
                             )
                             if pending_sse is None:
                                 sse_index += 1
+                                pending_sse_value_offset = offset
                             pending_sse = register
                             locations_list.append(
                                 StorageLocation(
@@ -436,6 +442,14 @@ class PrototypeResolver:
                                     size,
                                     register=register,
                                     value_offset=offset,
+                                    register_offset=(
+                                        offset
+                                        - (
+                                            pending_sse_value_offset
+                                            if pending_sse_value_offset is not None
+                                            else offset
+                                        )
+                                    ),
                                 )
                             )
                     locations = tuple(locations_list)
@@ -687,6 +701,7 @@ class PrototypeResolver:
         gp_index = 0
         sse_index = 0
         previous_sse: str | None = None
+        previous_sse_value_offset: int | None = None
         for index, abi_class in enumerate(classes):
             part_size = min(8, max(1, size - index * 8))
             if abi_class == "INTEGER":
@@ -702,10 +717,12 @@ class PrototypeResolver:
                 )
                 gp_index += 1
                 previous_sse = None
+                previous_sse_value_offset = None
             elif abi_class == "SSE":
                 if sse_index >= len(self._SYSV_FLOAT_RETURNS):
                     return ()
                 previous_sse = self._SYSV_FLOAT_RETURNS[sse_index]
+                previous_sse_value_offset = index * 8
                 sse_index += 1
                 locations.append(
                     StorageLocation(
@@ -720,6 +737,7 @@ class PrototypeResolver:
                     if sse_index >= len(self._SYSV_FLOAT_RETURNS):
                         return ()
                     previous_sse = self._SYSV_FLOAT_RETURNS[sse_index]
+                    previous_sse_value_offset = index * 8
                     sse_index += 1
                 locations.append(
                     StorageLocation(
@@ -727,6 +745,14 @@ class PrototypeResolver:
                         part_size,
                         register=previous_sse,
                         value_offset=index * 8,
+                        register_offset=(
+                            index * 8
+                            - (
+                                previous_sse_value_offset
+                                if previous_sse_value_offset is not None
+                                else index * 8
+                            )
+                        ),
                     )
                 )
         return tuple(locations)

@@ -5,7 +5,13 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from minighidra import Analyzer, BinaryImage
+from minighidra import (
+    Analyzer,
+    BinaryImage,
+    ParamTrial,
+    ParamTrialEntry,
+    ParamTrialFlag,
+)
 from minighidra.abi import X86_FASTCALL
 from minighidra.decompiler import SemanticDecompiler
 from minighidra.model import FunctionParameter, FunctionSignature
@@ -274,6 +280,7 @@ class ParamIDTests(unittest.TestCase):
         self.assertFalse(second.is_used())
         self.assertFalse(first.is_selected())
 
+        active.select_candidates(("param_1",), include_inactive=True)
         first.mark_used()
         self.assertTrue(first.is_active())
         self.assertTrue(first.is_selected())
@@ -300,6 +307,272 @@ class ParamIDTests(unittest.TestCase):
         self.assertTrue(copied.active)
         self.assertTrue(copied.killed_by_call)
         self.assertIs(active.get_trial("param_1"), copied)
+
+    def test_param_trial_flags_match_ghidra_bits_and_transitions(self) -> None:
+        trial = ParamTrial("param_1", 1, 64)
+        self.assertEqual(trial.flags, ParamTrialFlag(0))
+
+        trial.mark_used()
+        self.assertEqual(trial.flags, ParamTrialFlag.USED)
+        self.assertFalse(trial.active)
+        self.assertFalse(trial.checked)
+        trial.mark_active()
+        self.assertEqual(
+            trial.flags, ParamTrialFlag.USED | ParamTrialFlag.ACTIVE | ParamTrialFlag.CHECKED
+        )
+        trial.mark_inactive()
+        self.assertTrue(trial.used)
+        self.assertFalse(trial.active)
+        trial.mark_no_use()
+        self.assertEqual(
+            trial.flags,
+            ParamTrialFlag.CHECKED | ParamTrialFlag.DEFINITELY_NOT_USED,
+        )
+        trial.mark_unreferenced()
+        self.assertEqual(trial.slot, -1)
+        self.assertTrue(trial.is_unreferenced())
+        self.assertTrue(trial.is_definitely_not_used())
+
+        trial.flags = (
+            ParamTrialFlag.CHECKED
+            | ParamTrialFlag.KILLED_BY_CALL
+            | ParamTrialFlag.REM_FORMED
+            | ParamTrialFlag.INDIRECT_CREATED
+            | ParamTrialFlag.CONDITIONAL_EXECUTION
+            | ParamTrialFlag.ANCESTOR_REALISTIC
+            | ParamTrialFlag.ANCESTOR_SOLID
+        )
+        trial.mark_selected()
+        self.assertTrue(trial.is_selected())
+        self.assertFalse(trial.flags & ParamTrialFlag.USED)
+        self.assertTrue(trial.is_killed_by_call())
+        self.assertTrue(trial.is_rem_formed())
+        self.assertTrue(trial.is_indirect_created())
+        self.assertTrue(trial.has_conditional_execution())
+        self.assertTrue(trial.has_ancestor_realistic())
+        self.assertTrue(trial.has_ancestor_solid())
+
+    def test_param_active_split_join_and_stack_placeholder_slots(self) -> None:
+        active = ParamActive()
+        before = active.register_trial(
+            "before", 32, (StorageLocation("stack", 4, stack_offset=-16),)
+        )
+        before.mark_active()
+        before.mark_used()
+        placeholder = active.set_placeholder_slot()
+        target = active.register_trial(
+            "wide", 64, (StorageLocation("stack", 8, stack_offset=0),)
+        )
+        target.mark_active()
+        target.mark_used()
+        target.set_entry(ParamTrialEntry(group=4, order=2), offset=3)
+        target.set_fixed_position(1)
+        active.register_trial(
+            "after", 32, (StorageLocation("stack", 4, stack_offset=16),)
+        )
+        active.set_max_pass(7)
+
+        self.assertEqual(placeholder, 2)
+        self.assertIs(active.get_trial_for_input_varnode(1), before)
+        self.assertIs(active.get_trial_for_input_varnode(3), target)
+        self.assertIs(active.get_trial_for_input_varnode(4), active.trials[2])
+        with self.assertRaisesRegex(RuntimeError, "placeholder"):
+            active.split_trial(1, 32)
+        with self.assertRaisesRegex(RuntimeError, "placeholder"):
+            active.join_trial(1, size_bits=64)
+        active.free_placeholder_slot()
+        self.assertEqual(active.max_pass, 0)
+        self.assertEqual(active.placeholder_slot, -2)
+        self.assertEqual([trial.slot for trial in active.trials], [1, 2, 3])
+
+        high, low = active.split_trial(1, 32)
+        self.assertEqual([trial.slot for trial in active.trials], [1, 2, 3, 4])
+        self.assertEqual((high.size_bits, low.size_bits), (32, 32))
+        self.assertEqual(high.locations[0].stack_offset, 0)
+        self.assertEqual(low.locations[0].stack_offset, 4)
+        self.assertEqual(high.entry, None)
+        self.assertIsNone(high.fixed_position)
+        self.assertTrue(high.used and high.active)
+        self.assertTrue(low.used and low.active)
+        with self.assertRaisesRegex(ValueError, "Size mismatch"):
+            active.join_trial(2, size_bits=32)
+        self.assertEqual([trial.slot for trial in active.trials], [1, 2, 3, 4])
+
+        joined = active.join_trial(2, size_bits=64)
+        self.assertEqual(joined.name, "wide")
+        self.assertEqual(joined.locations, (StorageLocation("stack", 8, stack_offset=0),))
+        self.assertTrue(joined.used and joined.active and joined.checked)
+        self.assertFalse(joined.selected)
+        self.assertEqual([trial.slot for trial in active.trials], [1, 2, 3])
+        self.assertEqual(active.get_num_used(), 2)
+
+    def test_param_trial_shrink_obeys_endianness_and_model_binding(self) -> None:
+        location = StorageLocation("stack", 8, stack_offset=12)
+        little = ParamTrial("little", 1, 64, (location,))
+        low = StorageLocation("stack", 4, stack_offset=12)
+        high = StorageLocation("stack", 4, stack_offset=16)
+        self.assertTrue(little.test_shrink(low, 32))
+        self.assertFalse(little.test_shrink(high, 32))
+        little.shrink(low, 32)
+        self.assertEqual(little.size_bits, 32)
+        self.assertEqual(little.locations, (low,))
+
+        big = ParamTrial("big", 1, 64, (location,), big_endian=True)
+        self.assertTrue(big.test_shrink(high, 32))
+        self.assertFalse(big.test_shrink(low, 32))
+        big.set_entry(ParamTrialEntry(group=1), offset=0)
+        self.assertFalse(big.test_shrink(high, 32))
+
+        active = ParamActive()
+        candidate = active.register_trial("candidate", 64, (location,))
+        self.assertIs(candidate, active.get_trial_at(0))
+        self.assertEqual(candidate.get_size(), 8)
+        self.assertEqual(candidate.get_address(), (location,))
+        self.assertTrue(active.test_shrink(0, low, 32))
+        active.shrink(0, low, 32)
+        self.assertEqual(active.get_trial_at(0).locations, (low,))
+
+    def test_param_trial_splits_register_groups_and_vector_lanes(self) -> None:
+        aggregate = ParamTrial(
+            "aggregate",
+            1,
+            128,
+            (
+                StorageLocation("register", 8, register="rax", value_offset=0),
+                StorageLocation("register", 8, register="rdx", value_offset=8),
+            ),
+        )
+        low, high = aggregate.split_hi(64), aggregate.split_lo(64)
+        self.assertEqual(low.locations[0].register, "rax")
+        self.assertEqual(high.locations[0].register, "rdx")
+
+        vector = ParamTrial(
+            "vector", 1, 128, (StorageLocation("register", 16, register="xmm0"),)
+        )
+        low_lane, high_lane = vector.split_hi(64), vector.split_lo(64)
+        self.assertEqual(low_lane.locations[0].register_offset, 0)
+        self.assertEqual(high_lane.locations[0].register, "xmm0")
+        self.assertEqual(high_lane.locations[0].register_offset, 8)
+
+    def test_param_active_overlap_duplicate_names_and_slot_lookup(self) -> None:
+        active = ParamActive()
+        stack = active.register_trial(
+            "piece", 64, (StorageLocation("stack", 8, stack_offset=-8),)
+        )
+        register = active.register_trial(
+            "piece", 32, (StorageLocation("register", 4, register="eax"),)
+        )
+
+        self.assertEqual(active.get_num_trials(), 2)
+        self.assertEqual(len(active.get_trials("piece")), 2)
+        self.assertIs(active.get_trial("piece"), register)
+        self.assertEqual(
+            active.which_trial(StorageLocation("stack", 4, stack_offset=-4)), 0
+        )
+        self.assertEqual(
+            active.which_trial(StorageLocation("stack", 1, stack_offset=0)), -1
+        )
+        self.assertEqual(
+            active.which_trial(StorageLocation("register", 1, register="ah")), 1
+        )
+        self.assertTrue(register.killed_by_call)
+        self.assertFalse(stack.killed_by_call)
+        self.assertIs(active.get_trial_for_input_varnode(1), stack)
+        self.assertIs(active.get_trial_for_input_varnode(2), register)
+        self.assertEqual(active.which_trial(StorageLocation("register", 1, register="al")), 1)
+
+    def test_param_trial_slot_group_uses_entry_alignment_and_direction(self) -> None:
+        forward_entry = ParamTrialEntry(
+            group=5, alignment=4, address_base=0, num_slots=3
+        )
+        forward = ParamTrial(
+            "forward", 1, 32,
+            (StorageLocation("stack", 4, stack_offset=4),),
+        )
+        forward.set_entry(forward_entry)
+        self.assertEqual(forward.slot_group(), 6)
+
+        reverse_entry = ParamTrialEntry(
+            group=5, reverse_stack=True, alignment=4, address_base=0, num_slots=3
+        )
+        reverse = ParamTrial(
+            "reverse", 1, 32,
+            (StorageLocation("stack", 4, stack_offset=0),),
+        )
+        reverse.set_entry(reverse_entry)
+        self.assertEqual(reverse.slot_group(), 7)
+
+        exclusion = ParamTrial(
+            "exclusion", 1, 64,
+            (StorageLocation("register", 8, register="rax"),),
+        )
+        exclusion.set_entry(
+            ParamTrialEntry(group=10, exclusion=True, alignment=0, num_slots=2)
+        )
+        self.assertEqual(exclusion.slot_group(), 11)
+
+    def test_param_active_model_order_fixed_position_and_compaction(self) -> None:
+        active = ParamActive()
+        stack_low = active.register_trial(
+            "stack_low", 32, (StorageLocation("stack", 4, stack_offset=8),)
+        )
+        stack_high = active.register_trial(
+            "stack_high", 32, (StorageLocation("stack", 4, stack_offset=16),)
+        )
+        first_group = active.register_trial(
+            "first_group", 32, (StorageLocation("register", 4, register="eax"),)
+        )
+        active.register_trial("no_model", 32)
+        reverse_stack = ParamTrialEntry(group=2, reverse_stack=True)
+        stack_low.set_entry(reverse_stack)
+        stack_high.set_entry(reverse_stack)
+        first_group.set_entry(ParamTrialEntry(group=1))
+
+        active.sort_trials()
+        self.assertEqual(
+            [trial.name for trial in active.trials],
+            ["first_group", "stack_high", "stack_low", "no_model"],
+        )
+        self.assertEqual([trial.slot for trial in active.trials], [3, 2, 1, 4])
+
+        stack_high.set_fixed_position(2)
+        stack_low.set_fixed_position(1)
+        active.sort_by_fixed_position()
+        self.assertEqual(
+            [trial.name for trial in active.trials],
+            ["stack_low", "stack_high", "first_group", "no_model"],
+        )
+        first_group.mark_used()
+        stack_low.mark_used()
+        stack_high.mark_used()
+        active.delete_unused_trials()
+        self.assertEqual([trial.name for trial in active.trials], ["stack_low", "stack_high", "first_group"])
+        self.assertEqual([trial.slot for trial in active.trials], [1, 2, 3])
+        self.assertEqual(active.slot_base, 5)
+        self.assertEqual(active.get_num_used(), 3)
+        self.assertIs(active.get_trial_for_input_varnode(2), stack_high)
+
+    def test_param_active_clear_preserves_ghidra_control_flags(self) -> None:
+        active = ParamActive(recover_subcalls=True)
+        active.set_max_pass(5)
+        active.mark_needs_final_check()
+        active.finish_pass()
+        active.mark_fully_checked()
+        active.set_join_most_sig_first()
+        active.set_placeholder_slot()
+        active.register_trial("param_1", 64)
+
+        active.clear()
+
+        self.assertEqual(active.trials, ())
+        self.assertEqual(active.slot_base, 1)
+        self.assertEqual(active.placeholder_slot, -1)
+        self.assertEqual(active.num_passes, 0)
+        self.assertEqual(active.max_pass, 5)
+        self.assertTrue(active.needs_final_check)
+        self.assertFalse(active.fully_checked)
+        self.assertFalse(active.join_most_sig_first)
+        self.assertTrue(active.recover_subcall)
 
     def test_justproto_requires_explicit_formal_names(self) -> None:
         analysis = ParamIDAnalysis(PcodeLikeGraph())

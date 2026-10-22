@@ -13,7 +13,8 @@ import re
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from enum import Enum, IntEnum
+from enum import Enum, IntEnum, IntFlag
+from functools import cmp_to_key
 from typing import Any
 
 from .sleigh import SleighInstruction, SleighPcodeOp
@@ -167,9 +168,71 @@ class ParamMeasurement:
         return tuple(result)
 
 
+class ParamTrialFlag(IntFlag):
+    """Bit flags used by Ghidra's ``ParamTrial`` storage-range model."""
+
+    CHECKED = 0x001
+    USED = 0x002
+    DEFINITELY_NOT_USED = 0x004
+    ACTIVE = 0x008
+    UNREFERENCED = 0x010
+    KILLED_BY_CALL = 0x020
+    REM_FORMED = 0x040
+    INDIRECT_CREATED = 0x080
+    CONDITIONAL_EXECUTION = 0x100
+    ANCESTOR_REALISTIC = 0x200
+    ANCESTOR_SOLID = 0x400
+
+
+@dataclass(frozen=True, slots=True)
+class ParamTrialEntry:
+    """The ordering properties a matched Ghidra ``ParamEntry`` supplies.
+
+    The actual ParamList/ParamEntry mapping is outside this port. ``order`` is
+    a caller-supplied stand-in for the source object's pointer ordering when
+    entries share a group; object identity breaks unspecified ties. Optional
+    alignment/base/slot metadata also models
+    ``ParamEntry.getSlot`` for a contiguous storage range.
+    """
+
+    group: int
+    order: int = 0
+    exclusion: bool = False
+    reverse_stack: bool = False
+    alignment: int | None = None
+    address_base: int | None = None
+    num_slots: int = 1
+
+    def __post_init__(self) -> None:
+        if self.alignment is not None and self.alignment < 0:
+            raise ValueError("La alineación de ParamTrialEntry no puede ser negativa")
+        if self.num_slots < 1:
+            raise ValueError("ParamTrialEntry necesita al menos un slot")
+
+    @property
+    def is_exclusion(self) -> bool:
+        """Whether the model entry denotes a single-parameter exclusion."""
+        return self.exclusion or self.alignment == 0
+
+    def get_slot(self, address_offset: int, size_bytes: int) -> int:
+        """Resolve the group slot of a byte range, mirroring ``getSlot``."""
+        if size_bytes <= 0:
+            raise ValueError("El rango de ParamTrialEntry debe tener tamaño positivo")
+        if self.is_exclusion:
+            return self.group + (self.num_slots - 1 if size_bytes > 1 else 0)
+        if self.alignment is None:
+            return self.group
+        if self.address_base is None:
+            raise ValueError("Falta address_base para calcular el slot alineado")
+        base_slot = (address_offset + size_bytes - 1 - self.address_base) // self.alignment
+        if self.reverse_stack:
+            base_slot = self.num_slots - 1 - base_slot
+        return self.group + base_slot
+
+
 @dataclass(slots=True)
 class ParamTrial:
-    """A tentative ABI input range measured against SSA and fallback evidence."""
+    """A tentative storage range and its ParamID recovery flags."""
 
     name: str
     slot: int
@@ -191,29 +254,47 @@ class ParamTrial:
     ancestor_realistic: bool = False
     ancestor_solid: bool = False
     fixed_position: int | None = None
+    entry: ParamTrialEntry | None = None
+    offset: int = -1
+    big_endian: bool = False
+
+    @property
+    def size_bytes(self) -> int:
+        """Storage width in bytes (trials are byte-addressed in Ghidra)."""
+        return (max(0, self.size_bits) + 7) // 8
+
+    @property
+    def flags(self) -> ParamTrialFlag:
+        """Return the source-compatible flag mask; ``selected`` is Python-only."""
+        result = ParamTrialFlag(0)
+        for flag, field_name in _PARAM_TRIAL_FLAG_FIELDS:
+            if getattr(self, field_name):
+                result |= flag
+        return result
+
+    @flags.setter
+    def flags(self, value: ParamTrialFlag | int) -> None:
+        flags = ParamTrialFlag(value)
+        for flag, field_name in _PARAM_TRIAL_FLAG_FIELDS:
+            setattr(self, field_name, bool(flags & flag))
 
     def mark_active(self) -> None:
         self.checked = True
         self.active = True
-        self.definitely_not_used = False
 
     def mark_inactive(self) -> None:
         self.checked = True
         self.active = False
 
     def mark_selected(self) -> None:
-        """Select this trial as a candidate without asserting it is active/used."""
+        """Select a Python candidate without implying Ghidra's final verdict."""
         self.selected = True
 
     def mark_unselected(self) -> None:
         self.selected = False
 
     def mark_used(self) -> None:
-        self.checked = True
-        self.active = True
-        self.selected = True
         self.used = True
-        self.definitely_not_used = False
 
     def mark_no_use(self) -> None:
         self.checked = True
@@ -232,17 +313,79 @@ class ParamTrial:
     def mark_rem_formed(self) -> None:
         self.rem_formed = True
 
+    def set_rem_formed(self) -> None:
+        self.mark_rem_formed()
+
     def mark_indirect_created(self) -> None:
         self.indirect_created = True
+
+    def set_indirect_created(self) -> None:
+        self.mark_indirect_created()
 
     def mark_conditional_execution(self) -> None:
         self.conditional_execution = True
 
+    def set_conditional_execution(self) -> None:
+        self.mark_conditional_execution()
+
     def mark_ancestor_realistic(self) -> None:
         self.ancestor_realistic = True
 
+    def set_ancestor_realistic(self) -> None:
+        self.mark_ancestor_realistic()
+
     def mark_ancestor_solid(self) -> None:
         self.ancestor_solid = True
+
+    def set_ancestor_solid(self) -> None:
+        self.mark_ancestor_solid()
+
+    def get_size(self) -> int:
+        """Return the storage width in bytes, like ``ParamTrial.getSize``."""
+        return self.size_bytes
+
+    def get_slot(self) -> int:
+        return self.slot
+
+    def set_slot(self, slot: int) -> None:
+        self.slot = slot
+
+    def get_entry(self) -> ParamTrialEntry | None:
+        return self.entry
+
+    def get_offset(self) -> int:
+        return self.offset
+
+    def get_address(self) -> tuple[StorageLocation, ...]:
+        """Return the physical pieces representing this logical trial range."""
+        return self.locations
+
+    def set_entry(self, entry: ParamTrialEntry | None, offset: int = -1) -> None:
+        self.entry = entry
+        self.offset = offset if entry is not None else -1
+
+    def slot_group(self) -> int:
+        if self.entry is None:
+            raise ValueError("El trial todavía no está asociado a un ParamEntry")
+        if self.entry.alignment in {None, 0}:
+            return self.entry.get_slot(0, self.size_bytes)
+        if len(self.locations) != 1:
+            raise ValueError(
+                "ParamTrialEntry.getSlot requiere una pieza contigua de storage"
+            )
+        location = self.locations[0]
+        if location.kind == "stack" and location.stack_offset is not None:
+            address_offset = location.stack_offset
+        elif location.kind == "register" and location.register is not None:
+            address_offset = (
+                location.register_offset + _register_alias_offset(location.register)
+            )
+        else:
+            raise ValueError("El trial no tiene una dirección para resolver su slot")
+        return self.entry.get_slot(address_offset, self.size_bytes)
+
+    def set_fixed_position(self, position: int | None) -> None:
+        self.fixed_position = position
 
     def is_checked(self) -> bool:
         return self.checked
@@ -256,16 +399,357 @@ class ParamTrial:
     def is_used(self) -> bool:
         return self.used
 
+    def is_definitely_not_used(self) -> bool:
+        return self.definitely_not_used
+
+    def is_unreferenced(self) -> bool:
+        return self.unreferenced
+
+    def is_killed_by_call(self) -> bool:
+        return self.killed_by_call
+
+    def is_rem_formed(self) -> bool:
+        return self.rem_formed
+
+    def is_indirect_created(self) -> bool:
+        return self.indirect_created
+
+    def has_conditional_execution(self) -> bool:
+        return self.conditional_execution
+
+    def has_ancestor_realistic(self) -> bool:
+        return self.ancestor_realistic
+
+    def has_ancestor_solid(self) -> bool:
+        return self.ancestor_solid
+
+    def set_address(
+        self,
+        locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int,
+    ) -> None:
+        self.locations = _coerce_storage_locations(locations)
+        _require_byte_size(size_bits)
+        self.size_bits = size_bits
+
+    def test_shrink(
+        self,
+        new_locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int | None = None,
+    ) -> bool:
+        """Test Ghidra's endian-aware shrink rule for an unbound trial."""
+        if self.entry is not None:
+            return False
+        locations = _coerce_storage_locations(new_locations)
+        if not locations:
+            return False
+        if size_bits is None:
+            size_bits = _storage_extent_bits(locations)
+        try:
+            _require_byte_size(size_bits)
+        except ValueError:
+            return False
+        new_size = size_bits // 8
+        old_size = self.size_bytes
+        if new_size <= 0 or new_size > old_size:
+            return False
+        start = old_size - new_size if self.big_endian else 0
+        try:
+            expected = _slice_storage_locations(
+                self.locations, start, start + new_size, old_size
+            )
+        except ValueError:
+            return False
+        return _physical_location_signature(expected) == _physical_location_signature(
+            locations
+        )
+
+    def shrink(
+        self,
+        new_locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int | None = None,
+    ) -> None:
+        if not self.test_shrink(new_locations, size_bits):
+            raise ValueError("El nuevo rango no es un shrink válido de ParamTrial")
+        locations = _coerce_storage_locations(new_locations)
+        if size_bits is None:
+            size_bits = _storage_extent_bits(locations)
+        self.set_address(locations, size_bits)
+
+    def split_hi(self, size_bits: int) -> ParamTrial:
+        """Copy the low-address/first bytes into the original slot."""
+        _require_split_size(size_bits, self.size_bits)
+        if not self.locations:
+            raise ValueError("No se puede dividir un trial sin storage asociado")
+        size_bytes = size_bits // 8
+        locations = _slice_storage_locations(
+            self.locations, 0, size_bytes, self.size_bytes
+        )
+        return self._split_copy(locations, size_bits, self.slot)
+
+    def split_lo(self, size_bits: int) -> ParamTrial:
+        """Copy the high-address/last bytes into the following slot."""
+        _require_split_size(size_bits, self.size_bits)
+        if not self.locations:
+            raise ValueError("No se puede dividir un trial sin storage asociado")
+        size_bytes = size_bits // 8
+        start = self.size_bytes - size_bytes
+        locations = _slice_storage_locations(
+            self.locations, start, self.size_bytes, self.size_bytes
+        )
+        return self._split_copy(locations, size_bits, self.slot + 1)
+
+    def _split_copy(
+        self,
+        locations: tuple[StorageLocation, ...],
+        size_bits: int,
+        slot: int,
+    ) -> ParamTrial:
+        return replace(
+            self,
+            slot=slot,
+            size_bits=size_bits,
+            locations=locations,
+            fixed_position=None,
+            entry=None,
+            offset=-1,
+        )
+
+    def fixed_position_before(self, other: ParamTrial) -> bool:
+        return self.fixed_position_compare(self, other)
+
+    @staticmethod
+    def fixed_position_compare(left: ParamTrial, right: ParamTrial) -> bool:
+        if left.fixed_position is None and right.fixed_position is None:
+            return left < right
+        if left.fixed_position is None:
+            return False
+        if right.fixed_position is None:
+            return True
+        return left.fixed_position < right.fixed_position
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, ParamTrial):
+            return NotImplemented
+        if self.entry is None:
+            return False
+        if other.entry is None:
+            return True
+        return _param_trial_order_key(self) < _param_trial_order_key(other)
+
+
+_PARAM_TRIAL_FLAG_FIELDS = (
+    (ParamTrialFlag.CHECKED, "checked"),
+    (ParamTrialFlag.USED, "used"),
+    (ParamTrialFlag.DEFINITELY_NOT_USED, "definitely_not_used"),
+    (ParamTrialFlag.ACTIVE, "active"),
+    (ParamTrialFlag.UNREFERENCED, "unreferenced"),
+    (ParamTrialFlag.KILLED_BY_CALL, "killed_by_call"),
+    (ParamTrialFlag.REM_FORMED, "rem_formed"),
+    (ParamTrialFlag.INDIRECT_CREATED, "indirect_created"),
+    (ParamTrialFlag.CONDITIONAL_EXECUTION, "conditional_execution"),
+    (ParamTrialFlag.ANCESTOR_REALISTIC, "ancestor_realistic"),
+    (ParamTrialFlag.ANCESTOR_SOLID, "ancestor_solid"),
+)
+
+
+def _normalize_trial_size(size_bits: int) -> int:
+    if size_bits <= 0:
+        raise ValueError("El tamaño de un ParamTrial debe ser positivo")
+    return ((size_bits + 7) // 8) * 8
+
+
+def _require_byte_size(size_bits: int) -> None:
+    if size_bits <= 0 or size_bits % 8:
+        raise ValueError("El tamaño de un ParamTrial debe ser positivo y múltiplo de 8")
+
+
+def _require_split_size(size_bits: int, total_bits: int) -> None:
+    _require_byte_size(size_bits)
+    if size_bits >= total_bits or size_bits % 8 or total_bits % 8:
+        raise ValueError("El split debe dejar dos rangos de bytes no vacíos")
+
+
+def _coerce_storage_locations(
+    locations: StorageLocation | Iterable[StorageLocation],
+) -> tuple[StorageLocation, ...]:
+    if isinstance(locations, StorageLocation):
+        return (locations,)
+    return tuple(locations)
+
+
+def _register_alias_offset(register: str | None) -> int:
+    return 1 if (register or "").lower() in {"ah", "bh", "ch", "dh"} else 0
+
+
+def _logical_location_offsets(
+    locations: tuple[StorageLocation, ...],
+) -> tuple[tuple[int, int], ...]:
+    if not locations:
+        return ()
+    offsets = [location.value_offset for location in locations]
+    if len(locations) > 1 and all(offset == 0 for offset in offsets):
+        # Same-offset pieces are parallel representations (e.g. Windows x64
+        # varargs copied into both XMM and GPR storage), not adjacent bytes.
+        return tuple((0, location.size) for location in locations)
+    origin = min(offsets)
+    return tuple(
+        (location.value_offset - origin, location.value_offset - origin + location.size)
+        for location in locations
+    )
+
+
+def _storage_extent_bits(locations: tuple[StorageLocation, ...]) -> int:
+    ranges = _logical_location_offsets(locations)
+    if not ranges:
+        return 0
+    return (max(end for _start, end in ranges) - min(start for start, _end in ranges)) * 8
+
+
+def _slice_storage_locations(
+    locations: tuple[StorageLocation, ...],
+    start: int,
+    end: int,
+    total_size: int,
+) -> tuple[StorageLocation, ...]:
+    if start < 0 or end <= start or end > total_size:
+        raise ValueError("Rango ParamTrial fuera de límites")
+    ranges = _logical_location_offsets(locations)
+    sliced: list[StorageLocation] = []
+    for location, (logical_start, logical_end) in zip(locations, ranges):
+        piece_start = max(start, logical_start)
+        piece_end = min(end, logical_end)
+        if piece_start >= piece_end:
+            continue
+        delta = piece_start - logical_start
+        size = piece_end - piece_start
+        value_offset = piece_start - start
+        if location.kind == "stack" and location.stack_offset is not None:
+            sliced.append(
+                replace(
+                    location,
+                    size=size,
+                    stack_offset=location.stack_offset + delta,
+                    value_offset=value_offset,
+                )
+            )
+        elif location.kind == "register" and location.register is not None:
+            sliced.append(
+                replace(
+                    location,
+                    size=size,
+                    register=_register_family(location.register.lower()),
+                    register_offset=(
+                        location.register_offset
+                        + _register_alias_offset(location.register)
+                        + delta
+                    ),
+                    value_offset=value_offset,
+                )
+            )
+        elif delta == 0:
+            sliced.append(replace(location, size=size, value_offset=value_offset))
+        else:
+            raise ValueError("No se puede calcular el subrango de esta ubicación")
+    if not sliced:
+        raise ValueError("El subrango no contiene storage")
+    return tuple(
+        sorted(
+            sliced,
+            key=lambda item: (
+                item.value_offset,
+                _storage_location_order_key(item),
+            ),
+        )
+    )
+
+
+def _physical_location_signature(
+    locations: tuple[StorageLocation, ...],
+) -> tuple[tuple[object, ...], ...]:
+    result = []
+    for location in locations:
+        if location.kind == "stack" and location.stack_offset is not None:
+            result.append(
+                (
+                    "stack",
+                    location.stack_offset,
+                    location.stack_offset + location.size,
+                    location.indirect,
+                    location.hidden,
+                )
+            )
+        elif location.kind == "register" and location.register is not None:
+            start = location.register_offset + _register_alias_offset(location.register)
+            result.append(
+                (
+                    "register",
+                    _register_family(location.register.lower()),
+                    start,
+                    start + location.size,
+                    location.indirect,
+                    location.hidden,
+                )
+            )
+        else:
+            result.append(
+                (location.kind, location.register, location.stack_offset, location.size)
+            )
+    return tuple(sorted(result))
+
+
+def _storage_location_order_key(
+    location: StorageLocation, reverse_stack: bool = False
+) -> tuple[object, ...]:
+    if location.kind == "stack" and location.stack_offset is not None:
+        offset = -location.stack_offset if reverse_stack else location.stack_offset
+        return (1, "stack", offset)
+    if location.kind == "register" and location.register is not None:
+        return (
+            0,
+            _register_family(location.register.lower()),
+            location.register_offset + _register_alias_offset(location.register),
+        )
+    return (
+        2,
+        location.kind,
+        location.register or "",
+        location.stack_offset if location.stack_offset is not None else 0,
+    )
+
+
+def _param_trial_order_key(trial: ParamTrial) -> tuple[object, ...]:
+    entry = trial.entry
+    if entry is None:
+        return (1,)
+    if entry.is_exclusion:
+        address_key: tuple[object, ...] = (trial.offset,)
+    else:
+        address_key = tuple(
+            _storage_location_order_key(location, entry.reverse_stack)
+            for location in sorted(
+                trial.locations,
+                key=lambda item: (item.value_offset, _storage_location_order_key(item)),
+            )
+        ) or ((2, trial.name),)
+    return (0, entry.group, entry.order, id(entry), address_key, trial.size_bits)
+
 
 class ParamActive:
-    """Small candidate-trial container inspired by Ghidra's ParamActive."""
+    """Trial-range container ported from Ghidra's ``ParamActive`` mechanics.
+
+    The range/state operations mirror ``fspec.cc``. Prototype-model matching is
+    represented by :class:`ParamTrialEntry`, not by the unported ParamList and
+    ParamModel hierarchy. ``selected`` and name indexing remain Python-side
+    conveniences for binding a recovered signature to trials.
+    """
 
     def __init__(self, recover_subcalls: bool = False) -> None:
         self.recover_subcalls = recover_subcalls
         self._trials: list[ParamTrial] = []
         self._by_name: dict[str, ParamTrial] = {}
         self._slot_base = 1
-        self._placeholder_slot: int | None = None
+        self._placeholder_slot = -1
         self._passes = 0
         self._max_pass = 0
         self._fully_checked = False
@@ -308,21 +792,43 @@ class ParamActive:
     def join_most_sig_first(self) -> bool:
         return self._join_most_sig_first
 
+    @property
+    def recover_subcall(self) -> bool:
+        return self.recover_subcalls
+
+    @property
+    def placeholder_slot(self) -> int:
+        return self._placeholder_slot
+
+    @property
+    def slot_base(self) -> int:
+        return self._slot_base
+
     def register_trial(
         self,
         name: str,
         size_bits: int,
         locations: Iterable[StorageLocation] = (),
+        *,
+        merge_existing: bool = False,
     ) -> ParamTrial:
-        """Register a candidate input, retaining its slot on duplicate reports."""
-        found = self._by_name.get(name)
+        """Register a storage range; use ``merge_existing`` for signature binding.
+
+        Ghidra appends every range. ParamID's higher-level name binding often
+        needs to enrich the already measured candidate instead, so that
+        behavior is explicit and opt-in here.
+        """
+        size_bits = _normalize_trial_size(size_bits)
         supplied_locations = tuple(locations)
+        found = self._by_name.get(name) if merge_existing else None
         if found is not None:
-            found.size_bits = max(found.size_bits, size_bits)
             if supplied_locations:
+                found.size_bits = _storage_extent_bits(supplied_locations) or size_bits
                 found.locations = supplied_locations
-                if any(location.register is not None for location in supplied_locations):
+                if any(location.kind != "stack" for location in supplied_locations):
                     found.mark_killed_by_call()
+            else:
+                found.size_bits = max(found.size_bits, size_bits)
             return found
         trial = ParamTrial(
             name=name,
@@ -330,35 +836,39 @@ class ParamActive:
             size_bits=size_bits,
             locations=supplied_locations,
         )
-        if any(location.register is not None for location in supplied_locations):
+        if any(location.kind != "stack" for location in supplied_locations):
             trial.mark_killed_by_call()
         self._slot_base += 1
         self._trials.append(trial)
-        self._by_name[name] = trial
+        self._reindex_names()
         return trial
 
     def clear(self) -> None:
-        """Reset all trials and ParamActive pass state."""
+        """Clear trials while preserving max-pass and final-check controls."""
         self._trials.clear()
         self._by_name.clear()
         self._slot_base = 1
-        self._placeholder_slot = None
+        self._placeholder_slot = -1
         self._passes = 0
-        self._max_pass = 0
         self._fully_checked = False
-        self._needs_final_check = False
         self._join_most_sig_first = False
 
     def reregister_trial(self, old_trial: ParamTrial) -> ParamTrial:
-        """Copy a trial's state while assigning the next input slot."""
-        trial = replace(old_trial, slot=self._slot_base)
+        """Copy flags/range but clear model match and assign the next slot."""
+        trial = replace(
+            old_trial,
+            slot=self._slot_base,
+            entry=None,
+            offset=-1,
+            fixed_position=None,
+        )
         self._slot_base += 1
         self._trials.append(trial)
-        self._by_name[trial.name] = trial
+        self._reindex_names()
         return trial
 
     def set_max_pass(self, value: int) -> None:
-        self._max_pass = max(0, value)
+        self._max_pass = value
 
     def finish_pass(self) -> None:
         self._passes += 1
@@ -373,24 +883,168 @@ class ParamActive:
         self._join_most_sig_first = True
 
     def set_placeholder_slot(self) -> int:
-        """Reserve a positional placeholder before registering stack trials."""
-        if self._placeholder_slot is not None and self._placeholder_slot >= 0:
-            raise RuntimeError("ParamActive ya tiene un placeholder de pila")
         self._placeholder_slot = self._slot_base
         self._slot_base += 1
         return self._placeholder_slot
 
     def free_placeholder_slot(self) -> None:
-        if self._placeholder_slot is None or self._placeholder_slot < 0:
+        if self._placeholder_slot < 0:
             return
         for trial in self._trials:
             if trial.slot > self._placeholder_slot:
                 trial.slot -= 1
         self._placeholder_slot = -2
-        self._slot_base = max(1, self._slot_base - 1)
+        self._slot_base -= 1
+        self._max_pass = 0
+
+    def which_trial(
+        self,
+        locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int | None = None,
+    ) -> int:
+        """Return the first trial whose storage overlaps the supplied range."""
+        query = _coerce_storage_locations(locations)
+        if size_bits is not None:
+            _require_byte_size(size_bits)
+            if len(query) == 1:
+                query = (replace(query[0], size=size_bits // 8),)
+            elif _storage_extent_bits(query) != size_bits:
+                raise ValueError("El tamaño no coincide con las piezas de storage")
+        for index, trial in enumerate(self._trials):
+            if any(
+                _storage_locations_overlap(candidate, existing)
+                for candidate in query
+                for existing in trial.locations
+            ):
+                return index
+        return -1
+
+    def get_trial_for_input_varnode(self, slot: int) -> ParamTrial:
+        """Map a CALL input slot to its trial index, accounting for target/gap."""
+        index = slot - (
+            1 if self._placeholder_slot < 0 or slot < self._placeholder_slot else 2
+        )
+        if index < 0 or index >= len(self._trials):
+            raise KeyError(f"No hay ParamTrial para el slot de entrada {slot}")
+        return self._trials[index]
+
+    def free_placeholder_slot_if_set(self) -> None:
+        if self._placeholder_slot >= 0:
+            self.free_placeholder_slot()
+
+    def split_trial(self, index: int, size_bits: int) -> tuple[ParamTrial, ParamTrial]:
+        if self._placeholder_slot >= 0:
+            raise RuntimeError(
+                "No se puede dividir un trial mientras no se resuelva el placeholder"
+            )
+        if index < 0 or index >= len(self._trials):
+            raise IndexError("Índice de ParamTrial fuera de límites")
+        original = self._trials[index]
+        _require_split_size(size_bits, original.size_bits)
+        slot = original.slot
+        high_piece = original.split_hi(size_bits)
+        low_piece = original.split_lo(original.size_bits - size_bits)
+        updated: list[ParamTrial] = []
+        for trial in self._trials[:index]:
+            if trial.slot > slot:
+                trial.slot += 1
+            updated.append(trial)
+        updated.extend((high_piece, low_piece))
+        for trial in self._trials[index + 1 :]:
+            if trial.slot > slot:
+                trial.slot += 1
+            updated.append(trial)
+        self._trials = updated
+        self._slot_base += 1
+        self._reindex_names()
+        return high_piece, low_piece
+
+    def join_trial(
+        self,
+        slot: int,
+        locations: StorageLocation | Iterable[StorageLocation] | None = None,
+        size_bits: int | None = None,
+        *,
+        name: str | None = None,
+    ) -> ParamTrial:
+        """Join adjacent trial slots, requiring their exact combined size."""
+        if self._placeholder_slot >= 0:
+            raise RuntimeError(
+                "No se pueden unir trials mientras no se resuelva el placeholder"
+            )
+        left = [trial for trial in self._trials if trial.slot == slot]
+        right = [trial for trial in self._trials if trial.slot == slot + 1]
+        if len(left) != 1 or len(right) != 1:
+            raise ValueError("join_trial requiere un trial en cada slot adyacente")
+        first, second = left[0], right[0]
+        combined_size = first.size_bits + second.size_bits
+        if size_bits is None:
+            size_bits = combined_size
+        _require_byte_size(size_bits)
+        if combined_size != size_bits:
+            raise ValueError("Size mismatch when joining parameters")
+        if locations is None:
+            first_locations = _rebase_location_offsets(first.locations, 0)
+            second_locations = _rebase_location_offsets(
+                second.locations, first.size_bytes
+            )
+            joined_locations = _merge_adjacent_locations(
+                first_locations + second_locations
+            )
+        else:
+            joined_locations = _coerce_storage_locations(locations)
+        if joined_locations and _storage_extent_bits(joined_locations) != size_bits:
+            raise ValueError("El storage unido no coincide con el tamaño solicitado")
+        joined = ParamTrial(
+            name=name or first.name,
+            slot=slot,
+            size_bits=size_bits,
+            locations=joined_locations,
+            rank=min(first.rank, second.rank),
+            evidence=tuple(dict.fromkeys(first.evidence + second.evidence)),
+        )
+        joined.mark_used()
+        joined.mark_active()
+        updated: list[ParamTrial] = []
+        emitted_join = False
+        for trial in self._trials:
+            if trial.slot < slot:
+                updated.append(trial)
+            elif trial.slot == slot:
+                if not emitted_join:
+                    updated.append(joined)
+                    emitted_join = True
+            elif trial.slot == slot + 1:
+                continue
+            else:
+                trial.slot -= 1
+                updated.append(trial)
+        if not emitted_join:
+            raise ValueError(f"No existe el slot {slot}")
+        self._trials = updated
+        self._slot_base -= 1
+        self._reindex_names()
+        return joined
+
+    def test_shrink(
+        self,
+        index: int,
+        locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int | None = None,
+    ) -> bool:
+        return self._trials[index].test_shrink(locations, size_bits)
+
+    def shrink(
+        self,
+        index: int,
+        locations: StorageLocation | Iterable[StorageLocation],
+        size_bits: int,
+    ) -> None:
+        """Apply a previously checked range shrink, like ``ParamActive.shrink``."""
+        self._trials[index].set_address(locations, size_bits)
 
     def finalize_selected_trials(self) -> tuple[ParamTrial, ...]:
-        """Mark storage-backed, active selected candidates as final parameters."""
+        """Set the final used bit on active selected candidates with storage."""
         finalized: list[ParamTrial] = []
         for trial in self._trials:
             if trial.selected and trial.active and trial.locations:
@@ -401,11 +1055,30 @@ class ParamActive:
     def get_trial(self, name: str) -> ParamTrial | None:
         return self._by_name.get(name)
 
+    def get_trials(self, name: str) -> tuple[ParamTrial, ...]:
+        return tuple(trial for trial in self._trials if trial.name == name)
+
+    def get_trial_at(self, index: int) -> ParamTrial:
+        """Return the trial at a current list index, like ``getTrial``."""
+        return self._trials[index]
+
     def get_num_trials(self) -> int:
         return len(self._trials)
 
+    def get_num_passes(self) -> int:
+        return self._passes
+
+    def get_max_pass(self) -> int:
+        return self._max_pass
+
+    def is_fully_checked(self) -> bool:
+        return self._fully_checked
+
+    def is_recover_subcall(self) -> bool:
+        return self.recover_subcalls
+
     def get_num_used(self) -> int:
-        """Return the leading used prefix, as the sorted Ghidra container does."""
+        """Return the leading used prefix; callers must first sort trials."""
         count = 0
         for trial in self._trials:
             if not trial.used:
@@ -422,12 +1095,6 @@ class ParamActive:
         *,
         include_inactive: bool = False,
     ) -> tuple[ParamTrial, ...]:
-        """Select candidate trials independently from activity and final use.
-
-        With no explicit names, only active trials are selected. A caller that
-        has independent positional evidence (for example, an ABI-resolved
-        signature with a gap) may include inactive trials explicitly.
-        """
         requested = (
             {trial.name for trial in self._trials if trial.active}
             if names is None
@@ -441,35 +1108,136 @@ class ParamActive:
                 selected.append(trial)
         return tuple(selected)
 
+    def sort_trials(self) -> None:
+        """Sort by model group/address without rewriting source trial slots."""
+        self._trials.sort(key=cmp_to_key(_compare_param_trials))
+        self._reindex_names()
+
     def sort_by_position(self) -> None:
-        """Order trials by the current positional ABI names and renumber slots."""
+        """Python signature convenience: order by ABI names and renumber slots."""
         self._trials.sort(key=lambda trial: _parameter_order(trial.name))
         for slot, trial in enumerate(self._trials, start=1):
             trial.slot = slot
         self._slot_base = len(self._trials) + 1
-        self._by_name = {trial.name: trial for trial in self._trials}
+        self._reindex_names()
+
+    def sort_fixed_position(self) -> None:
+        """Sort by fixed position, then use ParamTrial's formal-order comparator."""
+        self._trials.sort(key=cmp_to_key(_compare_fixed_position))
+        self._reindex_names()
 
     def sort_by_fixed_position(self) -> None:
-        """Sort fixed variadic formals first, preserving ordinary trial order."""
-        self._trials.sort(
-            key=lambda trial: (
-                trial.fixed_position is None,
-                trial.fixed_position if trial.fixed_position is not None else 0,
-                _parameter_order(trial.name),
-            )
-        )
-        for slot, trial in enumerate(self._trials, start=1):
-            trial.slot = slot
-        self._slot_base = len(self._trials) + 1
-        self._by_name = {trial.name: trial for trial in self._trials}
+        """Python-friendly alias for :meth:`sort_fixed_position`."""
+        self.sort_fixed_position()
 
     def delete_unused_trials(self) -> None:
-        """Compact to trials that have reached a final used verdict."""
+        """Delete unused ranges and renumber the remaining input-varnode slots."""
         self._trials = [trial for trial in self._trials if trial.used]
-        self._by_name = {trial.name: trial for trial in self._trials}
         for slot, trial in enumerate(self._trials, start=1):
             trial.slot = slot
-        self._slot_base = len(self._trials) + 1
+        self._reindex_names()
+
+    def _reindex_names(self) -> None:
+        self._by_name = {trial.name: trial for trial in self._trials}
+
+
+def _compare_param_trials(left: ParamTrial, right: ParamTrial) -> int:
+    if left < right:
+        return -1
+    if right < left:
+        return 1
+    return 0
+
+
+def _compare_fixed_position(left: ParamTrial, right: ParamTrial) -> int:
+    if ParamTrial.fixed_position_compare(left, right):
+        return -1
+    if ParamTrial.fixed_position_compare(right, left):
+        return 1
+    return 0
+
+
+def _storage_locations_overlap(
+    left: StorageLocation, right: StorageLocation
+) -> bool:
+    def interval(location: StorageLocation) -> tuple[tuple[object, ...], int, int]:
+        if location.kind == "stack" and location.stack_offset is not None:
+            start = location.stack_offset
+            return ("stack",), start, start + location.size
+        if location.kind == "register" and location.register is not None:
+            start = (
+                location.register_offset
+                + _register_alias_offset(location.register)
+            )
+            return (
+                ("register", _register_family(location.register.lower())),
+                start,
+                start + location.size,
+            )
+        return (
+            (location.kind, location.register or ""),
+            0,
+            location.size,
+        )
+
+    left_space, left_start, left_end = interval(left)
+    right_space, right_start, right_end = interval(right)
+    return (
+        left_space == right_space
+        and max(left_start, right_start) < min(left_end, right_end)
+    )
+
+
+def _rebase_location_offsets(
+    locations: tuple[StorageLocation, ...], base_offset: int
+) -> tuple[StorageLocation, ...]:
+    ranges = _logical_location_offsets(locations)
+    return tuple(
+        replace(location, value_offset=base_offset + start)
+        for location, (start, _end) in zip(locations, ranges)
+    )
+
+
+def _merge_adjacent_locations(
+    locations: tuple[StorageLocation, ...],
+) -> tuple[StorageLocation, ...]:
+    ordered = sorted(
+        locations,
+        key=lambda item: (item.value_offset, _storage_location_order_key(item)),
+    )
+    merged: list[StorageLocation] = []
+    for location in ordered:
+        if merged:
+            previous = merged[-1]
+            same_attributes = (
+                previous.kind == location.kind
+                and previous.indirect == location.indirect
+                and previous.hidden == location.hidden
+                and previous.value_offset + previous.size == location.value_offset
+            )
+            if same_attributes and previous.kind == "stack":
+                adjacent = (
+                    previous.stack_offset is not None
+                    and location.stack_offset == previous.stack_offset + previous.size
+                )
+            elif same_attributes and previous.kind == "register":
+                adjacent = (
+                    previous.register is not None
+                    and location.register is not None
+                    and _register_family(previous.register.lower())
+                    == _register_family(location.register.lower())
+                    and location.register_offset + _register_alias_offset(location.register)
+                    == previous.register_offset
+                    + _register_alias_offset(previous.register)
+                    + previous.size
+                )
+            else:
+                adjacent = False
+            if adjacent:
+                merged[-1] = replace(previous, size=previous.size + location.size)
+                continue
+        merged.append(location)
+    return tuple(merged)
 
 
 class PcodeLikeGraph:
@@ -1713,12 +2481,20 @@ class ParamIDAnalysis:
         selected_names: list[str] = []
         for parameter in parameters:
             locations = tuple(getattr(parameter, "locations", ()))
+            storage_bits = _storage_extent_bits(locations)
             data_type = getattr(parameter, "data_type", None)
-            size_bytes = getattr(data_type, "size", None)
+            size_bytes = (
+                storage_bits // 8
+                if storage_bits
+                else getattr(data_type, "size", None)
+            )
             if size_bytes is None:
-                size_bytes = max((location.size for location in locations), default=1)
+                size_bytes = 1
             trial = self.input_active.register_trial(
-                parameter.name, max(1, int(size_bytes) * 8), locations
+                parameter.name,
+                max(1, int(size_bytes) * 8),
+                locations,
+                merge_existing=True,
             )
             measurement = self.measurements.get(parameter.name)
             if measurement is None:
