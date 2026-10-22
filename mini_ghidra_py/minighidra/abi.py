@@ -227,6 +227,38 @@ def default_calling_convention(analyzer: Any) -> CallingConvention:
     return X86_STDCALL if format_name == "PE" else X86_CDECL
 
 
+def calling_convention_by_name(
+    name: str, bits: int, format_name: str = ""
+) -> CallingConvention:
+    """Return a named profile matching the local x86 Cspecs."""
+    normalized = name.strip().lower()
+    fmt = format_name.upper()
+    if bits == 64:
+        profiles = {
+            "sysv_amd64": SYSV_AMD64,
+            "__stdcall": SYSV_AMD64 if fmt != "PE" else WINDOWS_X64,
+            "__fastcall": WINDOWS_X64,
+            "__thiscall": WINDOWS_X64_THISCALL,
+        }
+    elif bits == 32:
+        profiles = {
+            "__cdecl": X86_CDECL,
+            "__cdeclf": X86_CDECL,
+            "__stdcall": X86_STDCALL,
+            "__fastcall": X86_FASTCALL,
+            "__thiscall": X86_THISCALL if fmt == "PE" else X86_GCC_THISCALL,
+            "__regparm1": X86_REGPARM1,
+            "__regparm2": X86_REGPARM2,
+            "__regparm3": X86_REGPARM3,
+        }
+    else:
+        raise ValueError("Solo se admiten convenciones x86 y x86-64")
+    try:
+        return profiles[normalized]
+    except KeyError as exc:
+        raise ValueError(f"Convención no compatible con x86: {name}") from exc
+
+
 def calling_convention_for(analyzer: Any, function: Any) -> CallingConvention:
     """Infer a function's likely ABI from xrefs, entry reads and stack cleanup.
 
@@ -234,6 +266,11 @@ def calling_convention_for(analyzer: Any, function: Any) -> CallingConvention:
     ``resolveprototype`` analysis is richer than this static heuristic, so this
     routine prefers the file-format default unless call-site evidence is clear.
     """
+    overrides = getattr(analyzer, "_calling_convention_overrides", {})
+    overridden = overrides.get(function.address)
+    if overridden is not None:
+        return overridden
+
     cache = getattr(analyzer, "_calling_convention_cache", None)
     if cache is None:
         cache = {}
@@ -290,7 +327,7 @@ def _infer_x86_convention(
         xref for xref in analyzer.xrefs_to(function.address) if xref.kind == "call"
     ]
     entry_reads = _entry_reads_before_write(analyzer, function, {"ecx", "edx", "eax"})
-    call_writes = _callsite_register_writes(analyzer, call_sites, {"ecx", "edx", "eax"})
+    call_writes = callsite_register_writes(analyzer, call_sites, {"ecx", "edx", "eax"})
     threshold = max(1, (len(call_sites) + 1) // 2)
     supplied = {
         register for register, sites in call_writes.items() if len(sites) >= threshold
@@ -341,6 +378,50 @@ def _register_families(raw: Any, register_ids: list[int], bits: int) -> set[str]
 
 
 def _register_family(name: str, bits: int) -> str | None:
+    if re.fullmatch(r"xmm\d+", name):
+        return name
+    if bits == 64:
+        x64_aliases = {
+            "rax": "rax",
+            "eax": "rax",
+            "ax": "rax",
+            "al": "rax",
+            "ah": "rax",
+            "rbx": "rbx",
+            "ebx": "rbx",
+            "bx": "rbx",
+            "bl": "rbx",
+            "bh": "rbx",
+            "rcx": "rcx",
+            "ecx": "rcx",
+            "cx": "rcx",
+            "cl": "rcx",
+            "ch": "rcx",
+            "rdx": "rdx",
+            "edx": "rdx",
+            "dx": "rdx",
+            "dl": "rdx",
+            "dh": "rdx",
+            "rsi": "rsi",
+            "esi": "rsi",
+            "si": "rsi",
+            "sil": "rsi",
+            "rdi": "rdi",
+            "edi": "rdi",
+            "di": "rdi",
+            "dil": "rdi",
+            "rbp": "rbp",
+            "ebp": "rbp",
+            "bp": "rbp",
+            "bpl": "rbp",
+            "rsp": "rsp",
+            "esp": "rsp",
+            "sp": "rsp",
+            "spl": "rsp",
+        }
+        family = x64_aliases.get(name)
+        if family is not None:
+            return family
     aliases = {
         "eax": "eax",
         "ax": "eax",
@@ -422,9 +503,10 @@ def _entry_reads_before_write(
     return read_before_write
 
 
-def _callsite_register_writes(
+def callsite_register_writes(
     analyzer: Any, call_sites: list[Any], candidates: set[str]
 ) -> dict[str, set[int]]:
+    """Collect candidate-register writes in a bounded window before each call."""
     writes_by_register = {register: set() for register in candidates}
     for xref in call_sites:
         try:
@@ -458,6 +540,107 @@ def _callsite_register_writes(
         for register in found:
             writes_by_register[register].add(xref.source)
     return writes_by_register
+
+
+def callsite_stack_writes(
+    analyzer: Any, call_sites: list[Any], candidate_offsets: set[int]
+) -> dict[int, set[int]]:
+    """Find bounded callsite writes to outgoing stack slots, relative to call SP."""
+    writes_by_offset = {offset: set() for offset in candidate_offsets}
+    bits = int(analyzer.image.bits)
+    pointer_size = bits // 8
+    stack_register = "rsp" if bits == 64 else "esp"
+    store_prefixes = ("mov", "vmov", "fst", "set")
+
+    for xref in call_sites:
+        try:
+            caller = analyzer.function_at(xref.source)
+        except ValueError:
+            continue
+        call_index = next(
+            (
+                index
+                for index, instruction in enumerate(caller.instructions)
+                if instruction.address == xref.source
+            ),
+            None,
+        )
+        if call_index is None:
+            continue
+
+        # Walk backward from the call and express stack locations relative to
+        # the caller's SP at the call instruction.  Stop at control-flow edges
+        # and frame setup to avoid counting a saved-register prologue as args.
+        stack_adjustment = 0
+        prior = caller.instructions[max(0, call_index - 24) : call_index]
+        for instruction in reversed(prior):
+            raw, _reads, register_writes = _decoded_accesses(analyzer, instruction)
+            if raw is None:
+                continue
+            mnemonic = raw.mnemonic.lower()
+            if instruction.is_call or instruction.is_return or instruction.is_trap:
+                break
+            if instruction.is_jump:
+                break
+            operands = raw.operands
+            if (
+                mnemonic.startswith("mov")
+                and len(operands) >= 2
+                and operands[0].type == X86_OP_REG
+                and operands[1].type == X86_OP_REG
+                and raw.reg_name(operands[0].reg).lower()
+                in {"ebp", "rbp"}
+                and raw.reg_name(operands[1].reg).lower() == stack_register
+            ):
+                break
+
+            if mnemonic == "push":
+                if stack_adjustment in writes_by_offset:
+                    writes_by_offset[stack_adjustment].add(xref.source)
+                stack_adjustment += pointer_size
+                continue
+            if mnemonic == "pop":
+                stack_adjustment -= pointer_size
+                continue
+
+            if (
+                mnemonic in {"sub", "add"}
+                and len(operands) >= 2
+                and operands[0].type == X86_OP_REG
+                and raw.reg_name(operands[0].reg).lower() == stack_register
+                and operands[1].type == X86_OP_IMM
+            ):
+                amount = int(operands[1].imm)
+                stack_adjustment += amount if mnemonic == "sub" else -amount
+                continue
+            if (
+                mnemonic == "lea"
+                and len(operands) >= 2
+                and operands[0].type == X86_OP_REG
+                and raw.reg_name(operands[0].reg).lower() == stack_register
+                and operands[1].type == X86_OP_MEM
+                and raw.reg_name(operands[1].mem.base).lower() == stack_register
+                and not operands[1].mem.index
+            ):
+                stack_adjustment -= int(operands[1].mem.disp)
+                continue
+            if stack_register in register_writes:
+                break
+
+            if (
+                mnemonic.startswith(store_prefixes)
+                and operands
+                and operands[0].type == X86_OP_MEM
+            ):
+                memory = operands[0].mem
+                base = raw.reg_name(memory.base).lower() if memory.base else ""
+                index = raw.reg_name(memory.index).lower() if memory.index else ""
+                if base == stack_register and not index:
+                    offset = stack_adjustment + int(memory.disp)
+                    if offset in writes_by_offset:
+                        writes_by_offset[offset].add(xref.source)
+
+    return writes_by_offset
 
 
 def _caller_cleanup_evidence(analyzer: Any, call_sites: list[Any]) -> bool:

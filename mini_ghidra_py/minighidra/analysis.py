@@ -8,16 +8,32 @@ from dataclasses import replace
 from typing import Iterable, Optional
 
 try:
-    from capstone import CS_ARCH_X86, CS_MODE_32, CS_MODE_64, Cs
-    from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_GRP_RET
+    from capstone import (
+        CS_ARCH_X86,
+        CS_GRP_CALL,
+        CS_GRP_JUMP,
+        CS_GRP_RET,
+        CS_MODE_32,
+        CS_MODE_64,
+        Cs,
+    )
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_REG_RIP
 except ImportError as exc:  # pragma: no cover - dependency declared by the package
     raise RuntimeError("Falta Capstone. Instálalo con: python -m pip install capstone") from exc
 
+from .abi import CallingConvention, calling_convention_by_name, calling_convention_for
 from .function_starts import FunctionStartCandidate, find_function_start_candidates
-from .model import AddressTable, BasicBlock, Function, Instruction, StringEntry, Xref
+from .model import (
+    AddressTable,
+    BasicBlock,
+    Function,
+    FunctionSignature,
+    Instruction,
+    StringEntry,
+    Xref,
+)
 from .noreturn import NoReturnCatalog
-
+from .typesys import TypeDatabase, TypeKind
 
 _SCALAR_SENTINELS = frozenset(
     {
@@ -48,6 +64,8 @@ class Analyzer:
             raise ValueError("El umbral de evidencia no-return debe ser un entero positivo.")
         self.image = image
         self.project_state = project_state
+        self.type_database = TypeDatabase(image.bits, image.format)
+        self._calling_convention_overrides = {}
         self.noreturn_evidence_threshold = noreturn_evidence_threshold
         minimum_address = min((section.start for section in image.sections), default=0)
         self._scalar_reference_analysis_enabled = (
@@ -1018,6 +1036,103 @@ class Analyzer:
                 lines.append(f"\n{self.name_at(instruction.address) or f'loc_{instruction.address:X}'}:")
             lines.append("  " + self.format_instruction(instruction))
         return "\n".join(lines)
+
+    def set_prototype(
+        self,
+        function: int | Function,
+        signature: FunctionSignature,
+        *,
+        calling_convention: CallingConvention | str | None = None,
+    ) -> FunctionSignature:
+        """Attach a type-checked, ABI-resolved prototype to a function.
+
+        ``FunctionSignature`` contains the source-level return/parameter types;
+        the stored copy additionally records register, stack, aggregate-piece,
+        hidden-sret, and variadic metadata. Registered aggregate types can be
+        declared through ``analyzer.type_database`` before this call.
+        """
+        target = self.functions.get(function) if isinstance(function, int) else function
+        if target is None:
+            raise KeyError(f"No existe función en {function:#x}")
+
+        if isinstance(calling_convention, CallingConvention):
+            convention = calling_convention
+        elif isinstance(calling_convention, str):
+            convention = calling_convention_by_name(
+                calling_convention, self.image.bits, self.image.format
+            )
+        elif signature.calling_convention not in {"", "inferred"}:
+            convention = calling_convention_by_name(
+                signature.calling_convention, self.image.bits, self.image.format
+            )
+        else:
+            convention = calling_convention_for(self, target)
+
+        return_type = self.type_database.resolve(
+            signature.return_data_type or signature.return_type
+        )
+        return_base = return_type.unwrapped()
+        if return_base.kind in {
+            TypeKind.UNKNOWN,
+            TypeKind.ARRAY,
+            TypeKind.FUNCTION,
+        }:
+            raise ValueError(
+                "Una función C no puede retornar un tipo desconocido, array o función"
+            )
+        if return_base.kind != TypeKind.VOID and return_base.size is None:
+            raise ValueError("Una función C no puede retornar un agregado incompleto")
+        for parameter in signature.parameters:
+            parameter_type = self.type_database.resolve(
+                parameter.data_type or parameter.type_name
+            )
+            parameter_base = parameter_type.unwrapped()
+            parameter_kind = parameter_base.kind
+            if parameter_kind in {TypeKind.VOID, TypeKind.UNKNOWN}:
+                raise ValueError("Un parámetro requiere un tipo C definido y no void")
+            if (
+                parameter_kind not in {TypeKind.ARRAY, TypeKind.FUNCTION}
+                and parameter_base.size is None
+            ):
+                raise ValueError(
+                    "Un parámetro por valor no puede usar un agregado incompleto"
+                )
+
+        from .prototype import PrototypeResolver
+
+        requested = replace(
+            signature,
+            parameters=tuple(
+                replace(parameter, confidence=None, evidence=())
+                for parameter in signature.parameters
+            ),
+            calling_convention=convention.name,
+            source="user",
+            locked=True,
+            inference_confidence=None,
+            inference_evidence=(),
+        )
+        resolved = (
+            PrototypeResolver(self.type_database, self.image.bits)
+            .resolve(requested, convention)
+            .signature
+        )
+        target.calling_convention = convention.name
+        target.signature = resolved
+        self._calling_convention_overrides[target.address] = convention
+        return resolved
+
+    def infer_prototype(self, function: int | Function) -> FunctionSignature:
+        """Return a locked signature or an unlocked candidate with heuristic evidence."""
+        target = self.functions.get(function) if isinstance(function, int) else function
+        if target is None:
+            raise KeyError(f"No existe función en {function:#x}")
+        if target.signature is not None and target.signature.locked:
+            return target.signature
+        self.pseudocode(target)
+        if target.signature is None:
+            raise RuntimeError("No se pudo generar un candidato de prototipo")
+        return target.signature
 
     def pseudocode(self, function: Function) -> str:
         """Return experimental semantic pseudocode for a recovered function."""

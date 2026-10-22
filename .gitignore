@@ -27,8 +27,10 @@ Thumbs.db
 
 **/dist
 
-# Ignore Sleigh generated files
+# Ignore Sleigh generated files except the MiniGhidraPy runtime assets.
 *.sla
+!mini_ghidra_py/minighidra/data/sleigh/x86.sla
+!mini_ghidra_py/minighidra/data/sleigh/x86-64.sla
 **/data/build.xml
 
 # Misc files
