@@ -149,6 +149,19 @@ class PEUnwindInfo:
     handler_rva: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class FunctionParameter:
+    name: str
+    type_name: str
+
+
+@dataclass(frozen=True)
+class FunctionSignature:
+    return_type: str
+    parameters: tuple[FunctionParameter, ...]
+    calling_convention: str
+
+
 @dataclass
 class Function:
     address: int
@@ -162,6 +175,8 @@ class Function:
     thunk_target_name: Optional[str] = None
     stack_purge_size: Optional[int] = None
     pe_unwind_info: Optional[PEUnwindInfo] = None
+    calling_convention: Optional[str] = None
+    signature: Optional[FunctionSignature] = None
 
     @property
     def end(self) -> int:

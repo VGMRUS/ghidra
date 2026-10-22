@@ -148,7 +148,7 @@ def launch_gui(console) -> None:
             f"Referencias cruzadas: {info['xrefs']}",
             f"SHA-256: {info['sha256']}",
             "",
-            "El programa no se ejecuta. El pseudocódigo es aproximado y no equivale a un decompilador.",
+            "El programa no se ejecuta. El pseudocódigo usa propagación simbólica experimental; aún no equivale al decompilador completo de Ghidra.",
         ]
         if console.image.libraries:
             lines.extend(["", "Bibliotecas:", *[f"  {name}" for name in console.image.libraries]])

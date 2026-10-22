@@ -1020,73 +1020,10 @@ class Analyzer:
         return "\n".join(lines)
 
     def pseudocode(self, function: Function) -> str:
-        """Emit a deliberately conservative instruction-to-pseudocode sketch."""
-        lines = [
-            f"/* Pseudocódigo heurístico para {function.name}; no es una decompilación semántica. */",
-            f"void { _c_identifier(function.name) }(void) {{",
-        ]
-        if function.is_thunk:
-            if function.thunk_target_name:
-                target = _c_identifier(function.thunk_target_name)
-            elif function.thunk_target is not None:
-                target = self.name_at(function.thunk_target) or f"loc_{function.thunk_target:X}"
-            else:
-                target = "destino_indirecto"
-            lines.append(f"  /* thunk de salto; parámetros/retorno no inferidos */ goto {target};")
-            lines.append("}")
-            return "\n".join(lines)
-        for instruction in function.instructions:
-            mnemonic = instruction.mnemonic.lower()
-            operands = [part.strip() for part in instruction.op_str.split(",", 1)]
-            destination = operands[0] if operands else ""
-            source = operands[1] if len(operands) > 1 else ""
-            prefix = f"  /* {instruction.address:#x} */ "
-            if mnemonic == "ret" or mnemonic.startswith("ret"):
-                lines.append(prefix + "return;")
-            elif mnemonic in {"mov", "movabs", "movzx", "movsx", "movsxd"} and destination and source:
-                lines.append(prefix + f"{destination} = {source};")
-            elif mnemonic in {"lea"} and destination and source:
-                lines.append(prefix + f"{destination} = address_of({source});")
-            elif mnemonic in {"add", "sub", "and", "or", "xor", "imul"} and destination and source:
-                operator = {"add": "+=", "sub": "-=", "and": "&=", "or": "|=", "xor": "^=", "imul": "*="}[mnemonic]
-                lines.append(prefix + f"{destination} {operator} {source};")
-            elif mnemonic == "push" and destination:
-                lines.append(prefix + f"push({destination});")
-            elif mnemonic == "pop" and destination:
-                lines.append(prefix + f"{destination} = pop();")
-            elif instruction.is_call:
-                target = instruction.branch_target
-                name = self.name_at(target) if target is not None else None
-                if name is None:
-                    name = next(
-                        (self.name_at(reference) for reference in instruction.memory_references if self.name_at(reference)),
-                        None,
-                    )
-                call_text = f"{_c_identifier(name)}();" if name else f"call {instruction.op_str};"
-                if self._call_is_noreturn(instruction):
-                    call_text += " /* no retorna */"
-                lines.append(prefix + call_text)
-            elif instruction.is_conditional_jump:
-                target = instruction.branch_target or 0
-                condition = _condition_expression(mnemonic)
-                lines.append(prefix + f"if ({condition}) goto loc_{target:X};")
-            elif instruction.is_jump:
-                if instruction.computed_targets:
-                    targets = [
-                        self.name_at(target) or f"loc_{target:X}"
-                        for target in instruction.computed_targets
-                    ]
-                    lines.append(prefix + f"computed jump to one of: {', '.join(targets)};")
-                else:
-                    target = instruction.branch_target or 0
-                    name = self.name_at(target)
-                    lines.append(prefix + f"goto {_c_identifier(name) if name else f'loc_{target:X}'};")
-            elif mnemonic in {"cmp", "test"}:
-                lines.append(prefix + f"/* {mnemonic} {instruction.op_str} */")
-            else:
-                lines.append(prefix + f"/* {instruction.mnemonic} {instruction.op_str} */")
-        lines.append("}")
-        return "\n".join(lines)
+        """Return experimental semantic pseudocode for a recovered function."""
+        from .decompiler import SemanticDecompiler
+
+        return SemanticDecompiler(self).decompile(function)
 
     def cfg_dot(self, function: Function) -> str:
         safe_name = function.name.replace('"', r'\"')
@@ -1146,25 +1083,3 @@ def _lower_bound(values: list[int], value: int) -> int:
         else:
             right = middle
     return left
-
-
-def _c_identifier(value: Optional[str]) -> str:
-    if not value:
-        return "unknown"
-    identifier = re.sub(r"[^A-Za-z0-9_]", "_", value)
-    if not identifier or identifier[0].isdigit():
-        identifier = "sym_" + identifier
-    return identifier
-
-
-def _condition_expression(mnemonic: str) -> str:
-    conditions = {
-        "ja": "above", "jnbe": "above", "jae": "above_equal", "jnb": "above_equal",
-        "jb": "below", "jnae": "below", "jbe": "below_equal", "jna": "below_equal",
-        "je": "equal", "jz": "zero", "jne": "not_equal", "jnz": "not_zero",
-        "jg": "greater", "jnle": "greater", "jge": "greater_equal", "jnl": "greater_equal",
-        "jl": "less", "jnge": "less", "jle": "less_equal", "jng": "less_equal",
-        "js": "sign", "jns": "not_sign", "jo": "overflow", "jno": "not_overflow",
-        "jp": "parity", "jpe": "parity", "jnp": "not_parity", "jpo": "not_parity",
-    }
-    return conditions.get(mnemonic.lower(), mnemonic.lower())
