@@ -58,6 +58,8 @@ class ActionDatabase:
         from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
         from .blockaction import ActionBlockStructure, ActionFinalStructure
 
+        from .rule import ActionPool, RuleTrivialArith, RuleXorCollapse
+
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
 
@@ -66,6 +68,13 @@ class ActionDatabase:
         universal.add_action(ActionUnreachable("base"))
         universal.add_action(ActionVarnodeProps("base"))
         universal.add_action(ActionHeritage("base"))
+        
+        # 0.1 AST Simplification Pool
+        actprop = ActionPool("oppool1", "oppool1")
+        actprop.add_rule(RuleTrivialArith("analysis"))
+        actprop.add_rule(RuleXorCollapse("analysis"))
+        universal.add_action(actprop)
+
         universal.add_action(ActionForceGoto("blockrecovery"))
         universal.add_action(ActionDirectWrite("protorecovery_a", True))
         universal.add_action(ActionDirectWrite("protorecovery_b", False))
