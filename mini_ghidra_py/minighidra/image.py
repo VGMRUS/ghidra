@@ -61,6 +61,15 @@ class BinaryImage:
         self.pe_tls_callbacks = sorted(set(pe_tls_callbacks or []))
         self.pe_unwind_infos = dict(pe_unwind_infos or {})
         self.sha256 = hashlib.sha256(raw).hexdigest()
+        self.pe = None
+        if self.format == "PE":
+            try:
+                import pefile
+                self.pe = pefile.PE(str(path))
+            except ImportError:
+                pass
+            except Exception:
+                pass
 
     @classmethod
     def load(
@@ -242,6 +251,16 @@ class BinaryImage:
             pe_tls_callbacks=pe_tls_callbacks,
             pe_unwind_infos=pe_unwind_infos,
         )
+
+    @property
+    def resources(self):
+        """Devuelve el gestor de recursos de LIEF para binarios PE, o None."""
+        if self.format == "PE" and self.lief_binary is not None:
+            try:
+                return self.lief_binary.resources_manager
+            except Exception:
+                pass
+        return None
 
     @property
     def executable_sections(self):

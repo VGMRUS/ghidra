@@ -4253,8 +4253,8 @@ class SemanticDecompiler:
         if opcode in {"FLOAT_ADD", "FLOAT_DIV", "FLOAT_MULT", "FLOAT_SUB"}:
             if (
                 len(values) != 2
-                or output_bits not in {32, 64}
-                or any(value.bits not in {32, 64} for value in values)
+                or output_bits not in {32, 64, 80}
+                or any(value.bits not in {32, 64, 80} for value in values)
             ):
                 return None
             operation = {
@@ -4266,11 +4266,11 @@ class SemanticDecompiler:
             left, right = (_simd_float(value, value.bits) for value in values)
             return _fp_to_bits(_fp_binary(operation, left, right), output_bits)
         if opcode == "FLOAT_NAN" and len(values) == 1:
-            if values[0].bits not in {32, 64}:
+            if values[0].bits not in {32, 64, 80}:
                 return None
             return _fp_is_nan(_simd_float(values[0], values[0].bits))
         if opcode in {"FLOAT_NEG", "FLOAT_ABS", "FLOAT_SQRT"} and len(values) == 1:
-            if values[0].bits not in {32, 64} or output_bits not in {32, 64}:
+            if values[0].bits not in {32, 64, 80} or output_bits not in {32, 64, 80}:
                 return None
             operation = {
                 "FLOAT_NEG": "neg",
@@ -4280,21 +4280,21 @@ class SemanticDecompiler:
             source = _simd_float(values[0], values[0].bits)
             return _fp_to_bits(_fp_unary(operation, source), output_bits)
         if opcode == "FLOAT_INT2FLOAT" and len(values) == 1:
-            if values[0].bits > 64 or output_bits not in {32, 64}:
+            if values[0].bits > 64 or output_bits not in {32, 64, 80}:
                 return None
             return _fp_to_bits(_fp_from_integer(values[0]), output_bits)
         if opcode == "FLOAT_FLOAT2FLOAT" and len(values) == 1:
-            if values[0].bits not in {32, 64} or output_bits not in {32, 64}:
+            if values[0].bits not in {32, 64, 80} or output_bits not in {32, 64, 80}:
                 return None
             source = _simd_float(values[0], values[0].bits)
             cast = _Expr("fp_cast", output_bits, args=(source,), bits=80)
             return _fp_to_bits(cast, output_bits)
         if opcode == "FLOAT_TRUNC" and len(values) == 1:
-            if values[0].bits not in {32, 64} or output_bits not in {8, 16, 32, 64}:
+            if values[0].bits not in {32, 64, 80} or output_bits not in {8, 16, 32, 64}:
                 return None
             return _simd_cvtt_to_int(values[0], output_bits, input_bits=values[0].bits)
         if opcode in {"FLOAT_CEIL", "FLOAT_FLOOR", "FLOAT_ROUND"} and len(values) == 1:
-            if values[0].bits not in {32, 64} or output_bits not in {32, 64}:
+            if values[0].bits not in {32, 64, 80} or output_bits not in {32, 64, 80}:
                 return None
             operation = {
                 "FLOAT_CEIL": "ceil",
@@ -4932,6 +4932,12 @@ class SemanticDecompiler:
             return emitted
 
         if self._execute_x87(state, instruction, decoded, emitted, collect=collect):
+            if collect:
+                for i, val in enumerate(state.x87_stack):
+                    if val.kind not in {"var", "const"}:
+                        name = f"fpu_st{i}_{instruction.address:X}"
+                        emitted.append(f"double {name} = {self._render(val)};")
+                        state.x87_stack[i] = _var(name, 80)
             return emitted
         if self._execute_string(state, instruction, decoded, emitted, collect=collect):
             return emitted

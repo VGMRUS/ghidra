@@ -61,6 +61,12 @@ _SCALAR_SENTINELS = frozenset(
 class Analyzer:
     """Build an in-memory static-analysis index for one :class:`BinaryImage`."""
 
+    @classmethod
+    def from_path(cls, path: str, project_state=None, **kwargs):
+        from .image import BinaryImage
+        img = BinaryImage.load(path)
+        return cls(img, project_state=project_state, **kwargs)
+
     def __init__(
         self, image, project_state=None, *, noreturn_evidence_threshold: int = 3
     ) -> None:
@@ -994,6 +1000,11 @@ class Analyzer:
         return self._name_by_address.get(address, fallback)
 
     def resolve_address(self, value: str | int) -> int:
+        """
+        Devuelve la dirección de memoria asociada a un nombre de símbolo,
+        función o cadena hexadecimal. Si se pasa un entero, se devuelve tal cual.
+        Para obtener el nombre asociado a una dirección, usa name_for_address().
+        """
         if isinstance(value, int):
             return value
         token = value.strip()
@@ -1009,6 +1020,16 @@ class Analyzer:
             if function.name.casefold() == folded:
                 return function.address
         raise ValueError(f"No conozco la dirección o símbolo {token!r}.")
+
+    def name_for_address(self, address: int) -> str | None:
+        """
+        Devuelve el nombre del símbolo, importación o función en la dirección dada.
+        """
+        if address in self._name_by_address:
+            return self._name_by_address[address]
+        if address in self.functions:
+            return self.functions[address].name
+        return None
 
     def function_at(self, value: str | int) -> Function:
         address = self.resolve_address(value)
@@ -1030,8 +1051,21 @@ class Analyzer:
         return function.name if function else None
 
     def iter_instructions(
-        self, start: int | None = None, count: int | None = None
+        self, start: int | "Function" | None = None, count: int | None = None
     ) -> list[Instruction]:
+        """
+        Devuelve las instrucciones a partir de una dirección o dentro de una función.
+        
+        Si 'start' es una Function, devuelve las instrucciones de esa función.
+        Si 'start' es una dirección, devuelve las instrucciones secuenciales
+        (ignorando los límites de las funciones).
+        """
+        from .model import Function
+        if isinstance(start, Function):
+            if count is not None:
+                return start.instructions[: max(0, count)]
+            return start.instructions
+
         addresses = self.instruction_addresses
         if start is not None:
             index = _lower_bound(addresses, start)
@@ -1041,6 +1075,9 @@ class Analyzer:
         return [self.instructions[address] for address in addresses]
 
     def xrefs_to(self, address: int) -> list[Xref]:
+        """
+        Devuelve todas las referencias cruzadas (Xrefs) que apuntan a la dirección dada.
+        """
         return sorted(
             self.xrefs_by_target.get(address, ()), key=lambda item: item.source
         )

@@ -124,6 +124,8 @@ class Console:
             self._export_json(rest)
         elif command in {"export-asm", "report-asm"}:
             self._export_asm(rest)
+        elif command in {"export-pseudo", "report-pseudo"}:
+            self._export_pseudo(rest)
         else:
             raise ValueError(f"Comando desconocido: {command!r}. Escribe help.")
         return True
@@ -695,6 +697,58 @@ class Console:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"Desensamblado escrito en {destination}")
+
+    def _export_pseudo(self, args: list[str]) -> None:
+        if not args:
+            raise ValueError("Uso: export-pseudo --all <archivo.c> | export-pseudo <0xaddr> <archivo.c>")
+        
+        all_funcs = False
+        target_file = None
+        func_addr_str = None
+
+        if args[0] == "--all":
+            all_funcs = True
+            if len(args) != 2:
+                raise ValueError("Uso: export-pseudo --all <archivo.c>")
+            target_file = args[1]
+        else:
+            if len(args) != 2:
+                raise ValueError("Uso: export-pseudo <0xaddr> <archivo.c>")
+            func_addr_str = args[0]
+            target_file = args[1]
+
+        destination = Path(target_file).expanduser().resolve()
+        lines = [
+            f"/* MiniGhidraPy | {self.image.path} */",
+            f"/* {self.image.format} {self.image.architecture} ({self.image.bits} bits) */",
+            f"/* SHA-256: {self.image.sha256} */",
+            "",
+        ]
+
+        if all_funcs:
+            print("Decompilando todas las funciones (puede tardar un rato)...")
+            functions = sorted(self.analyzer.functions.values(), key=lambda f: f.address)
+        else:
+            address = self.analyzer.resolve_address(func_addr_str)
+            function = self.analyzer.function_at(address)
+            if function is None:
+                raise ValueError(f"No hay ninguna función detectada en la dirección {address:#x}.")
+            functions = [function]
+
+        from .decompiler import SemanticDecompiler
+        for function in functions:
+            decompiler = SemanticDecompiler(self.analyzer)
+            try:
+                high_func = decompiler.decompile(function)
+                code = high_func.print_c()
+            except Exception as e:
+                code = f"/* Error al decompilar {function.name}: {e} */"
+            lines.append(code)
+            lines.append("")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"Pseudocódigo escrito en {destination}")
 
 
 def _parse_hex_bytes(tokens: list[str]) -> bytes:
