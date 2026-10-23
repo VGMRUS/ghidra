@@ -56,7 +56,7 @@ class ActionDatabase:
         )
         from .action_varnode import ActionVarnodeProps, ActionDirectWrite
         from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
-        from .blockaction import ActionBlockStructure, ActionFinalStructure
+        from .blockaction import ActionBlockStructure, ActionFinalStructure, ActionConditionalConst, ActionSwitchNorm
 
         from .rule import ActionPool, RuleTrivialArith, RuleXorCollapse
 
@@ -88,6 +88,8 @@ class ActionDatabase:
         universal.add_action(ActionDeadCode("deadcode"))
 
         # 2. Block structure and flow
+        universal.add_action(ActionConditionalConst("analysis"))
+        universal.add_action(ActionSwitchNorm("switchnorm"))
         universal.add_action(ActionBlockStructure("blockrecovery"))
 
         # 3. HighVariable Merging (converting SSA Varnodes to logical HighVariables)
