@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .typesys import CType, StorageLocation
+
 
 @dataclass(frozen=True)
 class Section:
@@ -149,6 +151,46 @@ class PEUnwindInfo:
     handler_rva: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class FunctionParameter:
+    """A formal parameter, optionally annotated as an inferred candidate.
+
+    Candidate confidence/evidence refer to presence and ABI location; the C type
+    can remain a conservative fallback.
+    """
+
+    name: str
+    type_name: str
+    data_type: CType | None = None
+    locations: tuple[StorageLocation, ...] = ()
+    implicit: bool = False
+    fixed: bool = True
+    confidence: float | None = None
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FunctionSignature:
+    """Resolved prototype or unlocked candidate.
+
+    Confidence scores are heuristic rankings, not calibrated probabilities.
+    """
+
+    return_type: str
+    parameters: tuple[FunctionParameter, ...]
+    calling_convention: str
+    variadic: bool = False
+    return_data_type: CType | None = None
+    return_locations: tuple[StorageLocation, ...] = ()
+    hidden_return: bool = False
+    hidden_return_location: StorageLocation | None = None
+    varargs_sse_count_register: str | None = None
+    source: str = "inferred"
+    locked: bool = False
+    inference_confidence: float | None = None
+    inference_evidence: tuple[str, ...] = ()
+
+
 @dataclass
 class Function:
     address: int
@@ -162,6 +204,8 @@ class Function:
     thunk_target_name: Optional[str] = None
     stack_purge_size: Optional[int] = None
     pe_unwind_info: Optional[PEUnwindInfo] = None
+    calling_convention: Optional[str] = None
+    signature: Optional[FunctionSignature] = None
 
     @property
     def end(self) -> int:

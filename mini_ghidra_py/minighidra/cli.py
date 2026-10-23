@@ -26,7 +26,7 @@ HELP_TEXT = """Comandos disponibles:
   noreturn                          funciones/imports no-return detectados
   function <direccion|nombre>       desensamblar una función
   disasm [direccion] [cantidad]     desensamblar desde una dirección
-  pseudo <direccion|nombre>         pseudocódigo heurístico (experimental)
+  pseudo <direccion|nombre>         pseudocódigo semántico x86/x64 (experimental)
   graph <funcion> [archivo.dot]     grafo CFG en formato Graphviz DOT
   strings [filtro] [cantidad]       cadenas ASCII y UTF-16LE
   imports | exports | symbols [filtro]
@@ -47,7 +47,9 @@ Las direcciones aceptan notación decimal o hexadecimal (0x...)."""
 
 
 class Console:
-    def __init__(self, image: BinaryImage, state: ProjectState, project_path: Path) -> None:
+    def __init__(
+        self, image: BinaryImage, state: ProjectState, project_path: Path
+    ) -> None:
         self.image = image
         self.state = state
         self.project_path = project_path
@@ -132,8 +134,12 @@ class Console:
         print(f"Formato       : {info['format']}")
         print(f"Arquitectura  : {info['architecture']} ({info['bits']} bits)")
         print(f"Base          : {self.image.image_base:#x}")
-        print(f"Punto entrada : {hex(info['entrypoint']) if info['entrypoint'] is not None else 'no disponible'}")
-        print(f"Secciones     : {info['sections']} ({info['executable_sections']} ejecutables)")
+        print(
+            f"Punto entrada : {hex(info['entrypoint']) if info['entrypoint'] is not None else 'no disponible'}"
+        )
+        print(
+            f"Secciones     : {info['sections']} ({info['executable_sections']} ejecutables)"
+        )
         print(f"Instrucciones : {info['instructions']}")
         print(f"Funciones     : {info['functions']}")
         print(f"Thunks        : {info['thunks']}")
@@ -144,8 +150,12 @@ class Console:
         print(f"PE .pdata     : {info['pe_exception_functions']} rangos x64")
         print(f"PE unwind    : {info['pe_unwind_functions']} funciones con metadata")
         print(f"PE TLS        : {info['pe_tls_callbacks']} callbacks")
-        print(f"No-return     : {info['no_return_functions']} funciones, {info['no_return_imports']} imports conocidos")
-        print(f"Purga pila    : {info['stack_purge_functions']} funciones con valor inferido")
+        print(
+            f"No-return     : {info['no_return_functions']} funciones, {info['no_return_imports']} imports conocidos"
+        )
+        print(
+            f"Purga pila    : {info['stack_purge_functions']} funciones con valor inferido"
+        )
         print(f"Cadenas       : {info['strings']}")
         print(f"Importaciones : {info['imports']}")
         print(f"Exportaciones : {info['exports']}")
@@ -155,7 +165,9 @@ class Console:
             print(f"Bibliotecas   : {', '.join(self.image.libraries)}")
 
     def _sections(self) -> None:
-        print(f"{'Nombre':<22} {'Inicio':>18} {'Tamaño':>10} {'Permisos':<5} {'Archivo':>12}")
+        print(
+            f"{'Nombre':<22} {'Inicio':>18} {'Tamaño':>10} {'Permisos':<5} {'Archivo':>12}"
+        )
         for section in self.image.sections:
             permissions = "".join(
                 letter if enabled else "-"
@@ -175,20 +187,30 @@ class Console:
         query = " ".join(args).casefold().removeprefix("0x")
         functions = [
             function
-            for function in sorted(self.analyzer.functions.values(), key=lambda item: item.address)
+            for function in sorted(
+                self.analyzer.functions.values(), key=lambda item: item.address
+            )
             if query in function.name.casefold() or query in f"{function.address:x}"
         ]
         if not functions:
             print("No se encontraron funciones recuperadas.")
             return
         print(f"Funciones: {len(functions)}")
-        print(f"{'Dirección':>18} {'Bytes':>8} {'Instrucciones':>14} {'Origen':<18} Nombre")
+        print(
+            f"{'Dirección':>18} {'Bytes':>8} {'Instrucciones':>14} {'Origen':<18} Nombre"
+        )
         for function in functions:
-            origin = "patrón Ghidra" if function.source.startswith("Ghidra pattern:") else function.source
+            origin = (
+                "patrón Ghidra"
+                if function.source.startswith("Ghidra pattern:")
+                else function.source
+            )
             markers = []
             if function.is_thunk:
                 target = function.thunk_target_name or (
-                    f"{function.thunk_target:#x}" if function.thunk_target is not None else "externa"
+                    f"{function.thunk_target:#x}"
+                    if function.thunk_target is not None
+                    else "externa"
                 )
                 markers.append(f"THUNK -> {target}")
             if function.no_return:
@@ -197,7 +219,9 @@ class Console:
                 markers.append(f"STACK_PURGE={function.stack_purge_size}")
             if function.pe_unwind_info is not None:
                 allocation = function.pe_unwind_info.stack_allocation_bytes
-                markers.append(f"UNWIND_STACK={allocation}" if allocation is not None else "UNWIND")
+                markers.append(
+                    f"UNWIND_STACK={allocation}" if allocation is not None else "UNWIND"
+                )
             suffix = f" [{' | '.join(markers)}]" if markers else ""
             print(
                 f"{function.address:#018x} {function.size:>8} "
@@ -225,14 +249,22 @@ class Console:
         query = " ".join(args).casefold()
         thunks = [
             function
-            for function in sorted(self.analyzer.functions.values(), key=lambda item: item.address)
+            for function in sorted(
+                self.analyzer.functions.values(), key=lambda item: item.address
+            )
             if function.is_thunk
-            and (not query or query in function.name.casefold() or query in (function.thunk_target_name or "").casefold())
+            and (
+                not query
+                or query in function.name.casefold()
+                or query in (function.thunk_target_name or "").casefold()
+            )
         ]
         print(f"Thunks recuperados: {len(thunks)}")
         for function in thunks[:500]:
             target = function.thunk_target_name or (
-                f"{function.thunk_target:#x}" if function.thunk_target is not None else "indirecto"
+                f"{function.thunk_target:#x}"
+                if function.thunk_target is not None
+                else "indirecto"
             )
             noreturn = " [NORETURN]" if function.no_return else ""
             print(f"{function.address:#018x}  {function.name} -> {target}{noreturn}")
@@ -272,7 +304,11 @@ class Console:
     def _noreturn(self, args: list[str]) -> None:
         if args:
             raise ValueError("Uso: noreturn")
-        functions = [function for function in self.analyzer.functions.values() if function.no_return]
+        functions = [
+            function
+            for function in self.analyzer.functions.values()
+            if function.no_return
+        ]
         print(f"Funciones no-return detectadas: {len(functions)}")
         for function in sorted(functions, key=lambda item: item.address):
             evidence = self.analyzer.no_return_evidence.get(function.address, ())
@@ -284,7 +320,9 @@ class Console:
                 print(f"    ... {len(evidence) - 10} indicios omitidos")
         print(f"Imports no-return conocidos: {len(self.analyzer.no_return_imports)}")
         for symbol, matched_name in self.analyzer.no_return_imports:
-            location = f"{symbol.address:#018x}" if symbol.address else "(sin dirección)"
+            location = (
+                f"{symbol.address:#018x}" if symbol.address else "(sin dirección)"
+            )
             library = f" [{symbol.library}]" if symbol.library else ""
             print(f"{location}  {symbol.name}{library}  [regla: {matched_name}]")
 
@@ -390,14 +428,18 @@ class Console:
         print(f"Cadenas: {len(matches)} (mostrando hasta {limit})")
         for item in matches[:limit]:
             safe_text = item.text.encode("unicode_escape").decode("ascii")
-            print(f"{item.address:#018x}  {item.encoding:<8} {item.section:<16} {safe_text}")
+            print(
+                f"{item.address:#018x}  {item.encoding:<8} {item.section:<16} {safe_text}"
+            )
 
     def _symbols_table(self, symbols, title: str, args: list[str]) -> None:
         query = " ".join(args).casefold()
         filtered = [symbol for symbol in symbols if query in symbol.name.casefold()]
         print(f"{title}: {len(filtered)}")
         for symbol in filtered:
-            location = f"{symbol.address:#018x}" if symbol.address else "(sin dirección)"
+            location = (
+                f"{symbol.address:#018x}" if symbol.address else "(sin dirección)"
+            )
             extra = f"  [{symbol.library}]" if symbol.library else ""
             print(f"{location}  {symbol.name}{extra}")
 
@@ -407,7 +449,11 @@ class Console:
         target = self.analyzer.resolve_address(args[0])
         references = self.analyzer.xrefs_to(target)
         target_name = self.analyzer.name_at(target)
-        print(f"Referencias a {target:#x}" + (f" ({target_name})" if target_name else "") + f": {len(references)}")
+        print(
+            f"Referencias a {target:#x}"
+            + (f" ({target_name})" if target_name else "")
+            + f": {len(references)}"
+        )
         for xref in references:
             source_name = self.analyzer.name_at(xref.source)
             label = f" ({source_name})" if source_name else ""
@@ -457,7 +503,9 @@ class Console:
         address = self.analyzer.resolve_address(args[0])
         name = args[1]
         if not name or any(character in name for character in "\r\n\x00"):
-            raise ValueError("La etiqueta no puede estar vacía ni contener saltos de línea.")
+            raise ValueError(
+                "La etiqueta no puede estar vacía ni contener saltos de línea."
+            )
         self.state.labels[address] = name
         self.analyzer._name_by_address[address] = name
         if address in self.analyzer.functions:
@@ -481,7 +529,9 @@ class Console:
         output = args[-1]
         patch = _parse_hex_bytes(args[1:-1])
         result = self.image.patch_to_file(address, patch, output)
-        print(f"Copia parcheada escrita en {result} ({len(patch)} bytes en {address:#x}).")
+        print(
+            f"Copia parcheada escrita en {result} ({len(patch)} bytes en {address:#x})."
+        )
 
     def _save(self, args: list[str]) -> None:
         if len(args) > 1:
@@ -509,7 +559,9 @@ class Console:
             raise ValueError("Uso: export-json <archivo.json>")
         destination = Path(args[0]).expanduser().resolve()
         functions = []
-        for function in sorted(self.analyzer.functions.values(), key=lambda item: item.address):
+        for function in sorted(
+            self.analyzer.functions.values(), key=lambda item: item.address
+        ):
             functions.append(
                 {
                     "address": function.address,
@@ -518,12 +570,20 @@ class Console:
                     "source": function.source,
                     "no_return": function.no_return,
                     "stack_purge_size": function.stack_purge_size,
+                    "calling_convention": function.calling_convention,
+                    "signature": (
+                        asdict(function.signature)
+                        if function.signature is not None
+                        else None
+                    ),
                     "pe_unwind_info": (
                         asdict(function.pe_unwind_info)
                         if function.pe_unwind_info is not None
                         else None
                     ),
-                    "no_return_evidence": self.analyzer.no_return_evidence.get(function.address, []),
+                    "no_return_evidence": self.analyzer.no_return_evidence.get(
+                        function.address, []
+                    ),
                     "is_thunk": function.is_thunk,
                     "thunk_target": function.thunk_target,
                     "thunk_target_name": function.thunk_target_name,
@@ -534,7 +594,9 @@ class Console:
                             "mnemonic": instruction.mnemonic,
                             "operands": instruction.op_str,
                             "memory_references": list(instruction.memory_references),
-                            "indexed_memory_references": list(instruction.indexed_memory_references),
+                            "indexed_memory_references": list(
+                                instruction.indexed_memory_references
+                            ),
                             "scalar_references": list(instruction.scalar_references),
                             "computed_targets": list(instruction.computed_targets),
                         }
@@ -556,8 +618,13 @@ class Console:
             ],
             "symbols": [symbol.__dict__ for symbol in self.image.symbols],
             "imports": [symbol.__dict__ for symbol in self.image.imports],
-            "plt_stubs": {f"0x{address:x}": name for address, name in self.image.plt_stubs.items()},
-            "import_slots": {f"0x{address:x}": name for address, name in self.image.import_slots.items()},
+            "plt_stubs": {
+                f"0x{address:x}": name for address, name in self.image.plt_stubs.items()
+            },
+            "import_slots": {
+                f"0x{address:x}": name
+                for address, name in self.image.import_slots.items()
+            },
             "address_tables": [
                 {
                     "address": table.address,
@@ -584,21 +651,33 @@ class Console:
                 }
                 for item in self.analyzer.function_start_candidates
             ],
-            "macho_function_start_candidates": list(self.analyzer.macho_function_start_candidates),
+            "macho_function_start_candidates": list(
+                self.analyzer.macho_function_start_candidates
+            ),
             "pe_exception_function_ranges": [
                 {"start": start, "end": end}
-                for start, end in getattr(self.image, "pe_exception_function_ranges", ())
+                for start, end in getattr(
+                    self.image, "pe_exception_function_ranges", ()
+                )
             ],
             "pe_tls_callbacks": list(getattr(self.image, "pe_tls_callbacks", ())),
             "strings": [entry.__dict__ for entry in self.analyzer.strings],
             "xrefs": [xref.__dict__ for xref in self.analyzer.xrefs],
             "annotations": {
-                "labels": {f"0x{address:x}": name for address, name in self.state.labels.items()},
-                "comments": {f"0x{address:x}": text for address, text in self.state.comments.items()},
+                "labels": {
+                    f"0x{address:x}": name
+                    for address, name in self.state.labels.items()
+                },
+                "comments": {
+                    f"0x{address:x}": text
+                    for address, text in self.state.comments.items()
+                },
             },
         }
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        destination.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
         print(f"Informe JSON escrito en {destination}")
 
     def _export_asm(self, args: list[str]) -> None:
@@ -649,10 +728,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("x86", "x86_64"),
         help="trata el archivo como bytes crudos con esta arquitectura",
     )
-    parser.add_argument("--base", type=_parse_int, default=0, help="base virtual para un volcado crudo (default: 0)")
-    parser.add_argument("--project", help="archivo JSON de anotaciones (default: junto al binario)")
-    parser.add_argument("-c", "--command", help="ejecuta un comando y termina; sin esta opción abre la consola")
-    parser.add_argument("--gui", action="store_true", help="abre la interfaz gráfica Tkinter")
+    parser.add_argument(
+        "--base",
+        type=_parse_int,
+        default=0,
+        help="base virtual para un volcado crudo (default: 0)",
+    )
+    parser.add_argument(
+        "--project", help="archivo JSON de anotaciones (default: junto al binario)"
+    )
+    parser.add_argument(
+        "-c",
+        "--command",
+        help="ejecuta un comando y termina; sin esta opción abre la consola",
+    )
+    parser.add_argument(
+        "--gui", action="store_true", help="abre la interfaz gráfica Tkinter"
+    )
     return parser
 
 
@@ -698,7 +790,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"MiniGhidraPy — {image.path.name} | {image.architecture} ({image.bits} bits) | "
         f"{len(console.analyzer.functions)} funciones recuperadas"
     )
-    print("Escribe help para ver comandos. La herramienta solo hace análisis estático; no ejecuta el binario.")
+    print(
+        "Escribe help para ver comandos. La herramienta solo hace análisis estático; no ejecuta el binario."
+    )
     while True:
         try:
             line = input("minighidra> ")

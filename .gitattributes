@@ -36,6 +36,7 @@
 *.rxg text
 *.sh text
 *.sla text
+mini_ghidra_py/minighidra/data/sleigh/*.sla binary
 *.tag text
 *.tld text
 *.tool text

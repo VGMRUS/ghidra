@@ -13,6 +13,7 @@ authors = [{ name = "MiniGhidraPy contributors" }]
 dependencies = [
   "capstone>=5.0,<6",
   "lief>=0.15,<1",
+  "pypcode>=3.3.3,<4",
 ]
 
 [project.scripts]
@@ -23,7 +24,12 @@ where = ["."]
 include = ["minighidra*"]
 
 [tool.setuptools.package-data]
-minighidra = ["data/noreturn/*.txt"]
+minighidra = [
+  "data/noreturn/*.txt",
+  "data/sleigh/*.pspec",
+  "data/sleigh/*.sla",
+  "data/sleigh/*.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
