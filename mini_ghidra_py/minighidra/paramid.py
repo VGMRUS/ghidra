@@ -1852,6 +1852,8 @@ class PcodeLikeGraph:
         self._output_values: dict[str, set[int]] = defaultdict(set)
         self._output_widths: dict[str, int] = defaultdict(int)
         self._output_sink_operations: dict[str, set[int]] = defaultdict(set)
+        self.call_specs: list[Any] = []
+        self.active_output: Any = None
         self.ssa_function: SSAFunction | None = None
         self.supplemental_graph: PcodeLikeGraph | None = None
         self.depth_limited_uses = 0
@@ -2485,22 +2487,27 @@ class PcodeLikeGraph:
             if result is not None
             else None
         )
-        self._set_definition(
-            PcodeOp(
-                "CALL",
-                inputs,
-                output,
-                address=address,
-                evidence=evidence,
-                mnemonic=mnemonic,
-                input_ranks=(
-                    (ParamRank.DIRECT_READ,) if target_node is not None else ()
-                )
-                + tuple(
-                    ParamRank.SUBFUNCTION_PARAMETER for _argument in argument_nodes
-                ),
+        op = PcodeOp(
+            "CALL" if direct_target_address is not None else "CALLIND",
+            inputs,
+            output,
+            address=address,
+            evidence=evidence,
+            mnemonic=mnemonic,
+            input_ranks=(
+                (ParamRank.DIRECT_READ,) if target_node is not None else ()
             )
+            + tuple(
+                ParamRank.SUBFUNCTION_PARAMETER for _argument in argument_nodes
+            ),
         )
+        self._set_definition(op)
+        
+        try:
+            from .fspec import CallSpecs
+            self.call_specs.append(CallSpecs(op, name=call_target_name or ""))
+        except ImportError:
+            pass
         record = self._instruction_record(address, mnemonic)
         record["call_target"] = target_node
         record["call_target_name"] = call_target_name
