@@ -105,14 +105,62 @@ class CollapseStructure:
 
         return isolated_count
 
-    # Stubs for the structuring rules
-    def rule_block_goto(self, bl: FlowBlock) -> bool: return False
-    def rule_block_cat(self, bl: FlowBlock) -> bool: return False
-    def rule_block_proper_if(self, bl: FlowBlock) -> bool: return False
+    def rule_block_goto(self, bl: FlowBlock) -> bool:
+        return False
+        
+    def rule_block_cat(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 1: return False
+        if len(bl.in_edges) == 1 and len(bl.in_edges[0].out_edges) == 1: return False # Must be start of chain
+        outblock = bl.out_edges[0]
+        if outblock == bl: return False # No looping
+        if len(outblock.in_edges) != 1: return False
+
+        nodes = [bl, outblock]
+        while len(outblock.out_edges) == 1:
+            outbl2 = outblock.out_edges[0]
+            if outbl2 == bl: break
+            if len(outbl2.in_edges) != 1: break
+            outblock = outbl2
+            nodes.append(outblock)
+
+        self.graph.new_block_list(nodes)
+        return True
+
+    def rule_block_proper_if(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
+
+        for i in range(2):
+            clauseblock = bl.out_edges[i]
+            if len(clauseblock.in_edges) != 1: continue
+            if len(clauseblock.out_edges) != 1: continue
+            outblock = clauseblock.out_edges[0]
+            if outblock != bl.out_edges[1 - i]: continue
+
+            self.graph.new_block_if(bl, clauseblock)
+            return True
+            
+        return False
+
     def rule_block_proper_else(self, bl: FlowBlock) -> bool: return False
     def rule_block_if_else(self, bl: FlowBlock) -> bool: return False
     def rule_block_if_no_exit(self, bl: FlowBlock) -> bool: return False
-    def rule_block_while_do(self, bl: FlowBlock) -> bool: return False
+    
+    def rule_block_while_do(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
+
+        for i in range(2):
+            clauseblock = bl.out_edges[i]
+            if len(clauseblock.in_edges) != 1: continue
+            if len(clauseblock.out_edges) != 1: continue
+            if clauseblock.out_edges[0] != bl: continue
+
+            self.graph.new_block_while_do(bl, clauseblock)
+            return True
+            
+        return False
+
     def rule_block_do_while(self, bl: FlowBlock) -> bool: return False
     def rule_block_inf_loop(self, bl: FlowBlock) -> bool: return False
     def rule_block_switch(self, bl: FlowBlock) -> bool: return False
