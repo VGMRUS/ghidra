@@ -1,6 +1,7 @@
 from __future__ import annotations
 from .paramid import PcodeLikeGraph
 from .action import Action
+from .typeop import TYPE_OPS
 
 class ActionHeritage(Action):
     """Links uses to definitions and constructs Single Static Assignment (SSA) form."""
@@ -49,36 +50,46 @@ class ActionInferTypes(Action):
             iterations += 1
             
             for op in data.ops:
-                # 1. Forward propagation (from inputs to output)
+                type_op = TYPE_OPS.get(op.opcode)
+                if type_op is None:
+                    continue
+
+                in_types = []
+                for inp in op.inputs:
+                    if inp < 0:
+                        in_types.append(None)
+                    else:
+                        in_high = merge.node_to_high.get(inp)
+                        in_types.append(in_high.data_type if in_high else None)
+                        
+                out_high = None
+                out_type = None
                 if op.output is not None:
                     out_high = merge.node_to_high.get(op.output)
-                    if out_high and out_high.data_type is None:
-                        # Attempt to infer from inputs
-                        for inp in op.inputs:
-                            if inp < 0: continue
-                            in_high = merge.node_to_high.get(inp)
-                            if in_high and in_high.data_type is not None:
-                                # Simplified: inherit type directly or apply operation-specific typing
-                                if op.opcode in ("COPY", "MULTIEQUAL", "INT_ADD", "INT_SUB"):
-                                    out_high.data_type = in_high.data_type
-                                    out_high.is_dirty = True
-                                    changed = True
-                                    self.count += 1
-                                    break
+                    out_type = out_high.data_type if out_high else None
+
+                # 1. Forward propagation (from inputs to output)
+                if out_high is not None and out_type is None:
+                    inferred_out = type_op.push(op, in_types)
+                    if inferred_out is not None:
+                        out_high.data_type = inferred_out
+                        out_high.is_dirty = True
+                        changed = True
+                        self.count += 1
+                        out_type = inferred_out
                 
                 # 2. Backward propagation (from output to inputs)
-                if op.output is not None:
-                    out_high = merge.node_to_high.get(op.output)
-                    if out_high and out_high.data_type is not None:
-                        for inp in op.inputs:
-                            if inp < 0: continue
-                            in_high = merge.node_to_high.get(inp)
-                            if in_high and in_high.data_type is None:
-                                if op.opcode in ("COPY", "MULTIEQUAL"):
-                                    in_high.data_type = out_high.data_type
-                                    in_high.is_dirty = True
-                                    changed = True
-                                    self.count += 1
+                for slot, inp in enumerate(op.inputs):
+                    if inp < 0: continue
+                    in_high = merge.node_to_high.get(inp)
+                    if in_high and in_high.data_type is None:
+                        inferred_in = type_op.pop(op, out_type, in_types, slot)
+                        if inferred_in is not None:
+                            in_high.data_type = inferred_in
+                            in_high.is_dirty = True
+                            in_types[slot] = inferred_in
+                            changed = True
+                            self.count += 1
 
             # Mark all dirty highs as clean
             for high in merge.highs:
