@@ -7728,6 +7728,15 @@ class SemanticDecompiler:
             input_names=input_names,
         )
 
+        try:
+            from .action import ActionDatabase
+            db = ActionDatabase()
+            db.universal_action()
+            if db.current_action:
+                db.current_action.apply(paramid_graph)
+        except ImportError:
+            pass
+
     def _parameter_specs(self, body: list[str]) -> list[FunctionParameter]:
         del body  # Candidate inputs come from the lifted value graph, not C text.
         self._run_paramid_analysis()

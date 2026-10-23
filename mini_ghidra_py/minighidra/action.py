@@ -16,6 +16,49 @@ class Action:
         raise NotImplementedError
 
 
+class ActionGroup(Action):
+    """An action that groups multiple sub-actions and applies them sequentially."""
+
+    def __init__(self, group: str, name: str) -> None:
+        super().__init__(group, name)
+        self.actions: list[Action] = []
+
+    def add_action(self, action: Action) -> None:
+        self.actions.append(action)
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        for action in self.actions:
+            res = action.apply(data)
+            if res > 0:
+                self.count += res
+        return 0
+
+
+class ActionDatabase:
+    """Registry and orchestrator of decompiler actions."""
+
+    def __init__(self) -> None:
+        self.groups: dict[str, ActionGroup] = {}
+        self.current_action: ActionGroup | None = None
+
+    def register_action(self, name: str, action: ActionGroup) -> None:
+        self.groups[name] = action
+
+    def universal_action(self) -> None:
+        """Configure the universal action group with the standard passes."""
+        universal = ActionGroup("universal", "universal")
+        self.register_action("universal", universal)
+
+        # Standard decompilation phases ported so far:
+        # 1. Parameter discovery and Call site trimming
+        universal.add_action(ActionActiveParam("base"))
+        universal.add_action(ActionActiveReturn("base"))
+        universal.add_action(ActionReturnRecovery("base"))
+
+        self.current_action = universal
+
+
 class ActionActiveParam(Action):
     """Determine which parameters are actively read by subfunctions."""
 
@@ -89,7 +132,7 @@ class ActionReturnRecovery(Action):
         returns = [op for op in data.ops if op.opcode == "RETURN"]
 
         for op in returns:
-            for trial in active.trials():
+            for trial in active.trials:
                 if trial.is_checked():
                     continue
                 # For each RETURN op, we would trace backwards to see if the value

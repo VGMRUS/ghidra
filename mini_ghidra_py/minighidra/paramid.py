@@ -1853,6 +1853,7 @@ class PcodeLikeGraph:
         self._output_widths: dict[str, int] = defaultdict(int)
         self._output_sink_operations: dict[str, set[int]] = defaultdict(set)
         self.call_specs: list[Any] = []
+        self.merged_model: Any = None
         self.active_output: Any = None
         self.ssa_function: SSAFunction | None = None
         self.supplemental_graph: PcodeLikeGraph | None = None
@@ -2505,7 +2506,9 @@ class PcodeLikeGraph:
         
         try:
             from .fspec import CallSpecs
-            self.call_specs.append(CallSpecs(op, name=call_target_name or ""))
+            self.call_specs.append(
+                CallSpecs(op, name=call_target_name or "", merged_model=self.merged_model)
+            )
         except ImportError:
             pass
         record = self._instruction_record(address, mnemonic)
