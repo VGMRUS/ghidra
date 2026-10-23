@@ -90,7 +90,22 @@ class ActionDatabase:
         # 2. Block structure and flow
         universal.add_action(ActionBlockStructure("blockrecovery"))
 
-        # 3. Basic Prototype and Type Enforcement
+        # 3. HighVariable Merging (converting SSA Varnodes to logical HighVariables)
+        from .action_merge import (
+            ActionAssignHigh, ActionMergeRequired, ActionMarkExplicit,
+            ActionMarkImplied, ActionMergeMultiEntry, ActionMergeCopy,
+            ActionMergeAdjacent, ActionMergeType
+        )
+        universal.add_action(ActionAssignHigh("merge"))
+        universal.add_action(ActionMergeRequired("merge"))
+        universal.add_action(ActionMarkExplicit("merge"))
+        universal.add_action(ActionMarkImplied("merge"))
+        universal.add_action(ActionMergeMultiEntry("merge"))
+        universal.add_action(ActionMergeCopy("merge"))
+        universal.add_action(ActionMergeAdjacent("merge"))
+        universal.add_action(ActionMergeType("merge"))
+
+        # 4. Basic Prototype and Type Enforcement
         universal.add_action(ActionActiveReturn("protorecovery"))
         universal.add_action(ActionPrototypeTypes("base"))
         universal.add_action(ActionInferTypes("base"))
