@@ -36,15 +36,55 @@ class ActionInferTypes(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        # A true inference algorithm iteratively pushes known data types 
-        # (e.g. from function prototypes and memory loads) to adjacent variables.
-        # MiniGhidra intercepts this phase to resolve internal node types.
-        if hasattr(data, "merge"):
-            merge = getattr(data, "merge")
+        if not hasattr(data, "merge"):
+            return 0
+        
+        merge = getattr(data, "merge")
+        
+        # Iterative type propagation algorithm (Forward and Backward)
+        changed = True
+        iterations = 0
+        while changed and iterations < 10:
+            changed = False
+            iterations += 1
+            
+            for op in data.ops:
+                # 1. Forward propagation (from inputs to output)
+                if op.output is not None:
+                    out_high = merge.node_to_high.get(op.output)
+                    if out_high and out_high.data_type is None:
+                        # Attempt to infer from inputs
+                        for inp in op.inputs:
+                            if inp < 0: continue
+                            in_high = merge.node_to_high.get(inp)
+                            if in_high and in_high.data_type is not None:
+                                # Simplified: inherit type directly or apply operation-specific typing
+                                if op.opcode in ("COPY", "MULTIEQUAL", "INT_ADD", "INT_SUB"):
+                                    out_high.data_type = in_high.data_type
+                                    out_high.is_dirty = True
+                                    changed = True
+                                    self.count += 1
+                                    break
+                
+                # 2. Backward propagation (from output to inputs)
+                if op.output is not None:
+                    out_high = merge.node_to_high.get(op.output)
+                    if out_high and out_high.data_type is not None:
+                        for inp in op.inputs:
+                            if inp < 0: continue
+                            in_high = merge.node_to_high.get(inp)
+                            if in_high and in_high.data_type is None:
+                                if op.opcode in ("COPY", "MULTIEQUAL"):
+                                    in_high.data_type = out_high.data_type
+                                    in_high.is_dirty = True
+                                    changed = True
+                                    self.count += 1
+
+            # Mark all dirty highs as clean
             for high in merge.highs:
                 if high.is_dirty:
                     high.is_dirty = False
-                    self.count += 1
+                    
         return 0
 
 class ActionSetCasts(Action):

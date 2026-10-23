@@ -2589,6 +2589,58 @@ class PcodeLikeGraph:
             )
         )
 
+    def op_set_input(self, op: PcodeOp, new_in: int, slot: int) -> PcodeOp:
+        new_inputs = list(op.inputs)
+        while len(new_inputs) <= slot:
+            new_inputs.append(-1)
+        new_inputs[slot] = new_in
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(op.__dict__)
+        new_op.__dict__["inputs"] = tuple(new_inputs)
+        try:
+            idx = self.ops.index(op)
+            self.ops[idx] = new_op
+        except ValueError:
+            pass
+        return new_op
+
+    def op_set_opcode(self, op: PcodeOp, new_opcode: str) -> PcodeOp:
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(op.__dict__)
+        new_op.__dict__["opcode"] = new_opcode
+        try:
+            idx = self.ops.index(op)
+            self.ops[idx] = new_op
+        except ValueError:
+            pass
+        return new_op
+
+    def new_constant(self, size_bits: int, value: int) -> int:
+        name = f"const_{value:#x}"
+        return self._new_node(name, size_bits, "constant")
+
+    def get_def(self, vn_id: int) -> PcodeOp | None:
+        def_idx = self._definitions.get(vn_id)
+        if def_idx is not None and def_idx < len(self.ops):
+            return self.ops[def_idx]
+        return None
+
+    def is_constant(self, vn_id: int) -> bool:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            return False
+        return self.nodes[vn_id].kind == "constant"
+
+    def get_constant_value(self, vn_id: int) -> int:
+        if not self.is_constant(vn_id):
+            return 0
+        name = self.nodes[vn_id].name
+        if name.startswith("const_"):
+            try:
+                return int(name[6:], 16)
+            except ValueError:
+                pass
+        return 0
+
     def measure(self, name: str, max_depth: int = 10) -> ParamMeasurement:
         """Measure an input by Ghidra's forward ``walkforward`` rank rules."""
         starts = self._source_nodes.get(name, set())

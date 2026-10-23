@@ -127,3 +127,24 @@ class BlockGraph(FlowBlock):
             
         return new_loop
 
+    def new_block_if_else(self, cond: FlowBlock, true_body: FlowBlock, false_body: FlowBlock) -> BlockIfElse:
+        new_if = BlockIfElse(cond, true_body, false_body)
+        self.replace_block(cond, new_if)
+        
+        if true_body in self.blocks: self.blocks.remove(true_body)
+        if false_body in self.blocks: self.blocks.remove(false_body)
+            
+        return new_if
+
+    def new_block_do_while(self, body: FlowBlock) -> BlockDoWhile:
+        new_loop = BlockDoWhile(body)
+        self.replace_block(body, new_loop)
+        return new_loop
+
+    def new_block_inf_loop(self, body: FlowBlock) -> FlowBlock:
+        # Placeholder for BlockInfLoop since it wasn't defined
+        # We can just reuse BlockDoWhile with True condition
+        new_loop = BlockDoWhile(body)
+        self.replace_block(body, new_loop)
+        return new_loop
+
