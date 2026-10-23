@@ -6,6 +6,13 @@ from .abi import (
     calling_convention_for,
     default_calling_convention,
 )
+from .fspec import CallSpecs
+from .action import (
+    Action,
+    ActionActiveParam,
+    ActionActiveReturn,
+    ActionReturnRecovery,
+)
 from .analysis import Analyzer
 from .decompiler import SemanticDecompiler
 from .function_starts import FunctionStartCandidate
@@ -74,6 +81,11 @@ __all__ = [
     "BinaryImage",
     "CField",
     "CType",
+    "CallSpecs",
+    "Action",
+    "ActionActiveParam",
+    "ActionActiveReturn",
+    "ActionReturnRecovery",
     "CallingConvention",
     "CspecModelRule",
     "Function",
