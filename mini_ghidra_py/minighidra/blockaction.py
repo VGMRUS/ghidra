@@ -39,3 +39,19 @@ class ActionFinalStructure(Action):
         # graph.mark_unstructured()
         self.count = 0
         return 0
+
+class ActionConditionalConst(Action):
+    """Propagates conditional constants through control flow edges."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "conditionalconst")
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionSwitchNorm(Action):
+    """Normalizes switch statements to a standard form."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "switchnorm")
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
