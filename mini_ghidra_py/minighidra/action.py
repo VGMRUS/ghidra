@@ -56,6 +56,7 @@ class ActionDatabase:
         )
         from .action_varnode import ActionVarnodeProps, ActionDirectWrite
         from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
+        from .blockaction import ActionBlockStructure, ActionFinalStructure
 
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
@@ -77,10 +78,15 @@ class ActionDatabase:
         
         universal.add_action(ActionDeadCode("deadcode"))
 
-        # 2. Basic Prototype and Type Enforcement
+        # 2. Block structure and flow
+        universal.add_action(ActionBlockStructure("blockrecovery"))
+
+        # 3. Basic Prototype and Type Enforcement
         universal.add_action(ActionActiveReturn("protorecovery"))
         universal.add_action(ActionPrototypeTypes("base"))
         universal.add_action(ActionInferTypes("base"))
+
+        universal.add_action(ActionFinalStructure("blockrecovery"))
 
         self.current_action = universal
 
