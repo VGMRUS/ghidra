@@ -78,3 +78,22 @@ class ActionDefaultParams(Action):
         # before they hit actions, so this acts as a formalization step.
         self.count = 0
         return 0
+
+class ActionPrototypeWarnings(Action):
+    """Adds warnings for prototypes that aren't modeled properly."""
+
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "prototypewarnings")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionStop(Action):
+    """Terminates the action pipeline."""
+
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "stop")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        return -1

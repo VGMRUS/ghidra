@@ -114,8 +114,13 @@ class ActionDatabase:
 
         # 5. Variable Naming and Dynamic Symbols
         from .action_name import ActionNameVars, ActionDynamicSymbols
+        from .action_types import ActionSetCasts, ActionPrototypeWarnings, ActionStop
+
         universal.add_action(ActionDynamicSymbols("dynamic"))
         universal.add_action(ActionNameVars("merge"))
+        universal.add_action(ActionSetCasts("casts"))
+        universal.add_action(ActionPrototypeWarnings("protorecovery"))
+        universal.add_action(ActionStop("base"))
 
         self.current_action = universal
 
