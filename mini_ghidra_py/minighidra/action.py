@@ -55,25 +55,30 @@ class ActionDatabase:
             ActionPrototypeTypes,
         )
         from .action_varnode import ActionVarnodeProps, ActionDirectWrite
+        from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
 
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
 
         # Standard decompilation phases ported so far:
         # 0. SSA Heritage and Cleanup
+        universal.add_action(ActionUnreachable("base"))
         universal.add_action(ActionVarnodeProps("base"))
         universal.add_action(ActionHeritage("base"))
+        universal.add_action(ActionForceGoto("blockrecovery"))
         universal.add_action(ActionDirectWrite("protorecovery_a", True))
         universal.add_action(ActionDirectWrite("protorecovery_b", False))
-        universal.add_action(ActionDeadCode("deadcode"))
-
+        
         # 1. Parameter discovery and Call site trimming
         universal.add_action(ActionDefaultParams("base"))
-        universal.add_action(ActionActiveParam("base"))
-        universal.add_action(ActionActiveReturn("base"))
-        universal.add_action(ActionReturnRecovery("base"))
+        universal.add_action(ActionActiveParam("protorecovery"))
+        universal.add_action(ActionReturnRecovery("protorecovery"))
+        universal.add_action(ActionRestrictLocal("localrecovery"))
+        
+        universal.add_action(ActionDeadCode("deadcode"))
 
         # 2. Basic Prototype and Type Enforcement
+        universal.add_action(ActionActiveReturn("protorecovery"))
         universal.add_action(ActionPrototypeTypes("base"))
         universal.add_action(ActionInferTypes("base"))
 
