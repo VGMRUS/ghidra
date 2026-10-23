@@ -47,14 +47,21 @@ class ActionDatabase:
 
     def universal_action(self) -> None:
         """Configure the universal action group with the standard passes."""
+        from .action_types import ActionInferTypes, ActionPrototypeTypes, ActionDefaultParams
+
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
 
         # Standard decompilation phases ported so far:
         # 1. Parameter discovery and Call site trimming
+        universal.add_action(ActionDefaultParams("base"))
         universal.add_action(ActionActiveParam("base"))
         universal.add_action(ActionActiveReturn("base"))
         universal.add_action(ActionReturnRecovery("base"))
+
+        # 2. Basic Prototype and Type Enforcement
+        universal.add_action(ActionPrototypeTypes("base"))
+        universal.add_action(ActionInferTypes("base"))
 
         self.current_action = universal
 
