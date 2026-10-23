@@ -208,6 +208,10 @@ class Function:
     signature: Optional[FunctionSignature] = None
 
     @property
+    def start(self) -> int:
+        return self.address
+
+    @property
     def end(self) -> int:
         if not self.instructions:
             return self.address
