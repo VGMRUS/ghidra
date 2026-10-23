@@ -143,7 +143,36 @@ class CollapseStructure:
         return False
 
     def rule_block_proper_else(self, bl: FlowBlock) -> bool: return False
-    def rule_block_if_else(self, bl: FlowBlock) -> bool: return False
+    def rule_block_if_else(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        tc = bl.out_edges[0]
+        fc = bl.out_edges[1]
+        
+        if len(tc.in_edges) != 1: return False
+        if len(fc.in_edges) != 1: return False
+        if len(tc.out_edges) != 1: return False
+        if len(fc.out_edges) != 1: return False
+        
+        outblock = tc.out_edges[0]
+        if outblock == bl: return False
+        if outblock != fc.out_edges[0]: return False
+        
+        self.graph.new_block_if_else(bl, tc, fc)
+        return True
+
+    def rule_block_do_while(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        for i in range(2):
+            if bl.out_edges[i] != bl: continue
+            self.graph.new_block_do_while(bl)
+            return True
+        return False
+
+    def rule_block_inf_loop(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 1: return False
+        if bl.out_edges[0] != bl: return False
+        self.graph.new_block_inf_loop(bl)
+        return True
     def rule_block_if_no_exit(self, bl: FlowBlock) -> bool: return False
     
     def rule_block_while_do(self, bl: FlowBlock) -> bool:
