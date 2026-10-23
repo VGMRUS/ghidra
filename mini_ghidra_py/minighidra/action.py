@@ -54,14 +54,18 @@ class ActionDatabase:
             ActionInferTypes,
             ActionPrototypeTypes,
         )
+        from .action_varnode import ActionVarnodeProps, ActionDirectWrite
 
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
 
         # Standard decompilation phases ported so far:
         # 0. SSA Heritage and Cleanup
+        universal.add_action(ActionVarnodeProps("base"))
         universal.add_action(ActionHeritage("base"))
-        universal.add_action(ActionDeadCode("base"))
+        universal.add_action(ActionDirectWrite("protorecovery_a", True))
+        universal.add_action(ActionDirectWrite("protorecovery_b", False))
+        universal.add_action(ActionDeadCode("deadcode"))
 
         # 1. Parameter discovery and Call site trimming
         universal.add_action(ActionDefaultParams("base"))
