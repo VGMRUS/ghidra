@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -50,6 +50,16 @@ class CType:
     packed: bool = False
     parameters: tuple[CType, ...] = ()
     variadic: bool = False
+
+    @property
+    def align_size(self) -> int | None:
+        """Size rounded up to the type's alignment, like Ghidra's getAlignSize."""
+        base = self.unwrapped()
+        if base.size is None:
+            return None
+        if base.kind in {TypeKind.STRUCT, TypeKind.UNION}:
+            return _align(base.size, base.alignment or 1)
+        return base.size
 
     @property
     def is_aggregate(self) -> bool:
@@ -102,11 +112,13 @@ class CType:
 
 @dataclass(frozen=True, slots=True)
 class StorageLocation:
-    """One piece of a parameter/return value in a calling convention.
+    """One logical piece of a parameter/return value in a calling convention.
 
     ``register_offset`` identifies a subrange within a physical register (for
     example, the upper SSEUP lane in ``xmm0``); ``value_offset`` remains the
-    corresponding byte offset in the logical value.
+    corresponding byte offset in the logical value. ``join_record`` describes
+    the physical piece(s) when a logical location is backed by Ghidra join
+    space, including x87 precision-extension records.
     """
 
     kind: str
@@ -117,6 +129,7 @@ class StorageLocation:
     indirect: bool = False
     hidden: bool = False
     register_offset: int = 0
+    join_record: JoinRecord | None = None
 
     @property
     def is_register(self) -> bool:
@@ -125,6 +138,99 @@ class StorageLocation:
     @property
     def is_stack(self) -> bool:
         return self.kind == "stack"
+
+    @property
+    def physical_pieces(self) -> tuple[StorageLocation, ...]:
+        """Return underlying register/stack pieces, flattening any join record."""
+        if self.join_record is not None:
+            return self.join_record.pieces
+        return (self,)
+
+    @property
+    def is_joined(self) -> bool:
+        return self.join_record is not None
+
+
+@dataclass(frozen=True, slots=True)
+class JoinRecord:
+    """Ghidra-style mapping from one logical join-space value to physical pieces.
+
+    Piece order is most-significant to least-significant, as in
+    ``Architecture::joinPieces``. A float-extension record is the special
+    single-piece case where the logical precision is smaller than the physical
+    register width (for example, a 4-byte ``float`` in a 10-byte ``st0``).
+    """
+
+    pieces: tuple[StorageLocation, ...]
+    logical_size: int
+    float_extension: bool = False
+    big_endian: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.pieces or self.logical_size <= 0:
+            raise ValueError("JoinRecord necesita piezas físicas y tamaño lógico positivo")
+        if any(piece.size <= 0 for piece in self.pieces):
+            raise ValueError("Las piezas físicas de JoinRecord deben tener tamaño positivo")
+        physical_size = sum(piece.size for piece in self.pieces)
+        if self.float_extension:
+            if len(self.pieces) != 1 or self.logical_size >= physical_size:
+                raise ValueError(
+                    "Un JoinRecord float requiere una pieza más ancha que el valor lógico"
+                )
+        elif self.logical_size != physical_size:
+            raise ValueError("El tamaño lógico de JoinRecord debe sumar sus piezas")
+
+    def get_equivalent_piece(
+        self, logical_offset: int
+    ) -> tuple[StorageLocation, int] | None:
+        """Map a relative join-space offset to ``(piece, byte offset)``."""
+        if logical_offset < 0 or logical_offset >= self.logical_size:
+            return None
+        remaining = logical_offset
+        indices = (
+            range(len(self.pieces))
+            if self.big_endian
+            else range(len(self.pieces) - 1, -1, -1)
+        )
+        for index in indices:
+            piece = self.pieces[index]
+            if remaining < piece.size:
+                return piece, remaining
+            remaining -= piece.size
+        return None
+
+
+def construct_float_extension_location(
+    real_location: StorageLocation,
+    real_size: int,
+    logical_size: int,
+    *,
+    big_endian: bool = False,
+) -> StorageLocation:
+    """Model ``constructFloatExtensionAddress`` for one real storage location."""
+    if real_size <= 0 or logical_size <= 0 or logical_size > real_size:
+        raise ValueError("Float extension requiere 0 < logical_size <= real_size")
+    if real_location.size < real_size:
+        raise ValueError("La ubicación real no cubre el ancho físico del registro")
+    physical_piece = replace(
+        real_location,
+        size=real_size,
+        value_offset=0,
+        join_record=None,
+    )
+    if logical_size == real_size:
+        return physical_piece
+    record = JoinRecord(
+        pieces=(physical_piece,),
+        logical_size=logical_size,
+        float_extension=True,
+        big_endian=big_endian,
+    )
+    return replace(
+        physical_piece,
+        size=logical_size,
+        join_record=record,
+    )
 
 
 class TypeDatabase:
@@ -327,7 +433,11 @@ class TypeDatabase:
             raise ValueError("Un array requiere un tipo de elemento completo")
         if count is not None and count < 0:
             raise ValueError("El tamaño de un array no puede ser negativo")
-        size = None if count is None or base.size is None else count * base.size
+        size = (
+            None
+            if count is None or base.align_size is None
+            else count * base.align_size
+        )
         suffix = "" if count is None else str(count)
         return CType(
             f"{base.name}[{suffix}]",
@@ -442,8 +552,8 @@ class TypeDatabase:
             field_alignment = 1 if packed else (field_type.alignment or 1)
             maximum_alignment = max(maximum_alignment, field_alignment)
             built.append(CField(field_name, field_type, int(offset)))
-            if field_type.size is not None:
-                cursor = max(cursor, int(offset) + field_type.size)
+            if field_type.align_size is not None:
+                cursor = max(cursor, int(offset) + field_type.align_size)
         alignment = alignment or maximum_alignment
         computed_size = _align(cursor, alignment)
         if size is not None:

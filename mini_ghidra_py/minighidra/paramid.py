@@ -3,8 +3,9 @@
 The rank walk ports ``ParamMeasure``'s directional input/output rules, bounded
 phi traversal, and loop-edge suppression. The SSA graph is authoritative for
 instruction uses; the reduced symbolic graph supplements stack-slot input
-identity and call-spec evidence not represented by raw SLEIGH p-code. This
-module does not port Ghidra's separate prototype-model resolution pipeline.
+identity and call-spec evidence not represented by raw SLEIGH p-code. The
+separate ParamEntry/ParamList resource and prototype-model passes live in
+:mod:`minighidra.paramlist` and consume the trials managed here.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any
 
 from .sleigh import SleighInstruction, SleighPcodeOp
 from .ssa import SSAFunction, SSALocation, _register_family
-from .typesys import StorageLocation
+from .typesys import StorageLocation, construct_float_extension_location
 
 _PARAM_NAME = re.compile(r"(?:float_)?param_\d+\Z")
 PARAMID_MAX_DEPTH = 10
@@ -184,15 +185,46 @@ class ParamTrialFlag(IntFlag):
     ANCESTOR_SOLID = 0x400
 
 
-@dataclass(frozen=True, slots=True)
-class ParamTrialEntry:
-    """The ordering properties a matched Ghidra ``ParamEntry`` supplies.
+class ParamTypeClass(IntEnum):
+    """Storage classes used by ``fspec.hh`` ParamEntry resources."""
 
-    The actual ParamList/ParamEntry mapping is outside this port. ``order`` is
-    a caller-supplied stand-in for the source object's pointer ordering when
-    entries share a group; object identity breaks unspecified ties. Optional
-    alignment/base/slot metadata also models
-    ``ParamEntry.getSlot`` for a contiguous storage range.
+    GENERAL = 0
+    FLOAT = 1
+    POINTER = 2
+    HIDDEN_RETURN = 3
+    VECTOR = 4
+    CLASS1 = 100
+    CLASS2 = 101
+    CLASS3 = 102
+    CLASS4 = 103
+
+
+class ParamEntryFlag(IntFlag):
+    """Bit-for-bit ParamEntry flags from Ghidra's ``fspec.hh``."""
+
+    FORCE_LEFT_JUSTIFY = 0x001
+    REVERSE_STACK = 0x002
+    SMALL_SIZE_ZERO_EXTEND = 0x004
+    SMALL_SIZE_SIGN_EXTEND = 0x008
+    SMALL_SIZE_INTEGER_TYPE = 0x020
+    SMALL_SIZE_FLOAT_EXTEND = 0x040
+    EXTRA_CHECK_HIGH = 0x080
+    EXTRA_CHECK_LOW = 0x100
+    GROUPED = 0x200
+    OVERLAPPING = 0x400
+    FIRST_STORAGE = 0x800
+    STACK_SPILL = 0x1000
+
+
+@dataclass(slots=True, eq=False)
+class ParamEntry:
+    """A storage resource range from Ghidra's ``ParamEntry`` model.
+
+    A normal entry represents a range divisible into aligned slots. An
+    exclusion entry represents one parameter that may consume several group
+    identifiers. ``join_pieces`` represents a logical range backed by multiple
+    registers/stack locations. Entry definitions are independent of concrete C
+    parameter types and can be used by input, output, and merged ParamLists.
     """
 
     group: int
@@ -201,33 +233,599 @@ class ParamTrialEntry:
     reverse_stack: bool = False
     alignment: int | None = None
     address_base: int | None = None
-    num_slots: int = 1
+    num_slots: int = 0
+    location: StorageLocation | None = None
+    min_size: int = 1
+    max_size: int = 0
+    type_class: ParamTypeClass | str = ParamTypeClass.GENERAL
+    group_set: tuple[int, ...] = ()
+    join_pieces: tuple[StorageLocation, ...] = ()
+    big_endian: bool = False
+    force_left_justify: bool = False
+    extension: str = "none"
+    extra_check_high: bool = False
+    extra_check_low: bool = False
+    grouped: bool = False
+    overlapping: bool = False
+    first_storage: bool = False
+    stack_spill: bool = False
 
     def __post_init__(self) -> None:
         if self.alignment is not None and self.alignment < 0:
-            raise ValueError("La alineación de ParamTrialEntry no puede ser negativa")
+            raise ValueError("La alineación de ParamEntry no puede ser negativa")
+        if self.min_size < 0 or self.max_size < 0:
+            raise ValueError("Los tamaños de ParamEntry no pueden ser negativos")
+        pieces = tuple(self.join_pieces)
+        self.join_pieces = pieces
+        if self.location is None and pieces:
+            self.location = pieces[0]
+        if not self.max_size:
+            if pieces:
+                self.max_size = sum(piece.size for piece in pieces)
+            elif self.location is not None:
+                self.max_size = self.location.size
+        if self.max_size and self.min_size > self.max_size:
+            raise ValueError("ParamEntry min_size supera max_size")
+        if not self.group_set:
+            self.group_set = (self.group,)
+        else:
+            self.group_set = tuple(sorted(set(self.group_set)))
+            self.group = self.group_set[0]
+        if self.alignment == 0:
+            self.exclusion = True
+        if (
+            self.location is not None
+            and self.location.kind == "stack"
+            and self.alignment not in {None, 0}
+        ):
+            self.stack_spill = True
+        if not self.num_slots:
+            if self.alignment and self.max_size:
+                self.num_slots = self.max_size // self.alignment
+            else:
+                self.num_slots = 1
         if self.num_slots < 1:
-            raise ValueError("ParamTrialEntry necesita al menos un slot")
+            raise ValueError("ParamEntry necesita al menos un slot alineado")
+        if self.address_base is None and self.location is not None:
+            self.address_base = _location_start_offset(self.location)
+        if self.extension not in {"none", "zero", "sign", "inttype", "float"}:
+            raise ValueError(f"Extensión ParamEntry desconocida: {self.extension}")
 
     @property
     def is_exclusion(self) -> bool:
-        """Whether the model entry denotes a single-parameter exclusion."""
         return self.exclusion or self.alignment == 0
 
-    def get_slot(self, address_offset: int, size_bytes: int) -> int:
-        """Resolve the group slot of a byte range, mirroring ``getSlot``."""
-        if size_bytes <= 0:
-            raise ValueError("El rango de ParamTrialEntry debe tener tamaño positivo")
+    @property
+    def locations(self) -> tuple[StorageLocation, ...]:
+        if self.join_pieces:
+            return self.join_pieces
+        return (self.location,) if self.location is not None else ()
+
+    @property
+    def effective_alignment(self) -> int:
         if self.is_exclusion:
-            return self.group + (self.num_slots - 1 if size_bytes > 1 else 0)
+            return 0
+        return self.alignment or 1
+
+    @property
+    def flags(self) -> ParamEntryFlag:
+        result = ParamEntryFlag(0)
+        for flag, field_name in _PARAM_ENTRY_FLAG_FIELDS:
+            if getattr(self, field_name):
+                result |= flag
+        result |= {
+            "zero": ParamEntryFlag.SMALL_SIZE_ZERO_EXTEND,
+            "sign": ParamEntryFlag.SMALL_SIZE_SIGN_EXTEND,
+            "inttype": ParamEntryFlag.SMALL_SIZE_INTEGER_TYPE,
+            "float": ParamEntryFlag.SMALL_SIZE_FLOAT_EXTEND,
+        }.get(self.extension, ParamEntryFlag(0))
+        return result
+
+    @flags.setter
+    def flags(self, value: ParamEntryFlag | int) -> None:
+        flags = ParamEntryFlag(value)
+        for flag, field_name in _PARAM_ENTRY_FLAG_FIELDS:
+            setattr(self, field_name, bool(flags & flag))
+        if flags & ParamEntryFlag.SMALL_SIZE_ZERO_EXTEND:
+            self.extension = "zero"
+        elif flags & ParamEntryFlag.SMALL_SIZE_SIGN_EXTEND:
+            self.extension = "sign"
+        elif flags & ParamEntryFlag.SMALL_SIZE_INTEGER_TYPE:
+            self.extension = "inttype"
+        elif flags & ParamEntryFlag.SMALL_SIZE_FLOAT_EXTEND:
+            self.extension = "float"
+        else:
+            self.extension = "none"
+
+    def get_group(self) -> int:
+        return self.group_set[0]
+
+    def get_all_groups(self) -> tuple[int, ...]:
+        return self.group_set
+
+    def get_size(self) -> int:
+        return self.max_size
+
+    def get_min_size(self) -> int:
+        return self.min_size
+
+    def get_align(self) -> int:
+        return self.effective_alignment
+
+    def get_type(self) -> ParamTypeClass:
+        return _param_type_class(self.type_class)
+
+    def get_join_record(self) -> tuple[StorageLocation, ...] | None:
+        return self.join_pieces or None
+
+    def is_stack_spill(self) -> bool:
+        return self.stack_spill
+
+    def is_reverse_stack(self) -> bool:
+        return self.reverse_stack
+
+    def is_grouped(self) -> bool:
+        return self.grouped
+
+    def is_overlap(self) -> bool:
+        return self.overlapping
+
+    def is_first_in_class(self) -> bool:
+        return self.first_storage
+
+    def is_param_check_high(self) -> bool:
+        return self.extra_check_high
+
+    def is_param_check_low(self) -> bool:
+        return self.extra_check_low
+
+    def group_overlap(self, other: ParamEntry) -> bool:
+        return not set(self.group_set).isdisjoint(other.group_set)
+
+    def get_slot(self, address_offset: int | StorageLocation, skip: int = 0) -> int:
+        """Return the model group for ``address + skip``, like ``getSlot``."""
+        if skip < 0:
+            raise ValueError("El desplazamiento ParamEntry no puede ser negativo")
+        if isinstance(address_offset, StorageLocation):
+            start = _location_start_offset(address_offset)
+            if start is None:
+                raise ValueError("La ubicación no tiene offset de dirección")
+            address_offset = start
+        if self.is_exclusion:
+            return self.group_set[-1] if skip != 0 else self.group_set[0]
         if self.alignment is None:
-            return self.group
+            return self.group_set[0]
         if self.address_base is None:
             raise ValueError("Falta address_base para calcular el slot alineado")
-        base_slot = (address_offset + size_bytes - 1 - self.address_base) // self.alignment
+        base_slot = (address_offset + skip - self.address_base) // self.alignment
         if self.reverse_stack:
             base_slot = self.num_slots - 1 - base_slot
-        return self.group + base_slot
+        return self.group_set[0] + base_slot
+
+    def justified_contain(self, location: StorageLocation, size: int) -> int:
+        """Return endian-aware containment offset, or ``-1`` if not contained."""
+        if size <= 0:
+            return -1
+        if self.join_pieces:
+            offset = 0
+            for piece in reversed(self.join_pieces):
+                current = _justified_location_containment(
+                    piece, location, size, self.big_endian, False
+                )
+                if current >= 0:
+                    return offset + current
+                offset += piece.size
+            return -1
+        if self.location is None:
+            return -1
+        return _justified_location_containment(
+            self.location,
+            location,
+            size,
+            self.big_endian,
+            self.force_left_justify,
+            self.alignment,
+            self.address_base,
+        )
+
+    def contained_by(self, location: StorageLocation, size: int) -> bool:
+        if self.join_pieces or size <= 0 or self.location is None:
+            return False
+        return _location_contains(location, size, self.location, self.max_size)
+
+    def intersects(self, location: StorageLocation, size: int) -> bool:
+        return any(
+            _locations_intersect(location, size, piece, piece.size)
+            for piece in self.locations
+        )
+
+    def contains(self, other: ParamEntry) -> bool:
+        if other.join_pieces:
+            return False
+        return any(
+            _location_contains(piece, piece.size, other.location, other.max_size)
+            for piece in self.locations
+            if other.location is not None
+        )
+
+    def subsumes_definition(self, other: ParamEntry) -> bool:
+        if self.get_type() != ParamTypeClass.GENERAL and self.get_type() != other.get_type():
+            return False
+        if self.alignment != other.alignment:
+            return False
+        if self.join_pieces or other.join_pieces:
+            return (
+                bool(self.join_pieces)
+                and bool(other.join_pieces)
+                and self.join_pieces == other.join_pieces
+                and self.min_size <= other.min_size
+                and self.max_size >= other.max_size
+            )
+        return self.contains(other)
+
+    def get_container(self, location: StorageLocation, size: int) -> StorageLocation | None:
+        if size <= 0:
+            return None
+        if self.join_pieces:
+            start = _location_start_offset(location)
+            if start is None:
+                return None
+            end = start + size - 1
+            for piece in self.join_pieces:
+                piece_start = _location_start_offset(piece)
+                if (
+                    _location_space_key(piece) == _location_space_key(location)
+                    and piece_start is not None
+                    and piece_start <= start < piece_start + piece.size
+                    and piece_start <= end < piece_start + piece.size
+                ):
+                    return replace(piece, value_offset=location.value_offset)
+            return None
+        for piece in self.locations:
+            if not _locations_intersect(location, size, piece, piece.size):
+                continue
+            if not _location_contains(piece, piece.size, location, size):
+                continue
+            if self.is_exclusion or not self.alignment:
+                return replace(piece, value_offset=location.value_offset)
+            start = _location_start_offset(location)
+            base = _location_start_offset(piece)
+            if start is None or base is None:
+                return None
+            align = self.alignment
+            container_start = start - ((start - base) % align)
+            raw_end = start + size
+            container_size = ((raw_end - container_start + align - 1) // align) * align
+            offset = container_start - base
+            if piece.kind == "stack" and piece.stack_offset is not None:
+                return replace(
+                    piece,
+                    size=container_size,
+                    stack_offset=piece.stack_offset + offset,
+                    value_offset=location.value_offset,
+                )
+            if piece.kind == "register" and piece.register is not None:
+                return replace(
+                    piece,
+                    size=container_size,
+                    register_offset=piece.register_offset + offset,
+                    value_offset=location.value_offset,
+                )
+            return None
+        return None
+
+    def assumed_extension(
+        self, location: StorageLocation, size: int
+    ) -> tuple[str, StorageLocation | None]:
+        if self.extension not in {"zero", "sign", "inttype"} or size <= 0:
+            return "COPY", None
+        maximum = self.max_size if self.is_exclusion else self.effective_alignment
+        if size >= maximum or self.join_pieces:
+            return "COPY", None
+        if self.justified_contain(location, size) != 0:
+            return "COPY", None
+        container = self.get_container(location, size)
+        if container is None:
+            return "COPY", None
+        opcode = {
+            "zero": "INT_ZEXT",
+            "sign": "INT_SEXT",
+            "inttype": "PIECE",
+        }[self.extension]
+        return opcode, container
+
+    def get_locations_by_slot(
+        self,
+        slot: int,
+        size: int,
+        type_alignment: int = 1,
+        *,
+        justify_right: bool | None = None,
+    ) -> tuple[tuple[StorageLocation, ...] | None, int]:
+        """Allocate a logical range, expanding join-space entries to pieces."""
+        if self.join_pieces:
+            if slot != 0 or size < self.min_size or size > self.max_size:
+                return None, slot
+            remaining = size
+            logical_offset = 0
+            pieces: list[StorageLocation] = []
+            for piece in reversed(self.join_pieces):
+                if remaining <= 0:
+                    break
+                piece_size = min(piece.size, remaining)
+                pieces.append(
+                    replace(
+                        piece,
+                        size=piece_size,
+                        value_offset=logical_offset,
+                    )
+                )
+                logical_offset += piece_size
+                remaining -= piece_size
+            if remaining:
+                return None, slot
+            return tuple(pieces), 1
+        location, next_slot = self.get_addr_by_slot(
+            slot,
+            size,
+            type_alignment,
+            justify_right=justify_right,
+        )
+        return ((location,) if location is not None else None), next_slot
+
+    def get_addr_by_slot(
+        self,
+        slot: int,
+        size: int,
+        type_alignment: int = 1,
+        *,
+        justify_right: bool | None = None,
+    ) -> tuple[StorageLocation | None, int]:
+        """Allocate a parameter range, returning ``(location, next_slot)``."""
+        if size < self.min_size or size <= 0 or self.location is None:
+            return None, slot
+        justify_right = self.big_endian and not self.force_left_justify if justify_right is None else justify_right
+        if self.is_exclusion:
+            if slot != 0 or size > self.max_size:
+                return None, slot
+            if self.extension == "float" and size != self.max_size:
+                try:
+                    assigned = construct_float_extension_location(
+                        self.location,
+                        self.max_size,
+                        size,
+                        big_endian=self.big_endian,
+                    )
+                except ValueError:
+                    return None, slot
+                return assigned, 1
+            offset = self.max_size - size if justify_right else 0
+            assigned = _slice_physical_location(self.location, offset, size)
+            return assigned, 1
+        alignment = self.effective_alignment
+        if type_alignment > alignment:
+            remainder = (slot * alignment) % type_alignment
+            if remainder:
+                slot += (type_alignment - remainder) // alignment
+        slots_used = (size + alignment - 1) // alignment
+        if slot + slots_used > self.num_slots:
+            return None, slot
+        space_used = slots_used * alignment
+        index = self.num_slots - slot - slots_used if self.reverse_stack else slot
+        offset = index * alignment
+        if justify_right:
+            offset += space_used - size
+        assigned = _slice_physical_location(self.location, offset, size)
+        return replace(assigned, value_offset=0), slot + slots_used
+
+    def resolve_first(self, previous: ParamEntry | None) -> None:
+        self.first_storage = previous is None or self.get_type() != previous.get_type()
+
+    def resolve_overlap(self, previous: Iterable[ParamEntry]) -> None:
+        if self.join_pieces:
+            return
+        overlap_groups: set[int] = set()
+        found_overlap = False
+        for prior in previous:
+            if not any(
+                _locations_intersect(self.location, self.max_size, piece, piece.size)
+                for piece in prior.locations
+            ):
+                continue
+            if not self.contains(prior):
+                raise ValueError("Illegal overlap of ParamEntry ranges")
+            if prior.is_overlap():
+                continue
+            found_overlap = True
+            overlap_groups.update(prior.group_set)
+            if self.location is not None and prior.location is not None:
+                same_start = _location_start_offset(self.location) == _location_start_offset(prior.location)
+                if same_start:
+                    self.extra_check_low |= self.big_endian
+                    self.extra_check_high |= not self.big_endian
+                else:
+                    self.extra_check_high |= self.big_endian
+                    self.extra_check_low |= not self.big_endian
+        if found_overlap:
+            self.group_set = tuple(sorted(overlap_groups))
+            self.group = self.group_set[0]
+            self.overlapping = True
+
+    def resolve_join(self, previous: Iterable[ParamEntry]) -> None:
+        if not self.join_pieces:
+            return
+        groups: set[int] = set()
+        entries = tuple(previous)
+        for index, piece in enumerate(self.join_pieces):
+            for prior in reversed(entries):
+                if (
+                    prior.location is not None
+                    and _location_space_key(prior.location) == _location_space_key(piece)
+                    and _location_start_offset(prior.location) == _location_start_offset(piece)
+                    and prior.location.size == piece.size
+                ):
+                    groups.update(prior.group_set)
+                    if index == 0:
+                        self.extra_check_low = True
+                    else:
+                        self.extra_check_high = True
+                    break
+        if not groups:
+            raise ValueError("Un ParamEntry join debe solaparse con una entrada previa")
+        self.group_set = tuple(sorted(groups))
+        self.group = self.group_set[0]
+        self.overlapping = True
+
+    @staticmethod
+    def order_within_group(first: ParamEntry, second: ParamEntry) -> None:
+        if second.min_size > first.max_size or first.min_size > second.max_size:
+            return
+        if first.get_type() != second.get_type():
+            if first.get_type() == ParamTypeClass.GENERAL:
+                raise ValueError("Entradas específicas deben preceder a la clase general")
+            return
+        raise ValueError("ParamEntry en un group deben distinguirse por tamaño o tipo")
+
+
+# Compatibility name retained for callers of the previous ParamTrial-only port.
+ParamTrialEntry = ParamEntry
+
+
+_PARAM_ENTRY_FLAG_FIELDS = (
+    (ParamEntryFlag.FORCE_LEFT_JUSTIFY, "force_left_justify"),
+    (ParamEntryFlag.REVERSE_STACK, "reverse_stack"),
+    (ParamEntryFlag.EXTRA_CHECK_HIGH, "extra_check_high"),
+    (ParamEntryFlag.EXTRA_CHECK_LOW, "extra_check_low"),
+    (ParamEntryFlag.GROUPED, "grouped"),
+    (ParamEntryFlag.OVERLAPPING, "overlapping"),
+    (ParamEntryFlag.FIRST_STORAGE, "first_storage"),
+    (ParamEntryFlag.STACK_SPILL, "stack_spill"),
+)
+
+
+def _param_type_class(value: ParamTypeClass | str) -> ParamTypeClass:
+    if isinstance(value, ParamTypeClass):
+        return value
+    normalized = str(value).lower().replace("-", "_")
+    aliases = {
+        "general": ParamTypeClass.GENERAL,
+        "unknown": ParamTypeClass.GENERAL,
+        "float": ParamTypeClass.FLOAT,
+        "pointer": ParamTypeClass.POINTER,
+        "ptr": ParamTypeClass.POINTER,
+        "hiddenret": ParamTypeClass.HIDDEN_RETURN,
+        "hidden_return": ParamTypeClass.HIDDEN_RETURN,
+        "vector": ParamTypeClass.VECTOR,
+        "class1": ParamTypeClass.CLASS1,
+        "class2": ParamTypeClass.CLASS2,
+        "class3": ParamTypeClass.CLASS3,
+        "class4": ParamTypeClass.CLASS4,
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Clase de storage ParamEntry desconocida: {value}")
+    return aliases[normalized]
+
+
+def _location_space_key(location: StorageLocation) -> tuple[str, ...]:
+    if location.kind == "stack":
+        return ("stack",)
+    if location.kind == "register" and location.register:
+        return ("register", _register_family(location.register.lower()))
+    return (location.kind, location.register or "")
+
+
+def _location_start_offset(location: StorageLocation) -> int | None:
+    if location.kind == "stack":
+        return location.stack_offset
+    if location.kind == "register" and location.register:
+        return location.register_offset + _register_alias_offset(location.register)
+    return location.stack_offset
+
+
+def _locations_intersect(
+    left: StorageLocation | None,
+    left_size: int,
+    right: StorageLocation | None,
+    right_size: int,
+) -> bool:
+    if left is None or right is None or left_size <= 0 or right_size <= 0:
+        return False
+    if _location_space_key(left) != _location_space_key(right):
+        return False
+    left_start = _location_start_offset(left)
+    right_start = _location_start_offset(right)
+    if left_start is None or right_start is None:
+        return False
+    return max(left_start, right_start) < min(
+        left_start + left_size, right_start + right_size
+    )
+
+
+def _location_contains(
+    outer: StorageLocation | None,
+    outer_size: int,
+    inner: StorageLocation | None,
+    inner_size: int,
+) -> bool:
+    if outer is None or inner is None or outer_size <= 0 or inner_size <= 0:
+        return False
+    if _location_space_key(outer) != _location_space_key(inner):
+        return False
+    outer_start = _location_start_offset(outer)
+    inner_start = _location_start_offset(inner)
+    if outer_start is None or inner_start is None:
+        return False
+    return outer_start <= inner_start and inner_start + inner_size <= outer_start + outer_size
+
+
+def _justified_location_containment(
+    container: StorageLocation,
+    candidate: StorageLocation,
+    candidate_size: int,
+    big_endian: bool,
+    force_left: bool,
+    alignment: int | None = None,
+    address_base: int | None = None,
+) -> int:
+    if not _location_contains(container, container.size, candidate, candidate_size):
+        return -1
+    base = _location_start_offset(container)
+    start = _location_start_offset(candidate)
+    if base is None or start is None:
+        return -1
+    end = start + candidate_size - 1
+    if alignment is None or alignment == 0:
+        return (base + container.size - 1 - end) if big_endian and not force_left else start - base
+    base_offset = address_base if address_base is not None else base
+    if force_left or not big_endian:
+        return (start - base_offset) % alignment
+    aligned_end = end - base_offset
+    remainder = (aligned_end + 1) % alignment
+    return 0 if remainder == 0 else alignment - remainder
+
+
+def _slice_physical_location(
+    location: StorageLocation, offset: int, size: int
+) -> StorageLocation:
+    if offset < 0 or size <= 0 or offset + size > location.size:
+        raise ValueError("Subrango ParamEntry fuera de límites")
+    if location.kind == "stack" and location.stack_offset is not None:
+        return replace(
+            location,
+            size=size,
+            stack_offset=location.stack_offset + offset,
+            value_offset=location.value_offset + offset,
+        )
+    if location.kind == "register" and location.register is not None:
+        return replace(
+            location,
+            size=size,
+            register_offset=location.register_offset + offset,
+            value_offset=location.value_offset + offset,
+        )
+    if offset == 0:
+        return replace(location, size=size)
+    raise ValueError("No se puede calcular el subrango de esta ubicación")
 
 
 @dataclass(slots=True)
@@ -368,21 +966,14 @@ class ParamTrial:
         if self.entry is None:
             raise ValueError("El trial todavía no está asociado a un ParamEntry")
         if self.entry.alignment in {None, 0}:
-            return self.entry.get_slot(0, self.size_bytes)
+            return self.entry.get_slot(0, max(0, self.size_bytes - 1))
         if len(self.locations) != 1:
             raise ValueError(
-                "ParamTrialEntry.getSlot requiere una pieza contigua de storage"
+                "ParamTrial.getSlot requiere una pieza contigua de storage"
             )
-        location = self.locations[0]
-        if location.kind == "stack" and location.stack_offset is not None:
-            address_offset = location.stack_offset
-        elif location.kind == "register" and location.register is not None:
-            address_offset = (
-                location.register_offset + _register_alias_offset(location.register)
-            )
-        else:
-            raise ValueError("El trial no tiene una dirección para resolver su slot")
-        return self.entry.get_slot(address_offset, self.size_bytes)
+        return self.entry.get_slot(
+            self.locations[0], max(0, self.size_bytes - 1)
+        )
 
     def set_fixed_position(self, position: int | None) -> None:
         self.fixed_position = position
@@ -738,10 +1329,10 @@ def _param_trial_order_key(trial: ParamTrial) -> tuple[object, ...]:
 class ParamActive:
     """Trial-range container ported from Ghidra's ``ParamActive`` mechanics.
 
-    The range/state operations mirror ``fspec.cc``. Prototype-model matching is
-    represented by :class:`ParamTrialEntry`, not by the unported ParamList and
-    ParamModel hierarchy. ``selected`` and name indexing remain Python-side
-    conveniences for binding a recovered signature to trials.
+    The range/state operations mirror ``fspec.cc``. Resource matching and
+    prototype-model selection are implemented by :mod:`minighidra.paramlist`;
+    ``selected`` and name indexing remain Python-side conveniences for binding
+    recovered signatures to trials.
     """
 
     def __init__(self, recover_subcalls: bool = False) -> None:
@@ -1259,6 +1850,7 @@ class PcodeLikeGraph:
         self._instruction_records: dict[int, dict[str, Any]] = {}
         self._source_widths: dict[str, int] = {}
         self._output_values: dict[str, set[int]] = defaultdict(set)
+        self._output_widths: dict[str, int] = defaultdict(int)
         self._output_sink_operations: dict[str, set[int]] = defaultdict(set)
         self.ssa_function: SSAFunction | None = None
         self.supplemental_graph: PcodeLikeGraph | None = None
@@ -1605,6 +2197,9 @@ class PcodeLikeGraph:
                 if not return_values:
                     continue
                 graph._output_values[return_name].update(return_values)
+                graph._output_widths[return_name] = max(
+                    graph._output_widths[return_name], operand.size_bits
+                )
                 sink_index = graph._append_operation(
                     PcodeOp(
                         "RETURN",
@@ -2383,6 +2978,7 @@ class ParamIDAnalysis:
         self.supplemental_graph = graph.supplemental_graph
         self.max_depth = min(PARAMID_MAX_DEPTH, max(1, max_depth))
         self.input_active = ParamActive()
+        self.output_active = ParamActive()
         self.measurements: dict[str, ParamMeasurement] = {}
         self.output_measurements: dict[str, ParamMeasurement] = {}
         self.justproto = False
@@ -2419,6 +3015,7 @@ class ParamIDAnalysis:
         if justproto and input_names is None:
             raise ValueError("justproto=True requiere los nombres de los formales")
         self.input_active = ParamActive()
+        self.output_active = ParamActive()
         self.measurements = {}
         self.output_measurements = {}
         self.justproto = justproto
@@ -2438,9 +3035,17 @@ class ParamIDAnalysis:
             self._apply_measurement(trial, measurement)
 
         for name in self.graph.output_names:
-            self.output_measurements[name] = self.graph.measure_output(
+            measurement = self.graph.measure_output(
                 name, max_depth=self.max_depth
             )
+            self.output_measurements[name] = measurement
+            location = _output_trial_location(self.graph, name)
+            if location is None:
+                continue
+            trial = self.output_active.register_trial(
+                name, location.size * 8, (location,)
+            )
+            self._apply_measurement(trial, measurement)
         return self.input_active
 
     def _measure(self, name: str) -> ParamMeasurement:
@@ -2505,6 +3110,24 @@ class ParamIDAnalysis:
         self.input_active.select_candidates(selected_names, include_inactive=True)
         self.input_active.sort_by_position()
         return self.input_active
+
+    def fillin_param_list(self, param_list: Any, *, output: bool = False) -> Any:
+        """Run a ParamList pass on measured input or ABI-output trials.
+
+        The list performs its own Ghidra-style map construction and pass flags;
+        the result does not rewrite ParamID ranks or discard inactive trials.
+        Output trials cover the register candidates observed at reachable
+        return sites; hidden sret memory itself remains represented as input.
+        """
+        from .paramlist import ParamListStandard
+
+        active = self.output_active if output else self.input_active
+        if isinstance(param_list, ParamListStandard):
+            return param_list.fillin_map(active)
+        callback = getattr(param_list, "fillin_map", None)
+        if callback is None:
+            raise TypeError("param_list debe implementar fillin_map")
+        return callback(active, output=output)
 
     def select_candidates(
         self,
@@ -2604,6 +3227,27 @@ def _source_width(graph: PcodeLikeGraph, name: str) -> int:
         if node.name == name and node.kind == "input"
     ]
     return max(widths, default=1)
+
+
+def _output_trial_location(
+    graph: PcodeLikeGraph, name: str
+) -> StorageLocation | None:
+    if not name.startswith("return_"):
+        return None
+    value_ids = getattr(graph, "_output_values", {}).get(name, ())
+    nodes_by_id = {node.identifier: node for node in graph.nodes}
+    width_bits = getattr(graph, "_output_widths", {}).get(name, 0)
+    if not width_bits:
+        widths = [
+            nodes_by_id[value_id].size_bits
+            for value_id in value_ids
+            if value_id in nodes_by_id
+        ]
+        width_bits = max(widths, default=0)
+    if not width_bits:
+        return None
+    size = max(1, (width_bits + 7) // 8)
+    return StorageLocation("register", size, register=name.removeprefix("return_"))
 
 
 def _parameter_order(name: str) -> tuple[int, int, str]:

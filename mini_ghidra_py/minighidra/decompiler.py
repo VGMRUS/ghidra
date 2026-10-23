@@ -162,8 +162,9 @@ class SemanticDecompiler:
     call, comparison, and control-flow instructions.  Register and stack values
     are propagated between basic blocks; values that disagree at a CFG join are
     represented with a ``phi(...)`` expression, following Ghidra's heritage /
-    SSA merge model.  CFG transfers remain explicit gotos rather than claiming
-    a complete structuring pass.
+    SSA merge model.  Simple forward if branches, diamonds, and single-block
+    do/while loops are structured; other CFG transfers retain explicit gotos
+    rather than claiming complete structuring.
     """
 
     _ALIASES_64: ClassVar[dict[str, tuple[str, int, int]]] = {
@@ -603,6 +604,7 @@ class SemanticDecompiler:
         self._paramid_recording_enabled = False
         body = self._prune_dead_phis(body)
         body = self._drop_unused_call_results(body)
+        body = self._structure_control_flow(body)
         if self._declared_signature is not None:
             parameters = list(self._declared_signature.parameters)
             return_type = self._declared_signature.return_type
@@ -671,7 +673,7 @@ class SemanticDecompiler:
             else ""
         )
         lines = [
-            "/* Experimental semantic pseudocode: symbolic register/stack propagation and CFG gotos.",
+            "/* Experimental semantic pseudocode: symbolic propagation, structured branches, and CFG goto fallback.",
             " * Types, prototypes, and unsupported instruction effects remain conservative guesses;",
             " * this is not a byte-for-byte or feature-complete replacement for Ghidra. */",
             f"{return_type} {convention_prefix}{name}({params}) {{",
@@ -5755,6 +5757,339 @@ class SemanticDecompiler:
     def _phi_name(self, block_start: int, location: str) -> str:
         safe = _c_identifier(location)
         return f"phi_{safe}_loc_{block_start:X}"
+
+    def _structure_control_flow(self, body: list[str]) -> list[str]:
+        """Structure simple if branches and one-block self-loop do/while forms."""
+        block_lines: dict[int, list[str]] = {}
+        current_start: int | None = None
+        for line in body:
+            label = re.fullmatch(r"loc_([0-9A-Fa-f]+):", line)
+            if label is not None:
+                current_start = int(label.group(1), 16)
+                block_lines[current_start] = []
+            elif current_start is not None:
+                block_lines[current_start].append(line)
+
+        if set(block_lines) != set(self._block_by_start):
+            return body
+
+        def block_address(label: str) -> int | None:
+            match = re.fullmatch(r"loc_([0-9A-Fa-f]+)", label)
+            return int(match.group(1), 16) if match is not None else None
+
+        def single_successor(block: BasicBlock) -> int | None:
+            if (
+                not block.instructions
+                or block.instructions[-1].is_conditional_jump
+                or len(block.successors) != 1
+            ):
+                return None
+            target = block.successors[0]
+            return target if target in self._block_by_start else None
+
+        def is_terminal(block: BasicBlock) -> bool:
+            if not block.instructions or block.successors:
+                return False
+            last = block.instructions[-1]
+            return (
+                last.is_return
+                or last.is_trap
+                or (last.is_call and self.analyzer._call_is_noreturn(last))
+            )
+
+        def private_arm(start: int, source: int) -> bool:
+            return set(self._predecessors.get(start, ())) == {source}
+
+        def arm_to_join(start: int, join: int) -> list[str] | None:
+            if start == join:
+                return []
+            lines = block_lines[start]
+            if not lines:
+                return None
+            transfer = re.fullmatch(
+                r"goto (loc_[0-9A-Fa-f]+);", lines[-1].strip()
+            )
+            if transfer is None or block_address(transfer.group(1)) != join:
+                return None
+            return lines[:-1]
+
+        def phi_assignments(
+            join: int, true_predecessor: int, false_predecessor: int
+        ) -> tuple[list[str], list[str], set[str]]:
+            predecessors = self._predecessors.get(join, [])
+            if (
+                len(predecessors) != 2
+                or set(predecessors) != {true_predecessor, false_predecessor}
+            ):
+                return [], [], set()
+            true_lines: list[str] = []
+            false_lines: list[str] = []
+            names: set[str] = set()
+            for (phi_block, location), values in sorted(self._phi_inputs.items()):
+                if phi_block != join or len(values) != 2:
+                    continue
+                name = self._phi_name(join, location)
+                phi_prefix = f"{name} = phi("
+                if not any(
+                    line.strip().startswith(phi_prefix)
+                    for line in block_lines[join]
+                ):
+                    continue
+                true_value = self._render(values[predecessors.index(true_predecessor)])
+                false_value = self._render(
+                    values[predecessors.index(false_predecessor)]
+                )
+                true_lines.append(f"  {name} = {true_value};")
+                false_lines.append(f"  {name} = {false_value};")
+                names.add(name)
+            return true_lines, false_lines, names
+
+        # If replacements hold a branch's condition, arm text, and optional
+        # join; loop replacements hold a do/while condition and its body text.
+        replacements: dict[int, tuple[int, str, list[str], list[str], int | None]] = {}
+        loop_replacements: dict[int, tuple[str, list[str], int]] = {}
+        removed_phi_names: dict[int, set[str]] = defaultdict(set)
+        skipped: set[int] = set()
+        for block in self._blocks:
+            if block.start in skipped:
+                continue
+            if (
+                not block.instructions
+                or not block.instructions[-1].is_conditional_jump
+            ):
+                continue
+            lines = block_lines[block.start]
+            conditional_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if line.strip().startswith("if (") and ") goto " in line
+                ),
+                None,
+            )
+            if conditional_index is None or conditional_index != len(lines) - 2:
+                continue
+
+            conditional = lines[conditional_index].strip()
+            prefix, target_label = conditional.rsplit(") goto ", 1)
+            if not prefix.startswith("if (") or not target_label.endswith(";"):
+                continue
+            condition = prefix[len("if (") :]
+            true_start = block_address(target_label[:-1])
+            fallthrough = re.fullmatch(
+                r"goto (loc_[0-9A-Fa-f]+);",
+                lines[conditional_index + 1].strip(),
+            )
+            false_start = (
+                block_address(fallthrough.group(1))
+                if fallthrough is not None
+                else None
+            )
+            if (
+                true_start is None
+                or false_start is None
+                or true_start == false_start
+                or true_start not in self._block_by_start
+                or false_start not in self._block_by_start
+            ):
+                continue
+
+            loop_exit: int | None = None
+            loop_condition = condition
+            if true_start == block.start or false_start == block.start:
+                loop_exit = false_start if true_start == block.start else true_start
+                incoming = set(self._predecessors.get(block.start, ()))
+                prefix_lines = lines[:conditional_index]
+                if (
+                    loop_exit == block.start
+                    or loop_exit <= block.start
+                    or loop_exit in skipped
+                    or set(block.successors) != {block.start, loop_exit}
+                    or block.start not in incoming
+                    or len(incoming - {block.start}) > 1
+                    or any(re.search(r"\bgoto\b", line) for line in prefix_lines)
+                ):
+                    continue
+                if false_start == block.start:
+                    loop_condition = f"!({condition})"
+                loop_replacements[block.start] = (
+                    loop_condition,
+                    prefix_lines,
+                    loop_exit,
+                )
+                continue
+
+            if (
+                true_start <= block.start
+                or false_start <= block.start
+                or set(block.successors) != {true_start, false_start}
+                or true_start in skipped
+                or false_start in skipped
+            ):
+                continue
+
+            true_block = self._block_by_start[true_start]
+            false_block = self._block_by_start[false_start]
+            if is_terminal(true_block) and is_terminal(false_block):
+                if not private_arm(true_start, block.start) or not private_arm(
+                    false_start, block.start
+                ):
+                    continue
+                replacements[block.start] = (
+                    conditional_index,
+                    condition,
+                    block_lines[true_start],
+                    block_lines[false_start],
+                    None,
+                )
+                skipped.update((true_start, false_start))
+                continue
+
+            true_next = single_successor(true_block)
+            false_next = single_successor(false_block)
+            if true_next is not None and true_next == false_next:
+                join = true_next
+            elif true_start == false_next:
+                join = true_start
+            elif false_start == true_next:
+                join = false_start
+            else:
+                continue
+
+            if join not in block_lines or join <= block.start or join in skipped:
+                continue
+            if true_start != join and (
+                true_next != join or not private_arm(true_start, block.start)
+            ):
+                continue
+            if false_start != join and (
+                false_next != join or not private_arm(false_start, block.start)
+            ):
+                continue
+
+            true_lines = arm_to_join(true_start, join)
+            false_lines = arm_to_join(false_start, join)
+            if true_lines is None or false_lines is None:
+                continue
+            true_predecessor = block.start if true_start == join else true_start
+            false_predecessor = block.start if false_start == join else false_start
+            true_phi, false_phi, phi_names = phi_assignments(
+                join, true_predecessor, false_predecessor
+            )
+            true_lines.extend(true_phi)
+            false_lines.extend(false_phi)
+            if not true_lines and not false_lines:
+                continue
+            removed_phi_names[join].update(phi_names)
+            replacements[block.start] = (
+                conditional_index,
+                condition,
+                true_lines,
+                false_lines,
+                join,
+            )
+            if true_start != join:
+                skipped.add(true_start)
+            if false_start != join:
+                skipped.add(false_start)
+
+        if not replacements and not loop_replacements:
+            return body
+
+        def indented(lines: list[str], spaces: int) -> list[str]:
+            return [" " * spaces + line.strip() for line in lines if line.strip()]
+
+        def render_if(
+            condition: str, true_lines: list[str], false_lines: list[str]
+        ) -> list[str]:
+            if true_lines and false_lines:
+                return ["  if (" + condition + ") {"] + indented(
+                    true_lines, 4
+                ) + ["  } else {"] + indented(false_lines, 4) + ["  }"]
+            if true_lines:
+                return ["  if (" + condition + ") {"] + indented(
+                    true_lines, 4
+                ) + ["  }"]
+            if false_lines:
+                return ["  if (!(" + condition + ")) {"] + indented(
+                    false_lines, 4
+                ) + ["  }"]
+            return []
+
+        block_order = {block.start: index for index, block in enumerate(self._blocks)}
+        structured: list[str] = []
+        for block in self._blocks:
+            if block.start in skipped:
+                continue
+            structured.append(f"loc_{block.start:X}:")
+            lines = block_lines[block.start]
+            removed_names = removed_phi_names.get(block.start, set())
+            replacement = replacements.get(block.start)
+            loop_replacement = loop_replacements.get(block.start)
+            if replacement is None and loop_replacement is None:
+                structured.extend(
+                    line
+                    for line in lines
+                    if not any(
+                        line.strip().startswith(f"{name} = phi(")
+                        for name in removed_names
+                    )
+                )
+                continue
+
+            if loop_replacement is not None:
+                condition, loop_body, loop_exit = loop_replacement
+                prefix = loop_body
+                if removed_names:
+                    prefix = [
+                        line
+                        for line in prefix
+                        if not any(
+                            line.strip().startswith(f"{name} = phi(")
+                            for name in removed_names
+                        )
+                    ]
+                structured.append("  do {")
+                structured.extend(indented(prefix, 4))
+                structured.append(f"  }} while ({condition});")
+                next_block = next(
+                    (
+                        candidate.start
+                        for candidate in self._blocks[block_order[block.start] + 1 :]
+                        if candidate.start not in skipped
+                    ),
+                    None,
+                )
+                if next_block != loop_exit:
+                    structured.append(f"  goto loc_{loop_exit:X};")
+                continue
+
+            assert replacement is not None
+            conditional_index, condition, true_lines, false_lines, join = replacement
+            prefix = lines[:conditional_index]
+            if removed_names:
+                prefix = [
+                    line
+                    for line in prefix
+                    if not any(
+                        line.strip().startswith(f"{name} = phi(")
+                        for name in removed_names
+                    )
+                ]
+            structured.extend(prefix)
+            structured.extend(render_if(condition, true_lines, false_lines))
+            if join is not None:
+                next_block = next(
+                    (
+                        candidate.start
+                        for candidate in self._blocks[block_order[block.start] + 1 :]
+                        if candidate.start not in skipped
+                    ),
+                    None,
+                )
+                if next_block != join:
+                    structured.append(f"  goto loc_{join:X};")
+        return structured
 
     def _render_terminator(self, block: BasicBlock, state: _State) -> list[str]:
         if not block.instructions:

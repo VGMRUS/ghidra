@@ -977,10 +977,73 @@ class MiniGhidraTests(unittest.TestCase):
 
         pseudocode = analyzer.pseudocode(analyzer.functions[0x9200])
         self.assertIn("if (", pseudocode)
+        self.assertIn("else", pseudocode)
         self.assertIn("param_1", pseudocode)
-        self.assertIn("goto loc_920B;", pseudocode)
+        self.assertNotIn("goto loc_920B;", pseudocode)
         self.assertIn("return 1;", pseudocode)
         self.assertIn("return 0;", pseudocode)
+
+    def test_semantic_pseudocode_structures_x86_conditional_return(self) -> None:
+        path = self.root / "x86-conditional-return.bin"
+        path.write_bytes(
+            bytes.fromhex(
+                "83 7c 24 04 00 74 06 b8 01 00 00 00 c3 "
+                "b8 00 00 00 00 c3"
+            )
+        )
+        image = BinaryImage.load(path, raw_arch="x86", base=0x9A00)
+        analyzer = Analyzer(image)
+
+        pseudocode = analyzer.pseudocode(analyzer.functions[0x9A00])
+
+        self.assertIn("if (", pseudocode)
+        self.assertIn("else", pseudocode)
+        self.assertIn("param_1", pseudocode)
+        self.assertIn("return 1;", pseudocode)
+        self.assertIn("return 0;", pseudocode)
+        self.assertNotIn("goto loc_9A12;", pseudocode)
+
+    def test_semantic_pseudocode_structures_single_sided_if(self) -> None:
+        path = self.root / "if-only.bin"
+        path.write_bytes(
+            bytes.fromhex("85 ff 74 0a c7 05 00 20 00 00 01 00 00 00 c3")
+        )
+        image = BinaryImage.load(path, raw_arch="x86_64", base=0x9F00)
+        analyzer = Analyzer(image)
+
+        pseudocode = analyzer.pseudocode(analyzer.functions[0x9F00])
+
+        self.assertIn("if (!(", pseudocode)
+        self.assertIn("*(uint32_t *)(0xbf0e) = 1;", pseudocode)
+        self.assertNotIn("goto loc_9F0E;", pseudocode)
+
+    def test_semantic_pseudocode_structures_single_block_do_while(self) -> None:
+        path = self.root / "do-while.bin"
+        path.write_bytes(
+            bytes.fromhex(
+                "85 ff c7 05 00 20 00 00 01 00 00 00 75 f4 c3"
+            )
+        )
+        image = BinaryImage.load(path, raw_arch="x86_64", base=0xA000)
+        analyzer = Analyzer(image)
+
+        pseudocode = analyzer.pseudocode(analyzer.functions[0xA000])
+
+        self.assertIn("do {", pseudocode)
+        self.assertIn("} while (", pseudocode)
+        self.assertIn("*(uint32_t *)(0xc00c) = 1;", pseudocode)
+        self.assertEqual(pseudocode.count("goto loc_A002;"), 1)
+
+    def test_semantic_pseudocode_keeps_gotos_for_loop_cfg(self) -> None:
+        path = self.root / "loop-fallback.bin"
+        path.write_bytes(bytes.fromhex("85 ff 74 03 90 eb f9 c3"))
+        image = BinaryImage.load(path, raw_arch="x86_64", base=0x9E00)
+        analyzer = Analyzer(image)
+
+        pseudocode = analyzer.pseudocode(analyzer.functions[0x9E00])
+
+        self.assertIn("goto loc_9E00;", pseudocode)
+        self.assertIn("goto loc_9E07;", pseudocode)
 
     def test_semantic_pseudocode_keeps_segment_register_in_memory_access(self) -> None:
         path = self.root / "fs-memory.bin"
@@ -1158,7 +1221,7 @@ class MiniGhidraTests(unittest.TestCase):
         pseudocode = analyzer.pseudocode(analyzer.functions[0xA000])
         self.assertIn("FUN_A00F(5, 7)", pseudocode)
 
-    def test_semantic_pseudocode_emits_phi_at_control_flow_merge(self) -> None:
+    def test_semantic_pseudocode_structures_diamond_and_materializes_phi(self) -> None:
         path = self.root / "phi-merge.bin"
         path.write_bytes(
             bytes.fromhex("83 ff 00 74 07 b8 01 00 00 00 eb 05 b8 02 00 00 00 c3")
@@ -1167,7 +1230,12 @@ class MiniGhidraTests(unittest.TestCase):
         analyzer = Analyzer(image)
 
         pseudocode = analyzer.pseudocode(analyzer.functions[0x9400])
-        self.assertIn("phi_rax_loc_9411 = phi(1, 2);", pseudocode)
+        self.assertIn("if (", pseudocode)
+        self.assertIn("else", pseudocode)
+        self.assertNotIn("goto loc_9411;", pseudocode)
+        self.assertIn("phi_rax_loc_9411 = 2;", pseudocode)
+        self.assertIn("phi_rax_loc_9411 = 1;", pseudocode)
+        self.assertNotIn("phi_rax_loc_9411 = phi(", pseudocode)
         self.assertIn("return phi_rax_loc_9411;", pseudocode)
 
     def test_semantic_pseudocode_models_x86_64_call_argument_and_result(self) -> None:

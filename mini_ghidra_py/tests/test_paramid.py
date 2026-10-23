@@ -507,7 +507,13 @@ class ParamIDTests(unittest.TestCase):
             (StorageLocation("register", 8, register="rax"),),
         )
         exclusion.set_entry(
-            ParamTrialEntry(group=10, exclusion=True, alignment=0, num_slots=2)
+            ParamTrialEntry(
+                group=10,
+                exclusion=True,
+                alignment=0,
+                num_slots=2,
+                group_set=(10, 11),
+            )
         )
         self.assertEqual(exclusion.slot_group(), 11)
 
@@ -767,40 +773,42 @@ class ParamIDTests(unittest.TestCase):
             ("x86_64", "48 8b 44 24 28 c3", "PE", 0x512000, "param_5"),
         )
         for architecture, code, format_name, base, name in cases:
-            with self.subTest(architecture=architecture, format=format_name):
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "paramid-stack-input.bin"
-                    path.write_bytes(bytes.fromhex(code))
-                    image = BinaryImage.load(
-                        path, raw_arch=architecture, base=base
-                    )
-                    if format_name:
-                        image.format = format_name
-                    analyzer = Analyzer(image)
-                    function = analyzer.functions[base]
-                    decompiler = SemanticDecompiler(analyzer)
+            with (
+                self.subTest(architecture=architecture, format=format_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "paramid-stack-input.bin"
+                path.write_bytes(bytes.fromhex(code))
+                image = BinaryImage.load(
+                    path, raw_arch=architecture, base=base
+                )
+                if format_name:
+                    image.format = format_name
+                analyzer = Analyzer(image)
+                function = analyzer.functions[base]
+                decompiler = SemanticDecompiler(analyzer)
 
-                    decompiler.decompile(function)
+                decompiler.decompile(function)
 
-                    graph = decompiler.paramid_ssa_graph
-                    self.assertIsNotNone(graph)
-                    assert graph is not None
-                    self.assertIn(name, graph.parameter_names)
-                    self.assertEqual(
-                        decompiler._paramid_analysis.measurements[name].rank,
-                        ParamRank.DIRECT_READ,
+                graph = decompiler.paramid_ssa_graph
+                self.assertIsNotNone(graph)
+                assert graph is not None
+                self.assertIn(name, graph.parameter_names)
+                self.assertEqual(
+                    decompiler._paramid_analysis.measurements[name].rank,
+                    ParamRank.DIRECT_READ,
+                )
+                self.assertTrue(
+                    any(
+                        value.name == name and value.kind == "input"
+                        for value in graph.nodes
                     )
-                    self.assertTrue(
-                        any(
-                            value.name == name and value.kind == "input"
-                            for value in graph.nodes
-                        )
+                )
+                if architecture == "x86":
+                    self.assertIn(
+                        "return_rax",
+                        decompiler._paramid_analysis.output_measurements,
                     )
-                    if architecture == "x86":
-                        self.assertIn(
-                            "return_rax",
-                            decompiler._paramid_analysis.output_measurements,
-                        )
 
     def test_declared_sret_pointer_is_measured_as_hidden_formal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -929,6 +937,8 @@ class ParamIDTests(unittest.TestCase):
                 analysis.measurements["value"].rank, ParamRank.DIRECT_READ
             )
             self.assertIn("return_rax", analysis.output_measurements)
+            return_trial = analysis.output_active.get_trial("return_rax")
+            self.assertEqual(return_trial.locations[0].size, 8)
             parameter = function.signature.parameters[0]
             self.assertIn("paramid-used-final", parameter.evidence)
 

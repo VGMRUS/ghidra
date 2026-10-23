@@ -1,17 +1,18 @@
-"""C type/prototype layout translated from the x86 Ghidra compiler specs.
+"""C type/prototype layout and x86 Ghidra compiler-spec integration.
 
-This module implements the type-directed half of prototype resolution: C type
-classification, register/stack assignment, aggregate splitting, hidden structure
-returns, and variadic argument layout. Binary-only type inference remains a
-separate heuristic because machine code does not uniquely encode source types.
+The type-directed ABI helpers coexist with the resource-based ParamList and
+prototype-model passes in :mod:`minighidra.paramlist`. Binary-only type
+inference remains heuristic because machine code does not uniquely encode
+source types.
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
 from .abi import CallingConvention
 from .model import FunctionParameter, FunctionSignature
+from .paramid import ParamActive
+from .paramlist import ProtoModelMerged, PrototypeModel, TrialMapResult
 from .typesys import CType, StorageLocation, TypeDatabase, TypeKind
 
 
@@ -26,12 +27,11 @@ class PrototypeLayout:
 class PrototypeResolver:
     """Resolve a typed prototype to ABI locations for x86 and x86-64.
 
-    The C++ decompiler's ``ParamList``/``ParamEntry`` engine also performs
-    data-flow-driven parameter discovery, type recovery, parameter joining,
-    symbol updates, and model selection. This class ports the type-directed
-    layout rules from the local Cspecs; it deliberately does not pretend that
-    those broader heritage/type-propagation analyses can be reconstructed from
-    a single instruction scan.
+    Resource matching and Cspec model selection are implemented alongside this
+    helper in :mod:`minighidra.paramlist`. This class supplies the established
+    ABI layout heuristics and a convenient bridge for loading concrete/merged
+    models; it does not implement the downstream heritage/type-propagation
+    actions or recover source types from binary-only evidence.
     """
 
     _SYSV_INTEGER_ARGUMENTS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
@@ -47,6 +47,37 @@ class PrototypeResolver:
         self.types = types
         self.bits = bits
         self.pointer_size = bits // 8
+
+    def load_prototype_model(self, cspec_path: str, model_name: str) -> PrototypeModel:
+        """Load one x86 ``<prototype>`` resource model from the local Cspec."""
+        model = PrototypeModel.from_cspec(cspec_path, model_name)
+        for resource in (model.input_list, model.output_list):
+            if resource.pointer_size is None:
+                resource.pointer_size = self.pointer_size
+        return model
+
+    def load_merged_prototype_model(
+        self, cspec_path: str, resolve_name: str
+    ) -> ProtoModelMerged:
+        """Load a Cspec ``<resolveprototype>`` and its concrete member models."""
+        model = ProtoModelMerged.from_cspec(cspec_path, resolve_name)
+        for concrete in model.models:
+            for resource in (concrete.input_list, concrete.output_list):
+                if resource.pointer_size is None:
+                    resource.pointer_size = self.pointer_size
+        return model
+
+    def resolve_param_trials(
+        self,
+        active: ParamActive,
+        model: PrototypeModel | ProtoModelMerged,
+        *,
+        output: bool = False,
+    ) -> tuple[PrototypeModel, TrialMapResult | None]:
+        """Select a merged model if needed, then run its ParamList passes."""
+        selected = model.select_model(active) if isinstance(model, ProtoModelMerged) else model
+        result = selected.fillin_map(active, output=output)
+        return selected, result
 
     def resolve(
         self,
