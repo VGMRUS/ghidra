@@ -112,6 +112,11 @@ class ActionDatabase:
 
         universal.add_action(ActionFinalStructure("blockrecovery"))
 
+        # 5. Variable Naming and Dynamic Symbols
+        from .action_name import ActionNameVars, ActionDynamicSymbols
+        universal.add_action(ActionDynamicSymbols("dynamic"))
+        universal.add_action(ActionNameVars("merge"))
+
         self.current_action = universal
 
 
