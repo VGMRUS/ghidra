@@ -3036,6 +3036,137 @@ class RuleSignForm(Rule):
         data.op_set_opcode(op, "INT_SRIGHT")
         return 1
 
+
+class RuleSignNearMult(Rule):
+    """Simplify optimization of division: (x + (x s>> 31) >> (size-n)) & mask => (x s/ 2^n) * 2^n"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signnearmult")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        vn = op.inputs[0]
+        addop = next((cand for cand in data.ops if cand.output == vn), None)
+        if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
+        
+        shiftvn = None
+        unshiftop = None
+        idx = -1
+        for i in range(2):
+            shiftvn = addop.inputs[i]
+            unshiftop = next((cand for cand in data.ops if cand.output == shiftvn), None)
+            if unshiftop and unshiftop.opcode == "INT_RIGHT" and len(unshiftop.inputs) == 2:
+                if data.nodes[unshiftop.inputs[1]].kind == "const":
+                    idx = i
+                    break
+        if idx == -1: return 0
+        
+        x = addop.inputs[1 - idx]
+        
+        n = int(data.nodes[unshiftop.inputs[1]].name, 16)
+        if n <= 0: return 0
+        n = data.nodes[shiftvn].size_bits - n
+        if n <= 0: return 0
+        
+        mask = (1 << data.nodes[shiftvn].size_bits) - 1
+        mask = (mask << n) & mask
+        if mask != int(cnode.name, 16): return 0
+        
+        sgnvn = unshiftop.inputs[0]
+        sshiftop = next((cand for cand in data.ops if cand.output == sgnvn), None)
+        if not sshiftop or sshiftop.opcode != "INT_SRIGHT" or len(sshiftop.inputs) != 2: return 0
+        
+        scnode = data.nodes[sshiftop.inputs[1]]
+        if scnode.kind != "const": return 0
+        if sshiftop.inputs[0] != x: return 0
+        
+        val = int(scnode.name, 16)
+        if val != data.nodes[x].size_bits - 1: return 0
+        
+        pow2 = 1 << n
+        newdiv = PcodeOp(op.addr, "INT_SDIV", len(data.nodes), (x, len(data.nodes)))
+        c_pow = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_pow, hex(pow2), data.nodes[x].size_bits, "const"))
+        newdiv.inputs = (x, c_pow)
+        
+        divvn = len(data.nodes)
+        data.nodes.append(PcodeVarnode(divvn, None, data.nodes[x].size_bits, "unique"))
+        newdiv.output = divvn
+        data.ops.append(newdiv)
+        
+        data.op_set_opcode(op, "INT_MULT")
+        data.op_set_input(op, divvn, 0)
+        c_pow2 = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_pow2, hex(pow2), data.nodes[x].size_bits, "const"))
+        data.op_set_input(op, c_pow2, 1)
+        return 1
+
+
+class RuleModOpt(Rule):
+    """Simplify expressions that optimize INT_REM and INT_SREM"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "modopt")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_DIV", "INT_SDIV"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        x = op.inputs[0]
+        div = op.inputs[1]
+        outvn = op.output
+        if outvn is None: return 0
+        
+        descendants1 = [cand for cand in data.ops if outvn in cand.inputs]
+        for multop in descendants1:
+            if multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
+            
+            div2 = multop.inputs[1]
+            if div2 == outvn: div2 = multop.inputs[0]
+            
+            cdiv2 = data.nodes[div2]
+            cdiv = data.nodes[div]
+            
+            if cdiv2.kind == "const":
+                if cdiv.kind != "const": continue
+                mask = (1 << cdiv2.size_bits) - 1
+                v2 = int(cdiv2.name, 16)
+                v1 = int(cdiv.name, 16)
+                if (((v2 ^ mask) + 1) & mask) != v1: continue
+            else:
+                op2comp = next((cand for cand in data.ops if cand.output == div2), None)
+                if not op2comp or op2comp.opcode != "INT_2COMP" or len(op2comp.inputs) != 1: continue
+                if op2comp.inputs[0] != div: continue
+                
+            outvn2 = multop.output
+            if outvn2 is None: continue
+            
+            descendants2 = [cand for cand in data.ops if outvn2 in cand.inputs]
+            for addop in descendants2:
+                if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
+                
+                lvn = addop.inputs[0]
+                if lvn == outvn2: lvn = addop.inputs[1]
+                
+                if lvn != x: continue
+                
+                data.op_set_input(addop, x, 0)
+                if cdiv.kind == "const":
+                    cnew = len(data.nodes)
+                    data.nodes.append(PcodeVarnode(cnew, cdiv.name, cdiv.size_bits, "const"))
+                    data.op_set_input(addop, cnew, 1)
+                else:
+                    data.op_set_input(addop, div, 1)
+                    
+                data.op_set_opcode(addop, "INT_REM" if op.opcode == "INT_DIV" else "INT_SREM")
+                return 1
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
