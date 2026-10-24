@@ -2122,6 +2122,2667 @@ class RuleTestSign(Rule):
             
         return resultCode
 
+
+class RuleSubZext(Rule):
+    """Simplify INT_ZEXT applied to SUBPIECE expressions"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subzext")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        subvn = op.inputs[0]
+        subop = None
+        for cand in data.ops:
+            if cand.output == subvn:
+                subop = cand
+                break
+        if not subop: return 0
+        
+        if subop.opcode == "SUBPIECE" and len(subop.inputs) == 2:
+            basevn = subop.inputs[0]
+            if data.nodes[basevn].size_bits != data.nodes[op.output].size_bits: return 0
+            
+            cnode = data.nodes[subop.inputs[1]]
+            if cnode.kind != "const": return 0
+            
+            offset = int(cnode.name, 16)
+            if offset != 0:
+                count = sum(1 for cand in data.ops if subvn in cand.inputs)
+                if count != 1: return 0
+                
+                newvn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(newvn, None, data.nodes[basevn].size_bits, "unique"))
+                
+                data.op_set_input(op, newvn, 0)
+                data.op_set_opcode(subop, "INT_RIGHT")
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(offset * 8), cnode.size_bits, "const"))
+                data.op_set_input(subop, cnew, 1)
+                subop.output = newvn
+            else:
+                data.op_set_input(op, basevn, 0)
+                
+            val = (1 << data.nodes[subvn].size_bits) - 1
+            constvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(constvn, hex(val), data.nodes[basevn].size_bits, "const"))
+            
+            data.op_set_opcode(op, "INT_AND")
+            op.inputs = (op.inputs[0], constvn)
+            return 1
+            
+        elif subop.opcode == "INT_RIGHT" and len(subop.inputs) == 2:
+            shiftop = subop
+            scnode = data.nodes[shiftop.inputs[1]]
+            if scnode.kind != "const": return 0
+            
+            midvn = shiftop.inputs[0]
+            subop2 = None
+            for cand in data.ops:
+                if cand.output == midvn:
+                    subop2 = cand
+                    break
+            if not subop2 or subop2.opcode != "SUBPIECE" or len(subop2.inputs) != 2: return 0
+            
+            basevn = subop2.inputs[0]
+            if data.nodes[basevn].size_bits != data.nodes[op.output].size_bits: return 0
+            
+            count_mid = sum(1 for cand in data.ops if midvn in cand.inputs)
+            if count_mid != 1: return 0
+            
+            count_sub = sum(1 for cand in data.ops if subvn in cand.inputs)
+            if count_sub != 1: return 0
+            
+            subcnode = data.nodes[subop2.inputs[1]]
+            if subcnode.kind != "const": return 0
+            
+            val = (1 << data.nodes[midvn].size_bits) - 1
+            sa = int(scnode.name, 16)
+            val >>= sa
+            sa += int(subcnode.name, 16) * 8
+            
+            newvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newvn, None, data.nodes[basevn].size_bits, "unique"))
+            
+            data.op_set_input(op, newvn, 0)
+            data.op_set_input(shiftop, basevn, 0)
+            
+            cnew2 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew2, hex(sa), scnode.size_bits, "const"))
+            data.op_set_input(shiftop, cnew2, 1)
+            shiftop.output = newvn
+            
+            constvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(constvn, hex(val), data.nodes[basevn].size_bits, "const"))
+            
+            data.op_set_opcode(op, "INT_AND")
+            op.inputs = (op.inputs[0], constvn)
+            return 1
+            
+        return 0
+
+
+class RuleDumptyHump(Rule):
+    """Simplify join and break apart: sub( concat(V,W), c) => sub(W,c)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "dumptyhump")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        base = op.inputs[0]
+        pieceop = None
+        for cand in data.ops:
+            if cand.output == base:
+                pieceop = cand
+                break
+        if not pieceop or pieceop.opcode != "PIECE" or len(pieceop.inputs) != 2: return 0
+        
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        offset = int(cnode.name, 16)
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        vn1 = pieceop.inputs[0]
+        vn2 = pieceop.inputs[1]
+        sz2 = data.nodes[vn2].size_bits
+        
+        offset_bits = offset * 8
+        if offset_bits < sz2:
+            if offset_bits + outsize > sz2: return 0
+            vn = vn2
+            new_offset = offset
+        else:
+            vn = vn1
+            new_offset = offset - (sz2 // 8)
+            
+        vnode = data.nodes[vn]
+        sz = vnode.size_bits
+        
+        if new_offset == 0 and outsize == sz:
+            data.op_set_opcode(op, "COPY")
+            data.op_remove_input(op, 1)
+            data.op_set_input(op, vn, 0)
+        else:
+            data.op_set_input(op, vn, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(new_offset), cnode.size_bits, "const"))
+            data.op_set_input(op, cnew, 1)
+        return 1
+
+class RuleHumptyOr(Rule):
+    """Simplify masked pieces INT_ORed together: (V & ff00) | (V & 00ff) => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "humptyor")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1, vn2 = op.inputs[0], op.inputs[1]
+        
+        and1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not and1 or and1.opcode != "INT_AND" or len(and1.inputs) != 2: return 0
+        
+        and2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not and2 or and2.opcode != "INT_AND" or len(and2.inputs) != 2: return 0
+        
+        a, b = and1.inputs[0], and1.inputs[1]
+        c, d = and2.inputs[0], and2.inputs[1]
+        
+        if a == c:
+            c = d
+        elif a == d:
+            pass
+        elif b == c:
+            b, a, c = a, c, d
+        elif b == d:
+            b, a = a, d
+        else:
+            return 0
+            
+        bnode, cnode = data.nodes[b], data.nodes[c]
+        if bnode.kind == "const" and cnode.kind == "const":
+            totalbits = int(bnode.name, 16) | int(cnode.name, 16)
+            asz = data.nodes[a].size_bits
+            if totalbits == ((1 << asz) - 1):
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, a, 0)
+            else:
+                data.op_set_opcode(op, "INT_AND")
+                data.op_set_input(op, a, 0)
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(totalbits), asz, "const"))
+                data.op_set_input(op, cnew, 1)
+        else:
+            amask = data.get_nzmask(a)
+            bmask = data.get_nzmask(b)
+            cmask = data.get_nzmask(c)
+            if (bmask & amask) == 0 or (cmask & amask) == 0: return 0
+            
+            newOrOp = PcodeOp(op.addr, "INT_OR", len(data.nodes), (b, c))
+            data.nodes.append(PcodeVarnode(newOrOp.output, None, data.nodes[a].size_bits, "unique"))
+            data.ops.append(newOrOp)
+            
+            data.op_set_input(op, a, 0)
+            data.op_set_input(op, newOrOp.output, 1)
+            data.op_set_opcode(op, "INT_AND")
+        return 1
+
+
+class RuleHumptyDumpty(Rule):
+    """Simplify concat of adjacent subpieces: concat(sub(V, c+s), sub(V, c)) => sub(V, c) or V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "humptydumpty")
+
+    def get_op_list(self) -> list[str]:
+        return ["PIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1 = op.inputs[0]
+        sub1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not sub1 or sub1.opcode != "SUBPIECE" or len(sub1.inputs) != 2: return 0
+        
+        vn2 = op.inputs[1]
+        sub2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not sub2 or sub2.opcode != "SUBPIECE" or len(sub2.inputs) != 2: return 0
+        
+        root = sub1.inputs[0]
+        if root != sub2.inputs[0]: return 0
+        
+        cnode1 = data.nodes[sub1.inputs[1]]
+        cnode2 = data.nodes[sub2.inputs[1]]
+        if cnode1.kind != "const" or cnode2.kind != "const": return 0
+        
+        pos1 = int(cnode1.name, 16)
+        pos2 = int(cnode2.name, 16)
+        
+        size1 = data.nodes[vn1].size_bits
+        size2 = data.nodes[vn2].size_bits
+        
+        # In PIECE, vn1 is the high part, vn2 is the low part.
+        # Wait, the C++ code says pos1 == pos2 + size2 (bytes)
+        # However, our sizes are in bits. We must divide by 8 for bytes, or adjust if sizes are bits.
+        # Ghidra works in bytes for sizes, our size_bits are bits. So pos1 == pos2 + (size2 // 8).
+        # Actually in minighidra SUBPIECE offset is in bytes (same as Ghidra).
+        if pos1 != pos2 + (size2 // 8): return 0
+        
+        if pos2 == 0 and (size1 + size2 == data.nodes[root].size_bits):
+            data.op_remove_input(op, 1)
+            data.op_set_input(op, root, 0)
+            data.op_set_opcode(op, "COPY")
+        else:
+            data.op_set_input(op, root, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(pos2), cnode2.size_bits, "const"))
+            data.op_set_input(op, cnew, 1)
+            data.op_set_opcode(op, "SUBPIECE")
+        return 1
+
+
+class RuleBooleanNegate(Rule):
+    """Simplify comparison of boolean value with 0 or 1: V != 0 => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "booleannegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        if val not in (0, 1): return 0
+        
+        subbool = op.inputs[0]
+        if not data.is_boolean_value(subbool): return 0
+        
+        negate = (op.opcode == "INT_NOTEQUAL")
+        if val == 0:
+            negate = not negate
+            
+        data.op_remove_input(op, 1)
+        data.op_set_input(op, subbool, 0)
+        
+        if negate:
+            data.op_set_opcode(op, "BOOL_NEGATE")
+        else:
+            data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleXorSwap(Rule):
+    """Simplify limited chains of XOR operations: V = (a ^ b) ^ a => V = b"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "xorswap")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_XOR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        for i in range(2):
+            vn = op.inputs[i]
+            op2 = next((cand for cand in data.ops if cand.output == vn), None)
+            if not op2 or op2.opcode != "INT_XOR" or len(op2.inputs) != 2: continue
+            
+            othervn = op.inputs[1 - i]
+            vn0 = op2.inputs[0]
+            vn1 = op2.inputs[1]
+            
+            if othervn == vn0:
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "COPY")
+                data.op_set_input(op, vn1, 0)
+                return 1
+            elif othervn == vn1:
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "COPY")
+                data.op_set_input(op, vn0, 0)
+                return 1
+        return 0
+
+
+class RuleOrMask(Rule):
+    """Collapse unnecessary INT_OR: V | 0xffffffff => 0xffffffff"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ormask")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        outsz = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[0]].size_bits
+        mask = (1 << outsz) - 1
+        
+        if (val & mask) != mask: return 0
+        
+        data.op_set_opcode(op, "COPY")
+        data.op_set_input(op, op.inputs[1], 0)
+        data.op_remove_input(op, 1)
+        return 1
+
+
+class RuleTrivialShift(Rule):
+    """Simplify shifts by 0 (to COPY) or by >= size (to 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "trivialshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_LEFT", "INT_RIGHT", "INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        sz = data.nodes[op.inputs[0]].size_bits
+        
+        if val != 0:
+            if val < sz: return 0
+            if op.opcode == "INT_SRIGHT": return 0
+            
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", sz, "const"))
+            data.op_set_input(op, cnew, 0)
+            
+        data.op_remove_input(op, 1)
+        data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleLessNotEqual(Rule):
+    """Convert (a <= b) & (a != b) to a < b"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lessnotequal")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1, vn2 = op.inputs[0], op.inputs[1]
+        op_less = next((cand for cand in data.ops if cand.output == vn1), None)
+        op_equal = next((cand for cand in data.ops if cand.output == vn2), None)
+        
+        if not op_less or not op_equal: return 0
+        
+        opc = op_less.opcode
+        if opc not in ("INT_LESSEQUAL", "INT_SLESSEQUAL"):
+            op_less, op_equal = op_equal, op_less
+            opc = op_less.opcode
+            if opc not in ("INT_LESSEQUAL", "INT_SLESSEQUAL"): return 0
+            
+        if op_equal.opcode != "INT_NOTEQUAL": return 0
+        
+        a, b = op_less.inputs[0], op_less.inputs[1]
+        c, d = op_equal.inputs[0], op_equal.inputs[1]
+        
+        if (a == c and b == d) or (a == d and b == c):
+            data.op_set_input(op, a, 0)
+            data.op_set_input(op, b, 1)
+            data.op_set_opcode(op, "INT_SLESS" if opc == "INT_SLESSEQUAL" else "INT_LESS")
+            return 1
+        return 0
+
+
+class RuleNegateNegate(Rule):
+    """Simplify double negate: ~ (~ V) => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "negatenegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_NEGATE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        vn1 = op.inputs[0]
+        neg2 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not neg2 or neg2.opcode != "INT_NEGATE" or len(neg2.inputs) != 1: return 0
+        
+        vn2 = neg2.inputs[0]
+        data.op_set_input(op, vn2, 0)
+        data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleOrCompare(Rule):
+    """Simplify (V | W) == 0 => (V == 0) && (W == 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "orcompare")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        outvn = op.output
+        if outvn is None: return 0
+        
+        has_compares = False
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        for comp_op in descendants:
+            if comp_op.opcode not in ("INT_EQUAL", "INT_NOTEQUAL"): return 0
+            if len(comp_op.inputs) != 2: return 0
+            
+            cnode = data.nodes[comp_op.inputs[1]]
+            if cnode.kind != "const" or int(cnode.name, 16) != 0: return 0
+            has_compares = True
+            
+        if not has_compares: return 0
+        
+        v, w = op.inputs[0], op.inputs[1]
+        
+        for comp_op in descendants:
+            opc = comp_op.opcode
+            
+            zero_v = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zero_v, "0x0", data.nodes[v].size_bits, "const"))
+            eq_v = PcodeOp(comp_op.addr, opc, len(data.nodes), (v, zero_v))
+            data.nodes.append(PcodeVarnode(eq_v.output, None, 1, "unique"))
+            data.ops.append(eq_v)
+            
+            zero_w = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zero_w, "0x0", data.nodes[w].size_bits, "const"))
+            eq_w = PcodeOp(comp_op.addr, opc, len(data.nodes), (w, zero_w))
+            data.nodes.append(PcodeVarnode(eq_w.output, None, 1, "unique"))
+            data.ops.append(eq_w)
+            
+            data.op_set_input(comp_op, eq_v.output, 0)
+            data.op_set_input(comp_op, eq_w.output, 1)
+            data.op_set_opcode(comp_op, "BOOL_AND" if opc == "INT_EQUAL" else "BOOL_OR")
+            
+        return 1
+
+
+class RuleShiftSub(Rule):
+    """Simplify SUBPIECE of INT_LEFT: sub(V << (n*8), c) => sub(V, c - n)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shiftsub")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn = op.inputs[0]
+        shiftop = next((cand for cand in data.ops if cand.output == vn), None)
+        if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
+        
+        sa = data.nodes[shiftop.inputs[1]]
+        if sa.kind != "const": return 0
+        
+        n = int(sa.name, 16)
+        if (n & 7) != 0: return 0
+        
+        c = int(data.nodes[op.inputs[1]].name, 16)
+        shift_in = shiftop.inputs[0]
+        
+        insize = data.nodes[shift_in].size_bits
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        c -= (n // 8)
+        if c < 0 or c * 8 + outsize > insize: return 0
+        
+        data.op_set_input(op, shift_in, 0)
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(c), data.nodes[op.inputs[1]].size_bits, "const"))
+        data.op_set_input(op, cnew, 1)
+        return 1
+
+
+class RuleSubRight(Rule):
+    """Convert high SUBPIECE to INT_RIGHT + low SUBPIECE"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subright")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        c = int(cnode.name, 16)
+        if c == 0: return 0
+        
+        a = op.inputs[0]
+        outvn = op.output
+        if outvn is None: return 0
+        
+        opc = "INT_RIGHT"
+        d = c * 8
+        
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        lone = descendants[0] if len(descendants) == 1 else None
+        
+        if lone:
+            opc2 = lone.opcode
+            if opc2 in ("INT_RIGHT", "INT_SRIGHT") and len(lone.inputs) == 2:
+                scnode = data.nodes[lone.inputs[1]]
+                if scnode.kind == "const":
+                    if data.nodes[outvn].size_bits + c * 8 == data.nodes[a].size_bits:
+                        d += int(scnode.name, 16)
+                        if d >= data.nodes[a].size_bits:
+                            if opc2 == "INT_RIGHT": return 0
+                            d = data.nodes[a].size_bits - 1
+                        
+                        op = lone
+                        data.op_set_opcode(op, "SUBPIECE")
+                        opc = opc2
+        
+        shiftop = PcodeOp(op.addr, opc, len(data.nodes), (a,))
+        newout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newout, None, data.nodes[a].size_bits, "unique"))
+        shiftop.output = newout
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(d), 4 * 8, "const"))
+        shiftop.inputs = (a, cnew)
+        data.ops.append(shiftop)
+        
+        data.op_set_input(op, newout, 0)
+        cnew2 = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew2, "0x0", 4 * 8, "const"))
+        data.op_set_input(op, cnew2, 1)
+        return 1
+
+
+class RuleAddUnsigned(Rule):
+    """Convert INT_ADD of large unsigned constants to INT_SUB"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "addunsigned")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ADD"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        constvn = data.nodes[op.inputs[1]]
+        if constvn.kind != "const": return 0
+        
+        val = int(constvn.name, 16)
+        sz = constvn.size_bits
+        mask = (1 << sz) - 1
+        
+        sa = sz // 4 * 3  # Roughly 3/4 bitsize to match '1/4 less than full bitsize'
+        # Ghidra uses: int4 sa = constvn->getSize() * 6; since size is in bytes. 1 byte = 8 bits, so 6 is 3/4 of 8.
+        # sz is in bits, so we want sa = sz // 4 * 3
+        
+        quarter = (mask >> sa) << sa
+        if (val & quarter) != quarter: return 0
+        
+        negated_val = (-val) & mask
+        
+        data.op_set_opcode(op, "INT_SUB")
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(negated_val), sz, "const"))
+        data.op_set_input(op, cnew, 1)
+        return 1
+
+
+class RuleSubExtComm(Rule):
+    """Commute SUBPIECE and EXTENSION: sub(zext(V), c) => zext(sub(V, c))"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subextcomm")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        base = op.inputs[0]
+        extop = next((cand for cand in data.ops if cand.output == base), None)
+        if not extop or extop.opcode not in ("INT_ZEXT", "INT_SEXT"): return 0
+        
+        invn = extop.inputs[0]
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        subcut = int(cnode.name, 16)
+        outsz = data.nodes[op.output].size_bits if op.output is not None else 0
+        insz = data.nodes[invn].size_bits
+        
+        if outsz + subcut * 8 <= insz:
+            data.op_set_input(op, invn, 0)
+            if insz == outsz:
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "COPY")
+            return 1
+            
+        if subcut * 8 >= insz: return 0
+        
+        if subcut != 0:
+            newop = PcodeOp(op.addr, "SUBPIECE", len(data.nodes), (invn, op.inputs[1]))
+            newvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newvn, None, insz - subcut * 8, "unique"))
+            newop.output = newvn
+            data.ops.append(newop)
+        else:
+            newvn = invn
+            
+        data.op_remove_input(op, 1)
+        data.op_set_opcode(op, extop.opcode)
+        data.op_set_input(op, newvn, 0)
+        return 1
+
+
+class RuleSubNormal(Rule):
+    """Pull-back SUBPIECE through INT_RIGHT/INT_SRIGHT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subnormal")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        shiftout = op.inputs[0]
+        shiftop = next((cand for cand in data.ops if cand.output == shiftout), None)
+        if not shiftop or shiftop.opcode not in ("INT_RIGHT", "INT_SRIGHT") or len(shiftop.inputs) != 2: return 0
+        
+        sa = data.nodes[shiftop.inputs[1]]
+        if sa.kind != "const": return 0
+        
+        n = int(sa.name, 16)
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        c = int(cnode.name, 16)
+        k = n // 8
+        
+        a = shiftop.inputs[0]
+        insize = data.nodes[a].size_bits
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        if n + 8 * c + outsize < insize and n != k * 8: return 0
+        
+        if (k + c) * 8 + outsize > insize:
+            trunc_size = insize - c * 8 - k * 8
+            if n == k * 8 and trunc_size > 0 and (trunc_size & (trunc_size - 1)) == 0:
+                c += k
+                newop = PcodeOp(op.addr, "SUBPIECE", len(data.nodes), (a, op.inputs[1]))
+                newout = len(data.nodes)
+                data.nodes.append(PcodeVarnode(newout, None, trunc_size, "unique"))
+                newop.output = newout
+                data.ops.append(newop)
+                
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(c), cnode.size_bits, "const"))
+                data.op_set_input(newop, cnew, 1)
+                
+                data.op_set_input(op, newout, 0)
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "INT_SEXT" if shiftop.opcode == "INT_SRIGHT" else "INT_ZEXT")
+                return 1
+            else:
+                k = (insize - outsize) // 8 - c
+                
+        c += k
+        n -= k * 8
+        if n == 0:
+            data.op_set_input(op, a, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(c), cnode.size_bits, "const"))
+            data.op_set_input(op, cnew, 1)
+            return 1
+        elif n >= outsize:
+            n = outsize
+            if shiftop.opcode == "INT_SRIGHT": n -= 1
+            
+        newop = PcodeOp(op.addr, "SUBPIECE", len(data.nodes), (a, op.inputs[1]))
+        newout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newout, None, outsize, "unique"))
+        newop.output = newout
+        data.ops.append(newop)
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(c), cnode.size_bits, "const"))
+        data.op_set_input(newop, cnew, 1)
+        
+        data.op_set_input(op, newout, 0)
+        cnew_sa = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew_sa, hex(n), sa.size_bits, "const"))
+        data.op_set_input(op, cnew_sa, 1)
+        data.op_set_opcode(op, shiftop.opcode)
+        return 1
+
+
+class RuleCarryElim(Rule):
+    """Simplify INT_CARRY when adding a constant: V carry c => c <= V (where c is 2s-comp)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "carryelim")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_CARRY"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        off = int(cnode.name, 16)
+        if off == 0:
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+            
+        mask = (1 << cnode.size_bits) - 1
+        off = (-off) & mask
+        
+        data.op_set_opcode(op, "INT_LESSEQUAL")
+        data.op_set_input(op, op.inputs[0], 1)
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(off), data.nodes[op.inputs[0]].size_bits, "const"))
+        data.op_set_input(op, cnew, 0)
+        return 1
+
+
+class RuleScarry(Rule):
+    """Simplify signed comparisons using INT_SCARRY and constants"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "scarry")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SCARRY"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        avn = data.nodes[op.inputs[0]]
+        bvn = data.nodes[op.inputs[1]]
+        
+        if (avn.kind == "const" and int(avn.name, 16) == 0) or (bvn.kind == "const" and int(bvn.name, 16) == 0):
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+            
+        return 0
+
+
+class RuleSborrow(Rule):
+    """Simplify signed comparisons using INT_SBORROW"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "sborrow")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SBORROW"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        bvn = data.nodes[op.inputs[1]]
+        if bvn.kind == "const" and int(bvn.name, 16) == 0:
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+        return 0
+
+
+class RuleDivChain(Rule):
+    """Simplify chained divisions: (V / c) / d => V / (c * d)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "divchain")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_DIV", "INT_SDIV"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        opc2 = op.opcode
+        cnode2 = data.nodes[op.inputs[1]]
+        if cnode2.kind != "const": return 0
+        
+        vn = op.inputs[0]
+        divOp = next((cand for cand in data.ops if cand.output == vn), None)
+        if not divOp or len(divOp.inputs) != 2: return 0
+        
+        opc1 = divOp.opcode
+        if opc1 != opc2 and (opc2 != "INT_DIV" or opc1 != "INT_RIGHT"): return 0
+        
+        cnode1 = data.nodes[divOp.inputs[1]]
+        if cnode1.kind != "const": return 0
+        
+        count = sum(1 for cand in data.ops if vn in cand.inputs)
+        if count != 1: return 0
+        
+        val2 = int(cnode2.name, 16)
+        if opc1 == opc2:
+            val1 = int(cnode1.name, 16)
+        else:
+            sa = int(cnode1.name, 16)
+            val1 = 1 << sa
+            
+        baseVn = divOp.inputs[0]
+        sz = data.nodes[vn].size_bits
+        mask = (1 << sz) - 1
+        
+        resval = (val1 * val2) & mask
+        if resval == 0: return 0
+        
+        def signbit_negative(v, size):
+            return (v & (1 << (size - 1))) != 0
+            
+        def mostsigbit_set(v):
+            if v == 0: return -1
+            return v.bit_length() - 1
+            
+        abs1 = val1
+        if signbit_negative(val1, sz): abs1 = (~val1 + 1) & mask
+        abs2 = val2
+        if signbit_negative(val2, sz): abs2 = (~val2 + 1) & mask
+        
+        bitcount = mostsigbit_set(abs1) + mostsigbit_set(abs2) + 2
+        if opc2 == "INT_DIV" and bitcount > sz: return 0
+        if opc2 == "INT_SDIV" and bitcount > sz - 2: return 0
+        
+        data.op_set_input(op, baseVn, 0)
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(resval), sz, "const"))
+        data.op_set_input(op, cnew, 1)
+        return 1
+
+
+class RuleSignForm(Rule):
+    """Normalize sign extraction: sub(sext(V), c) => V s>> 31"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signform")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        sextout = op.inputs[0]
+        sextop = next((cand for cand in data.ops if cand.output == sextout), None)
+        if not sextop or sextop.opcode != "INT_SEXT" or len(sextop.inputs) != 1: return 0
+        
+        a = sextop.inputs[0]
+        if data.nodes[a].size_bits != data.nodes[op.output].size_bits: return 0
+        
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        c = int(cnode.name, 16)
+        
+        if c * 8 < data.nodes[a].size_bits: return 0
+        
+        data.op_set_input(op, a, 0)
+        n = data.nodes[a].size_bits - 1
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(n), 4 * 8, "const"))
+        data.op_set_input(op, cnew, 1)
+        data.op_set_opcode(op, "INT_SRIGHT")
+        return 1
+
+
+class RuleSignNearMult(Rule):
+    """Simplify optimization of division: (x + (x s>> 31) >> (size-n)) & mask => (x s/ 2^n) * 2^n"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signnearmult")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        vn = op.inputs[0]
+        addop = next((cand for cand in data.ops if cand.output == vn), None)
+        if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
+        
+        shiftvn = None
+        unshiftop = None
+        idx = -1
+        for i in range(2):
+            shiftvn = addop.inputs[i]
+            unshiftop = next((cand for cand in data.ops if cand.output == shiftvn), None)
+            if unshiftop and unshiftop.opcode == "INT_RIGHT" and len(unshiftop.inputs) == 2:
+                if data.nodes[unshiftop.inputs[1]].kind == "const":
+                    idx = i
+                    break
+        if idx == -1: return 0
+        
+        x = addop.inputs[1 - idx]
+        
+        n = int(data.nodes[unshiftop.inputs[1]].name, 16)
+        if n <= 0: return 0
+        n = data.nodes[shiftvn].size_bits - n
+        if n <= 0: return 0
+        
+        mask = (1 << data.nodes[shiftvn].size_bits) - 1
+        mask = (mask << n) & mask
+        if mask != int(cnode.name, 16): return 0
+        
+        sgnvn = unshiftop.inputs[0]
+        sshiftop = next((cand for cand in data.ops if cand.output == sgnvn), None)
+        if not sshiftop or sshiftop.opcode != "INT_SRIGHT" or len(sshiftop.inputs) != 2: return 0
+        
+        scnode = data.nodes[sshiftop.inputs[1]]
+        if scnode.kind != "const": return 0
+        if sshiftop.inputs[0] != x: return 0
+        
+        val = int(scnode.name, 16)
+        if val != data.nodes[x].size_bits - 1: return 0
+        
+        pow2 = 1 << n
+        newdiv = PcodeOp(op.addr, "INT_SDIV", len(data.nodes), (x, len(data.nodes)))
+        c_pow = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_pow, hex(pow2), data.nodes[x].size_bits, "const"))
+        newdiv.inputs = (x, c_pow)
+        
+        divvn = len(data.nodes)
+        data.nodes.append(PcodeVarnode(divvn, None, data.nodes[x].size_bits, "unique"))
+        newdiv.output = divvn
+        data.ops.append(newdiv)
+        
+        data.op_set_opcode(op, "INT_MULT")
+        data.op_set_input(op, divvn, 0)
+        c_pow2 = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_pow2, hex(pow2), data.nodes[x].size_bits, "const"))
+        data.op_set_input(op, c_pow2, 1)
+        return 1
+
+
+class RuleModOpt(Rule):
+    """Simplify expressions that optimize INT_REM and INT_SREM"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "modopt")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_DIV", "INT_SDIV"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        x = op.inputs[0]
+        div = op.inputs[1]
+        outvn = op.output
+        if outvn is None: return 0
+        
+        descendants1 = [cand for cand in data.ops if outvn in cand.inputs]
+        for multop in descendants1:
+            if multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
+            
+            div2 = multop.inputs[1]
+            if div2 == outvn: div2 = multop.inputs[0]
+            
+            cdiv2 = data.nodes[div2]
+            cdiv = data.nodes[div]
+            
+            if cdiv2.kind == "const":
+                if cdiv.kind != "const": continue
+                mask = (1 << cdiv2.size_bits) - 1
+                v2 = int(cdiv2.name, 16)
+                v1 = int(cdiv.name, 16)
+                if (((v2 ^ mask) + 1) & mask) != v1: continue
+            else:
+                op2comp = next((cand for cand in data.ops if cand.output == div2), None)
+                if not op2comp or op2comp.opcode != "INT_2COMP" or len(op2comp.inputs) != 1: continue
+                if op2comp.inputs[0] != div: continue
+                
+            outvn2 = multop.output
+            if outvn2 is None: continue
+            
+            descendants2 = [cand for cand in data.ops if outvn2 in cand.inputs]
+            for addop in descendants2:
+                if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
+                
+                lvn = addop.inputs[0]
+                if lvn == outvn2: lvn = addop.inputs[1]
+                
+                if lvn != x: continue
+                
+                data.op_set_input(addop, x, 0)
+                if cdiv.kind == "const":
+                    cnew = len(data.nodes)
+                    data.nodes.append(PcodeVarnode(cnew, cdiv.name, cdiv.size_bits, "const"))
+                    data.op_set_input(addop, cnew, 1)
+                else:
+                    data.op_set_input(addop, div, 1)
+                    
+                data.op_set_opcode(addop, "INT_REM" if op.opcode == "INT_DIV" else "INT_SREM")
+                return 1
+        return 0
+
+
+class RuleSignMod2nOpt(Rule):
+    """Convert INT_SREM forms: (V + (sign >> (64-n)) & (2^n-1)) - (sign >> (64-n)) => V s% 2^n"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signmod2nopt")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_RIGHT"]
+        
+    def check_sign_extraction(self, outVn, data):
+        signOp = next((cand for cand in data.ops if cand.output == outVn), None)
+        if not signOp or signOp.opcode != "INT_SRIGHT" or len(signOp.inputs) != 2: return None
+        constVn = data.nodes[signOp.inputs[1]]
+        if constVn.kind != "const": return None
+        
+        val = int(constVn.name, 16)
+        resVn = signOp.inputs[0]
+        insize = data.nodes[resVn].size_bits
+        if val != insize - 1: return None
+        return resVn
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        shiftAmt = int(cnode.name, 16)
+        
+        a = self.check_sign_extraction(op.inputs[0], data)
+        if a is None: return 0
+        
+        correctVn = op.output
+        if correctVn is None: return 0
+        
+        n = data.nodes[a].size_bits - shiftAmt
+        mask = (1 << n) - 1
+        
+        descendants_correct = [cand for cand in data.ops if correctVn in cand.inputs]
+        for multop in descendants_correct:
+            if multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
+            negone = data.nodes[multop.inputs[1]]
+            if negone.kind != "const": continue
+            if int(negone.name, 16) != (1 << data.nodes[correctVn].size_bits) - 1: continue
+            
+            out_mult = multop.output
+            if out_mult is None: continue
+            
+            descendants_mult = [cand for cand in data.ops if out_mult in cand.inputs]
+            if len(descendants_mult) != 1: continue
+            baseOp = descendants_mult[0]
+            if baseOp.opcode != "INT_ADD" or len(baseOp.inputs) != 2: continue
+            
+            slot = 1 if baseOp.inputs[0] == out_mult else 0
+            andOut = baseOp.inputs[slot]
+            andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+            
+            truncSize = -1
+            if andOp and andOp.opcode == "INT_ZEXT" and len(andOp.inputs) == 1:
+                andOut = andOp.inputs[0]
+                andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+                if andOp and andOp.opcode == "INT_AND":
+                    truncSize = data.nodes[andOut].size_bits
+            elif not andOp or andOp.opcode != "INT_AND" or len(andOp.inputs) != 2:
+                continue
+                
+            if not andOp: continue
+            
+            constVn2 = data.nodes[andOp.inputs[1]]
+            if constVn2.kind != "const" or int(constVn2.name, 16) != mask: continue
+            
+            addOut = andOp.inputs[0]
+            addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+            if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: continue
+            
+            aSlot = -1
+            for idx in range(2):
+                vn = addOp.inputs[idx]
+                if truncSize >= 0:
+                    subOp = next((cand for cand in data.ops if cand.output == vn), None)
+                    if subOp and subOp.opcode == "SUBPIECE" and len(subOp.inputs) == 2:
+                        subc = data.nodes[subOp.inputs[1]]
+                        if subc.kind == "const" and int(subc.name, 16) == 0:
+                            vn = subOp.inputs[0]
+                if a == vn:
+                    aSlot = idx
+                    break
+            
+            if aSlot == -1: continue
+            
+            extVn = addOp.inputs[1 - aSlot]
+            shiftOp = next((cand for cand in data.ops if cand.output == extVn), None)
+            if not shiftOp or shiftOp.opcode != "INT_RIGHT" or len(shiftOp.inputs) != 2: continue
+            
+            sconst = data.nodes[shiftOp.inputs[1]]
+            if sconst.kind != "const": continue
+            shiftval = int(sconst.name, 16)
+            
+            if truncSize >= 0:
+                shiftval += (data.nodes[a].size_bits - truncSize)
+                
+            if shiftval != shiftAmt: continue
+            
+            extVn = shiftOp.inputs[0]
+            if truncSize >= 0:
+                subOp = next((cand for cand in data.ops if cand.output == extVn), None)
+                if subOp and subOp.opcode == "SUBPIECE" and len(subOp.inputs) == 2:
+                    subc = data.nodes[subOp.inputs[1]]
+                    if subc.kind == "const" and int(subc.name, 16) == (truncSize // 8):
+                        extVn = subOp.inputs[0]
+            
+            actual_a = self.check_sign_extraction(extVn, data)
+            if actual_a != a: continue
+            
+            data.op_set_opcode(baseOp, "INT_SREM")
+            data.op_set_input(baseOp, a, 0)
+            
+            c_pow = len(data.nodes)
+            data.nodes.append(PcodeVarnode(c_pow, hex(1 << n), data.nodes[a].size_bits, "const"))
+            data.op_set_input(baseOp, c_pow, 1)
+            return 1
+        return 0
+
+
+class RuleSignMod2Opt(Rule):
+    """Convert INT_SREM form: (V - sign)&1 + sign => V s% 2"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signmod2opt")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        constVn = data.nodes[op.inputs[1]]
+        if constVn.kind != "const" or int(constVn.name, 16) != 1: return 0
+        
+        addOut = op.inputs[0]
+        addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+        if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: return 0
+        
+        multSlot = -1
+        multOp = None
+        for i in range(2):
+            vn = addOp.inputs[i]
+            mOp = next((cand for cand in data.ops if cand.output == vn), None)
+            if mOp and mOp.opcode == "INT_MULT" and len(mOp.inputs) == 2:
+                cVn = data.nodes[mOp.inputs[1]]
+                if cVn.kind == "const" and int(cVn.name, 16) == (1 << cVn.size_bits) - 1:
+                    multSlot = i
+                    multOp = mOp
+                    break
+        
+        if multSlot == -1: return 0
+        
+        from .rule import RuleSignMod2nOpt
+        # We need an instance to access the check_sign_extraction, or we can just redefine it inline since we didn't save it as a classmethod
+        
+        def check_sign_extraction(outVn):
+            signOp = next((cand for cand in data.ops if cand.output == outVn), None)
+            if not signOp or signOp.opcode != "INT_SRIGHT" or len(signOp.inputs) != 2: return None
+            cVn = data.nodes[signOp.inputs[1]]
+            if cVn.kind != "const": return None
+            val = int(cVn.name, 16)
+            resVn = signOp.inputs[0]
+            insize = data.nodes[resVn].size_bits
+            if val != insize - 1: return None
+            return resVn
+            
+        base = check_sign_extraction(multOp.inputs[0])
+        if base is None: return 0
+        
+        otherBase = addOp.inputs[1 - multSlot]
+        trunc = False
+        if base != otherBase:
+            sub1 = next((cand for cand in data.ops if cand.output == base), None)
+            if not sub1 or sub1.opcode != "SUBPIECE" or len(sub1.inputs) != 2: return 0
+            subc = data.nodes[sub1.inputs[1]]
+            if subc.kind != "const": return 0
+            truncAmt = int(subc.name, 16) * 8 # offset to bits
+            if truncAmt + data.nodes[base].size_bits != data.nodes[sub1.inputs[0]].size_bits: return 0
+            base = sub1.inputs[0]
+            
+            sub2 = next((cand for cand in data.ops if cand.output == otherBase), None)
+            if not sub2 or sub2.opcode != "SUBPIECE" or len(sub2.inputs) != 2: return 0
+            subc2 = data.nodes[sub2.inputs[1]]
+            if subc2.kind != "const" or int(subc2.name, 16) != 0: return 0
+            otherBase = sub2.inputs[0]
+            if otherBase != base: return 0
+            trunc = True
+            
+        andOut = op.output
+        if andOut is None: return 0
+        
+        if trunc:
+            descendants = [cand for cand in data.ops if andOut in cand.inputs]
+            if len(descendants) != 1 or descendants[0].opcode != "INT_ZEXT": return 0
+            extOp = descendants[0]
+            andOut = extOp.output
+            if andOut is None: return 0
+            
+        descendants = [cand for cand in data.ops if andOut in cand.inputs]
+        for rootOp in descendants:
+            if rootOp.opcode != "INT_ADD" or len(rootOp.inputs) != 2: continue
+            slot = 1 if rootOp.inputs[0] == andOut else 0
+            otherBase = check_sign_extraction(rootOp.inputs[1 - slot])
+            if otherBase != base: continue
+            
+            data.op_set_opcode(rootOp, "INT_SREM")
+            data.op_set_input(rootOp, base, 0)
+            
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x2", data.nodes[base].size_bits, "const"))
+            data.op_set_input(rootOp, cnew, 1)
+            return 1
+        return 0
+
+
+class RuleSignMod2nOpt2(Rule):
+    """Convert INT_SREM form: V - (Vadj & ~(2^n-1)) => V s% 2^n"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signmod2nopt2")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_MULT"]
+
+    def check_sign_ext_form(self, op: PcodeOp, data: PcodeLikeGraph):
+        for slot in range(2):
+            minusVn = op.inputs[slot]
+            multOp = next((cand for cand in data.ops if cand.output == minusVn), None)
+            if not multOp or multOp.opcode != "INT_MULT" or len(multOp.inputs) != 2: continue
+            constVn = data.nodes[multOp.inputs[1]]
+            if constVn.kind != "const": continue
+            if int(constVn.name, 16) != (1 << constVn.size_bits) - 1: continue
+            
+            base = op.inputs[1 - slot]
+            signExt = multOp.inputs[0]
+            shiftOp = next((cand for cand in data.ops if cand.output == signExt), None)
+            if not shiftOp or shiftOp.opcode != "INT_SRIGHT" or len(shiftOp.inputs) != 2: continue
+            if shiftOp.inputs[0] != base: continue
+            
+            sconst = data.nodes[shiftOp.inputs[1]]
+            if sconst.kind != "const": continue
+            if int(sconst.name, 16) != data.nodes[base].size_bits * 8 - 1: continue
+            return base
+        return None
+
+    def check_multiequal_form(self, op: PcodeOp, npow: int, data: PcodeLikeGraph):
+        if len(op.inputs) != 2: return None
+        npow_minus_1 = npow - 1
+        
+        base = None
+        for slot in range(2):
+            addOut = op.inputs[slot]
+            addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+            if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: continue
+            constVn = data.nodes[addOp.inputs[1]]
+            if constVn.kind != "const" or int(constVn.name, 16) != npow_minus_1: continue
+            base = addOp.inputs[0]
+            otherBase = op.inputs[1 - slot]
+            if otherBase == base:
+                return base
+        return None
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        constVn = data.nodes[op.inputs[1]]
+        if constVn.kind != "const": return 0
+        
+        mask = (1 << constVn.size_bits) - 1
+        if int(constVn.name, 16) != mask: return 0
+        
+        andOut = op.inputs[0]
+        andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+        if not andOp or andOp.opcode != "INT_AND" or len(andOp.inputs) != 2: return 0
+        
+        cAndVn = data.nodes[andOp.inputs[1]]
+        if cAndVn.kind != "const": return 0
+        
+        npow = (~int(cAndVn.name, 16) + 1) & mask
+        if bin(npow).count('1') != 1: return 0
+        if npow == 1: return 0
+        
+        adjVn = andOp.inputs[0]
+        adjOp = next((cand for cand in data.ops if cand.output == adjVn), None)
+        if not adjOp: return 0
+        
+        base = None
+        if adjOp.opcode == "INT_ADD":
+            if npow != 2: return 0
+            base = self.check_sign_ext_form(adjOp, data)
+        elif adjOp.opcode == "MULTIEQUAL":
+            base = self.check_multiequal_form(adjOp, npow, data)
+        
+        if base is None: return 0
+        
+        multOut = op.output
+        if multOut is None: return 0
+        
+        descendants = [cand for cand in data.ops if multOut in cand.inputs]
+        for rootOp in descendants:
+            if rootOp.opcode != "INT_ADD" or len(rootOp.inputs) != 2: continue
+            slot = 1 if rootOp.inputs[0] == multOut else 0
+            if rootOp.inputs[1 - slot] != base: continue
+            
+            if slot == 0:
+                data.op_set_input(rootOp, base, 0)
+            
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(npow), data.nodes[base].size_bits, "const"))
+            data.op_set_input(rootOp, cnew, 1)
+            data.op_set_opcode(rootOp, "INT_SREM")
+            return 1
+        return 0
+
+
+class RulePositiveDiv(Rule):
+    """Signed division of positive values is unsigned division"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "positivediv")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SDIV", "INT_SREM"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        sa = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[0]].size_bits
+        sa = sa - 1
+        
+        in0 = op.inputs[0]
+        in1 = op.inputs[1]
+        
+        mask0 = data.get_nzmask(in0)
+        mask1 = data.get_nzmask(in1)
+        
+        if ((mask0 >> sa) & 1) != 0: return 0
+        if ((mask1 >> sa) & 1) != 0: return 0
+        
+        opc = "INT_DIV" if op.opcode == "INT_SDIV" else "INT_REM"
+        data.op_set_opcode(op, opc)
+        return 1
+
+
+class RuleDivTermAdd(Rule):
+    """Simplify expressions associated with optimized division expressions"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "divtermadd")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE", "INT_RIGHT", "INT_SRIGHT"]
+        
+    def find_subshift(self, op: PcodeOp, data: PcodeLikeGraph):
+        shiftopc = op.opcode
+        n = 0
+        if shiftopc != "SUBPIECE":
+            vn = op.inputs[0]
+            subop = next((cand for cand in data.ops if cand.output == vn), None)
+            if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return None, "MAX", 0
+            sconst = data.nodes[op.inputs[1]]
+            if sconst.kind != "const": return None, "MAX", 0
+            n = int(sconst.name, 16)
+        else:
+            shiftopc = "MAX"
+            subop = op
+            
+        cnode = data.nodes[subop.inputs[1]]
+        if cnode.kind != "const": return None, "MAX", 0
+        c = int(cnode.name, 16)
+        
+        in_size = data.nodes[subop.inputs[0]].size_bits
+        out_size = data.nodes[subop.output].size_bits if subop.output is not None else 0
+        if out_size + c * 8 != in_size: return None, "MAX", 0
+        
+        n += 8 * c
+        return subop, shiftopc, n
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        subop, shiftopc, n = self.find_subshift(op, data)
+        if subop is None: return 0
+        if n > 127: return 0
+        
+        multvn = subop.inputs[0]
+        multop = next((cand for cand in data.ops if cand.output == multvn), None)
+        if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: return 0
+        
+        multConstNode = data.nodes[multop.inputs[1]]
+        if multConstNode.kind != "const": return 0
+        multConst = int(multConstNode.name, 16)
+        
+        extvn = multop.inputs[0]
+        extop = next((cand for cand in data.ops if cand.output == extvn), None)
+        if not extop or extop.opcode not in ("INT_ZEXT", "INT_SEXT"): return 0
+        
+        opc = extop.opcode
+        if opc == "INT_ZEXT" and op.opcode == "INT_SRIGHT": return 0
+        if opc == "INT_SEXT" and op.opcode == "INT_RIGHT": return 0
+        
+        multConst += (1 << n)
+        multConst &= (1 << data.nodes[extvn].size_bits) - 1
+        
+        x = extop.inputs[0]
+        out_op = op.output
+        if out_op is None: return 0
+        
+        descendants = [cand for cand in data.ops if out_op in cand.inputs]
+        for addop in descendants:
+            if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
+            if addop.inputs[0] != x and addop.inputs[1] != x: continue
+            
+            newmultop = PcodeOp(op.addr, "INT_MULT", len(data.nodes), (extvn, len(data.nodes)))
+            c_new = len(data.nodes)
+            data.nodes.append(PcodeVarnode(c_new, hex(multConst), data.nodes[extvn].size_bits, "const"))
+            newmultop.inputs = (extvn, c_new)
+            newmultvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newmultvn, None, data.nodes[extvn].size_bits, "unique"))
+            newmultop.output = newmultvn
+            data.ops.append(newmultop)
+            
+            newshiftop = PcodeOp(op.addr, "INT_RIGHT" if shiftopc == "MAX" else shiftopc, len(data.nodes), (newmultvn, len(data.nodes)))
+            c_n = len(data.nodes)
+            data.nodes.append(PcodeVarnode(c_n, hex(n), 4 * 8, "const"))
+            newshiftop.inputs = (newmultvn, c_n)
+            newshiftvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newshiftvn, None, data.nodes[extvn].size_bits, "unique"))
+            newshiftop.output = newshiftvn
+            data.ops.append(newshiftop)
+            
+            data.op_set_opcode(addop, "SUBPIECE")
+            data.op_set_input(addop, newshiftvn, 0)
+            c_0 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(c_0, "0x0", 4 * 8, "const"))
+            data.op_set_input(addop, c_0, 1)
+            return 1
+        return 0
+
+
+class RuleDivOpt(Rule):
+    """Convert INT_MULT and shift forms into INT_DIV or INT_SDIV"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "divopt")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE", "INT_RIGHT", "INT_SRIGHT"]
+
+    def find_form(self, op: PcodeOp, data: PcodeLikeGraph):
+        curOp = op
+        shiftopc = curOp.opcode
+        if shiftopc in ("INT_RIGHT", "INT_SRIGHT"):
+            vn = curOp.inputs[0]
+            cvn = data.nodes[curOp.inputs[1]]
+            if cvn.kind != "const": return None, 0, 0, 0, ""
+            n = int(cvn.name, 16)
+            curOp = next((cand for cand in data.ops if cand.output == vn), None)
+            if not curOp: return None, 0, 0, 0, ""
+        else:
+            n = 0
+            if shiftopc != "SUBPIECE": return None, 0, 0, 0, ""
+            shiftopc = "MAX"
+            
+        if curOp.opcode == "SUBPIECE":
+            c = int(data.nodes[curOp.inputs[1]].name, 16)
+            inVn = curOp.inputs[0]
+            if curOp.output is None: return None, 0, 0, 0, ""
+            outsz = data.nodes[curOp.output].size_bits
+            insz = data.nodes[inVn].size_bits
+            if outsz + c * 8 != insz: return None, 0, 0, 0, ""
+            n += 8 * c
+            curOp = next((cand for cand in data.ops if cand.output == inVn), None)
+            if not curOp: return None, 0, 0, 0, ""
+            
+        if curOp.opcode != "INT_MULT": return None, 0, 0, 0, ""
+        
+        inVn = curOp.inputs[0]
+        y_node = data.nodes[curOp.inputs[1]]
+        if y_node.kind == "const":
+            y = int(y_node.name, 16)
+        else:
+            y_node = data.nodes[inVn]
+            if y_node.kind == "const":
+                y = int(y_node.name, 16)
+                inVn = curOp.inputs[1]
+            else:
+                return None, 0, 0, 0, ""
+                
+        extOp = next((cand for cand in data.ops if cand.output == inVn), None)
+        if not extOp: return None, 0, 0, 0, ""
+        extopc = extOp.opcode
+        
+        if extopc != "INT_SEXT":
+            if extopc == "INT_ZEXT":
+                nzMask = data.get_nzmask(extOp.inputs[0])
+            else:
+                nzMask = data.get_nzmask(inVn)
+            if nzMask == 0: return None, 0, 0, 0, ""
+            xsize = nzMask.bit_length()
+            if xsize == 0 or xsize > 4 * data.nodes[inVn].size_bits: return None, 0, 0, 0, ""
+        else:
+            xsize = data.nodes[extOp.inputs[0]].size_bits
+            
+        if extopc in ("INT_SEXT", "INT_ZEXT"):
+            return extOp.inputs[0], n, y, xsize, extopc
+        return inVn, n, y, xsize, extopc
+
+    def check_form_overlap(self, op: PcodeOp, data: PcodeLikeGraph):
+        if op.opcode != "SUBPIECE" or op.output is None: return False
+        vn = op.output
+        descendants = [cand for cand in data.ops if vn in cand.inputs]
+        for superOp in descendants:
+            if superOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
+            cvn = data.nodes[superOp.inputs[1]]
+            if cvn.kind != "const": return True
+            inVn, _, _, _, _ = self.find_form(superOp, data)
+            if inVn is not None: return True
+        return False
+
+    def calc_divisor(self, n: int, y: int, xsize: int):
+        if n > 127 or xsize > 64: return 0
+        power = 1 << n
+        if y <= 1: return 0
+        y_minus_1 = y - 1
+        q = power // y_minus_1
+        r = power % y_minus_1
+        if q >= (1 << 64): return 0
+        if y_minus_1 < q: return 0
+        
+        diff = 0
+        if r >= q:
+            q += 1
+            r = r - y_minus_1 + q
+            if r >= q: return 0
+            diff = q
+            
+        maxx = 0 if xsize == 64 else (1 << xsize)
+        maxx -= 1
+        diff += q - r
+        if diff == 0:
+            return q
+        tmp = power // diff
+        if tmp >= (1 << 64): return q
+        if tmp <= maxx: return 0
+        return q
+
+    def move_sign_bit_extraction(self, firstVn, replaceVn, data: PcodeLikeGraph):
+        testList = [firstVn]
+        op_def = next((cand for cand in data.ops if cand.output == firstVn), None)
+        if op_def and op_def.opcode == "INT_SRIGHT":
+            testList.append(op_def.inputs[0])
+            
+        visited = set()
+        for vn in testList:
+            if vn in visited: continue
+            visited.add(vn)
+            descendants = [cand for cand in data.ops if vn in cand.inputs]
+            for op in descendants:
+                if op.opcode in ("INT_RIGHT", "INT_SRIGHT"):
+                    cvn_idx = op.inputs[1]
+                    cvn = data.nodes[cvn_idx]
+                    if cvn.kind != "const": continue
+                    sa = data.nodes[firstVn].size_bits * 8 - 1
+                    if sa == int(cvn.name, 16):
+                        data.op_set_input(op, replaceVn, 0)
+                elif op.opcode == "COPY":
+                    if op.output is not None:
+                        testList.append(op.output)
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        inVn, n, y, xsize, extOpc = self.find_form(op, data)
+        if inVn is None: return 0
+        if self.check_form_overlap(op, data): return 0
+        if extOpc == "INT_SEXT": xsize -= 1
+        
+        divisor = self.calc_divisor(n, y, xsize)
+        if divisor == 0: return 0
+        
+        outSize = data.nodes[op.output].size_bits
+        
+        if data.nodes[inVn].size_bits < outSize:
+            inExt = PcodeOp(op.addr, extOpc, len(data.nodes), (inVn,))
+            extOut = len(data.nodes)
+            data.nodes.append(PcodeVarnode(extOut, None, outSize, "unique"))
+            inExt.output = extOut
+            data.ops.append(inExt)
+            inVn = extOut
+        elif data.nodes[inVn].size_bits > outSize:
+            newop = PcodeOp(op.addr, "INT_ADD", len(data.nodes), op.inputs)
+            resVn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(resVn, None, data.nodes[inVn].size_bits, "unique"))
+            newop.output = resVn
+            data.ops.append(newop)
+            
+            data.op_set_opcode(op, "SUBPIECE")
+            data.op_set_input(op, resVn, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 4 * 8, "const"))
+            data.op_set_input(op, cnew, 1)
+            op = newop
+            outSize = data.nodes[inVn].size_bits
+            
+        if extOpc == "INT_ZEXT":
+            data.op_set_input(op, inVn, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(divisor), outSize, "const"))
+            data.op_set_input(op, cnew, 1)
+            data.op_set_opcode(op, "INT_DIV")
+        else:
+            self.move_sign_bit_extraction(op.output, inVn, data)
+            divop = PcodeOp(op.addr, "INT_SDIV", len(data.nodes), (inVn, len(data.nodes)))
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(divisor), outSize, "const"))
+            divop.inputs = (inVn, cnew)
+            newout = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newout, None, outSize, "unique"))
+            divop.output = newout
+            data.ops.append(divop)
+            
+            sgnop = PcodeOp(op.addr, "INT_SRIGHT", len(data.nodes), (inVn, len(data.nodes)))
+            cnew2 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew2, hex(outSize * 8 - 1), outSize, "const"))
+            sgnop.inputs = (inVn, cnew2)
+            sgnvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(sgnvn, None, outSize, "unique"))
+            sgnop.output = sgnvn
+            data.ops.append(sgnop)
+            
+            data.op_set_input(op, newout, 0)
+            data.op_set_input(op, sgnvn, 1)
+            data.op_set_opcode(op, "INT_ADD")
+            
+        return 1
+
+
+class RuleSignDiv2(Rule):
+    """Convert INT_SRIGHT form into INT_SDIV: (V + -1*(V s>> 31)) s>> 1 => V s/ 2"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signdiv2")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const" or int(cnode.name, 16) != 1: return 0
+        
+        addout = op.inputs[0]
+        addop = next((cand for cand in data.ops if cand.output == addout), None)
+        if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
+        
+        a = None
+        for i in range(2):
+            multout = addop.inputs[i]
+            multop = next((cand for cand in data.ops if cand.output == multout), None)
+            if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
+            
+            cnode2 = data.nodes[multop.inputs[1]]
+            if cnode2.kind != "const" or int(cnode2.name, 16) != (1 << cnode2.size_bits) - 1: continue
+            
+            shiftout = multop.inputs[0]
+            shiftop = next((cand for cand in data.ops if cand.output == shiftout), None)
+            if not shiftop or shiftop.opcode != "INT_SRIGHT" or len(shiftop.inputs) != 2: continue
+            
+            cnode3 = data.nodes[shiftop.inputs[1]]
+            if cnode3.kind != "const": continue
+            
+            n = int(cnode3.name, 16)
+            a_cand = shiftop.inputs[0]
+            if a_cand != addop.inputs[1 - i]: continue
+            if n != data.nodes[a_cand].size_bits * 8 - 1: continue
+            
+            a = a_cand
+            break
+            
+        if a is None: return 0
+        
+        data.op_set_input(op, a, 0)
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, "0x2", data.nodes[a].size_bits, "const"))
+        data.op_set_input(op, cnew, 1)
+        data.op_set_opcode(op, "INT_SDIV")
+        return 1
+
+
+class RuleDivTermAdd2(Rule):
+    """Simplify another expression associated with optimized division (unsigned)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "divtermadd2")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_RIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const" or int(cnode.name, 16) != 1: return 0
+        
+        subvn = op.inputs[0]
+        subop = next((cand for cand in data.ops if cand.output == subvn), None)
+        if not subop or subop.opcode != "INT_ADD" or len(subop.inputs) != 2: return 0
+        
+        x = None
+        compvn = None
+        compop = None
+        for i in range(2):
+            compvn = subop.inputs[i]
+            compop = next((cand for cand in data.ops if cand.output == compvn), None)
+            if compop and compop.opcode == "INT_MULT" and len(compop.inputs) == 2:
+                invn = data.nodes[compop.inputs[1]]
+                if invn.kind == "const" and int(invn.name, 16) == (1 << invn.size_bits) - 1:
+                    x = subop.inputs[1 - i]
+                    break
+        
+        if x is None: return 0
+        
+        z = compop.inputs[0]
+        subpieceop = next((cand for cand in data.ops if cand.output == z), None)
+        if not subpieceop or subpieceop.opcode != "SUBPIECE" or len(subpieceop.inputs) != 2: return 0
+        
+        csub = data.nodes[subpieceop.inputs[1]]
+        if csub.kind != "const": return 0
+        n = int(csub.name, 16) * 8
+        if n > 127 or n != 8 * (data.nodes[subpieceop.inputs[0]].size_bits - data.nodes[z].size_bits): return 0
+        
+        multvn = subpieceop.inputs[0]
+        multop = next((cand for cand in data.ops if cand.output == multvn), None)
+        if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: return 0
+        
+        cmult = data.nodes[multop.inputs[1]]
+        if cmult.kind != "const": return 0
+        multConst = int(cmult.name, 16)
+        
+        zextvn = multop.inputs[0]
+        zextop = next((cand for cand in data.ops if cand.output == zextvn), None)
+        if not zextop or zextop.opcode != "INT_ZEXT" or len(zextop.inputs) != 1: return 0
+        if zextop.inputs[0] != x: return 0
+        
+        out_op = op.output
+        if out_op is None: return 0
+        
+        descendants = [cand for cand in data.ops if out_op in cand.inputs]
+        for addop in descendants:
+            if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
+            if addop.inputs[0] != z and addop.inputs[1] != z: continue
+            
+            pow2 = 1 << n
+            multConst += pow2
+            multConst &= (1 << data.nodes[zextvn].size_bits) - 1
+            
+            newmultop = PcodeOp(op.addr, "INT_MULT", len(data.nodes), (zextvn, len(data.nodes)))
+            cnew1 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew1, hex(multConst), data.nodes[zextvn].size_bits, "const"))
+            newmultop.inputs = (zextvn, cnew1)
+            
+            newmultvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newmultvn, None, data.nodes[zextvn].size_bits, "unique"))
+            newmultop.output = newmultvn
+            data.ops.append(newmultop)
+            
+            newshiftop = PcodeOp(op.addr, "INT_RIGHT", len(data.nodes), (newmultvn, len(data.nodes)))
+            cnew2 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew2, hex(n + 1), 4 * 8, "const"))
+            newshiftop.inputs = (newmultvn, cnew2)
+            
+            newshiftvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newshiftvn, None, data.nodes[zextvn].size_bits, "unique"))
+            newshiftop.output = newshiftvn
+            data.ops.append(newshiftop)
+            
+            data.op_set_opcode(addop, "SUBPIECE")
+            data.op_set_input(addop, newshiftvn, 0)
+            cnew3 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew3, "0x0", 4 * 8, "const"))
+            data.op_set_input(addop, cnew3, 1)
+            return 1
+        return 0
+
+
+class RuleConcatLeftShift(Rule):
+    """Simplify concat(V, zext(W) << c) => concat(concat(V, W), 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "concatleftshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["PIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn2 = op.inputs[1]
+        shiftop = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
+        
+        cnode = data.nodes[shiftop.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        sa = int(cnode.name, 16)
+        if (sa & 7) != 0: return 0
+        
+        tmpvn = shiftop.inputs[0]
+        zextop = next((cand for cand in data.ops if cand.output == tmpvn), None)
+        if not zextop or zextop.opcode != "INT_ZEXT" or len(zextop.inputs) != 1: return 0
+        
+        b = zextop.inputs[0]
+        vn1 = op.inputs[0]
+        
+        sa //= 8
+        if sa + data.nodes[b].size_bits != data.nodes[tmpvn].size_bits: return 0
+        
+        newop = PcodeOp(op.addr, "PIECE", len(data.nodes), (vn1, b))
+        newout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newout, None, data.nodes[vn1].size_bits + data.nodes[b].size_bits, "unique"))
+        newop.output = newout
+        data.ops.append(newop)
+        
+        out_size = data.nodes[op.output].size_bits if op.output is not None else 0
+        diff = out_size - data.nodes[newout].size_bits
+        if diff < 0: return 0
+        
+        data.op_set_input(op, newout, 0)
+        c_diff = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_diff, "0x0", diff, "const"))
+        data.op_set_input(op, c_diff, 1)
+        return 1
+
+
+class RuleExpandLoad(Rule):
+    """Push BOOL_AND through INT_AND into INT_EQUAL where one side is a LOAD/INDIRECT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "expandload")
+
+    def get_op_list(self) -> list[str]:
+        return ["LOAD"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        outVn = op.output
+        if outVn is None: return 0
+        outSize = data.nodes[outVn].size_bits // 8
+        rootPtr = op.inputs[1]
+        
+        # Checking logic here is heavily tied to type recovery which is not fully present.
+        # We skip implementing a full equivalent since TypePointer, etc. aren't implemented here.
+        # Returning 0 to keep it stubbed safely.
+        return 0
+
+
+class RuleExtensionPush(Rule):
+    """Duplicate extension (INT_ZEXT/INT_SEXT) through operations to avoid truncating."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "extensionpush")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT", "INT_SEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        inVn = op.inputs[0]
+        if data.nodes[inVn].kind == "const": return 0
+        outVn = op.output
+        if outVn is None: return 0
+        
+        addcount = 0
+        ptrcount = 0
+        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        for decOp in descendants:
+            if decOp.opcode == "PTRADD":
+                ptrcount += 1
+            elif decOp.opcode == "INT_ADD":
+                sub_out = decOp.output
+                if sub_out is None: return 0
+                sub_desc = [c for c in data.ops if sub_out in c.inputs]
+                if len(sub_desc) != 1 or sub_desc[0].opcode != "PTRADD":
+                    return 0
+                addcount += 1
+            else:
+                return 0
+                
+        if addcount + ptrcount <= 1: return 0
+        
+        if addcount > 0:
+            if len([c for c in data.ops if inVn in c.inputs]) != 1: return 0
+            
+        # Duplicating extension to descendants:
+        for decOp in descendants:
+            newext = PcodeOp(decOp.addr, op.opcode, len(data.nodes), (inVn,))
+            newext_out = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newext_out, None, data.nodes[outVn].size_bits, "unique"))
+            newext.output = newext_out
+            data.ops.append(newext)
+            
+            for i, slot_vn in enumerate(decOp.inputs):
+                if slot_vn == outVn:
+                    data.op_set_input(decOp, newext_out, i)
+        
+        return 1
+
+
+class RuleStructOffset0(Rule):
+    """Convert LOAD/STORE to first element of structure into PTRSUB"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "structoffset0")
+
+    def get_op_list(self) -> list[str]:
+        return ["LOAD", "STORE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # Requires advanced Type propagation which is not in minighidra
+        # Safely return 0.
+        return 0
+
+
+class RulePtrsubCharConstant(Rule):
+    """Convert PTRSUB into a pointer constant to a string if appropriate"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrsubcharconstant")
+
+    def get_op_list(self) -> list[str]:
+        return ["PTRSUB"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # Relies heavily on full typing + StringManager which we do not have.
+        return 0
+
+
+class RuleRightShiftSub(Rule):
+    """This rule is commented out in original Ghidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "rightshiftsub")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleConditionalMove(Rule):
+    """This rule requires block structure analysis in rules which isn't currently implemented."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "conditionalmove")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return ["MULTIEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePullsubIndirect(Rule):
+    """This rule relies heavily on alias analysis and indirects which are not fully structured in minighidra yet"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pullsubindirect")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePushMulti(Rule):
+    """This rule requires flow block analysis which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pushmulti")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePushPtr(Rule):
+    """This rule requires flow block analysis which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pushptr")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePtrsubUndo(Rule):
+    """This rule requires Type propagation (for pointer alignment info) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrsubundo")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RulePtraddUndo(Rule):
+    """This rule requires Type propagation which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptraddundo")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePiecePathology(Rule):
+    """This rule relies heavily on indirects, call specifications, and consumption which are not ported into minighidra's AST rules."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "piecepathology")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePieceStructure(Rule):
+    """This rule requires Type propagation (for struct layout info) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "piecestructure")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePopcountBoolXor(Rule):
+    """Simplify POPCOUNT of boolean results combined into INT_XOR."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "popcountboolxor")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return ["POPCOUNT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # minighidra lacks full POPCOUNT semantics and NZMask tracking of bit positions through AST natively
+        return 0
+
+
+class RulePtrArith(Rule):
+    """This rule requires Type propagation (for pointer types) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrarith")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePtrFlow(Rule):
+    """This rule requires Type propagation (for pointer types) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrflow")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleRangeMeld(Rule):
+    """This rule requires CircleRange math/interval analysis which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "rangemeld")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSegment(Rule):
+    """This rule requires SegmentOp userops support which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "segment")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSelectCse(Rule):
+    """This rule requires CSE Hash calculation which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "selectcse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleCollectTerms(Rule):
+    """This rule requires TermOrder analysis which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "collectterms")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleEarlyRemoval(Rule):
+    """This is mostly handled by ActionDeadCode rather than a Rule in minighidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "earlyremoval")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleFloatCast(Rule):
+    """Simplify FLOAT_FLOAT2FLOAT and FLOAT_TRUNC applied to FLOAT_FLOAT2FLOAT or FLOAT_INT2FLOAT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatcast")
+
+    def get_op_list(self) -> list[str]:
+        return ["FLOAT_FLOAT2FLOAT", "FLOAT_TRUNC"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        vn1 = op.inputs[0]
+        castop = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not castop or len(castop.inputs) != 1: return 0
+        
+        opc2 = castop.opcode
+        if opc2 not in ("FLOAT_FLOAT2FLOAT", "FLOAT_INT2FLOAT"): return 0
+        
+        opc1 = op.opcode
+        vn2 = castop.inputs[0]
+        
+        insize1 = data.nodes[vn1].size_bits
+        insize2 = data.nodes[vn2].size_bits
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        if opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
+            if insize1 > outsize:
+                data.op_set_input(op, vn2, 0)
+                if outsize == insize2:
+                    data.op_set_opcode(op, "COPY")
+                return 1
+            elif insize2 < insize1:
+                data.op_set_input(op, vn2, 0)
+                return 1
+        elif opc2 == "FLOAT_INT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
+            data.op_set_input(op, vn2, 0)
+            data.op_set_opcode(op, "FLOAT_INT2FLOAT")
+            return 1
+        elif opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_TRUNC":
+            data.op_set_input(op, vn2, 0)
+            return 1
+        return 0
+
+
+class RuleIgnoreNan(Rule):
+    """This rule requires floating-point comparisons tracking and data configuration which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ignorenan")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleUnsigned2Float(Rule):
+    """Simplify conversion: T = int2float((X >> 1) | X & 1); T + T => int2float( zext(X) )"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "unsigned2float")
+
+    def get_op_list(self) -> list[str]:
+        return ["FLOAT_INT2FLOAT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        invn = op.inputs[0]
+        orop = next((cand for cand in data.ops if cand.output == invn), None)
+        if not orop or orop.opcode != "INT_OR" or len(orop.inputs) != 2: return 0
+        
+        shiftop = None
+        andop = None
+        for i in range(2):
+            cnd = next((cand for cand in data.ops if cand.output == orop.inputs[i]), None)
+            if cnd and cnd.opcode == "INT_RIGHT":
+                shiftop = cnd
+                andop = next((cand for cand in data.ops if cand.output == orop.inputs[1 - i]), None)
+                break
+                
+        if not shiftop: return 0
+        
+        cshift = data.nodes[shiftop.inputs[1]]
+        if cshift.kind != "const" or int(cshift.name, 16) != 1: return 0
+        
+        basevn = shiftop.inputs[0]
+        if not andop: return 0
+        
+        if andop.opcode == "INT_ZEXT" and len(andop.inputs) == 1:
+            andop = next((cand for cand in data.ops if cand.output == andop.inputs[0]), None)
+            
+        if not andop or andop.opcode != "INT_AND" or len(andop.inputs) != 2: return 0
+        
+        cand_const = data.nodes[andop.inputs[1]]
+        if cand_const.kind != "const" or int(cand_const.name, 16) != 1: return 0
+        
+        vn = andop.inputs[0]
+        if basevn != vn:
+            subop = next((cand for cand in data.ops if cand.output == vn), None)
+            if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return 0
+            csub = data.nodes[subop.inputs[1]]
+            if csub.kind != "const" or int(csub.name, 16) != 0: return 0
+            vn = subop.inputs[0]
+            if basevn != vn: return 0
+            
+        outvn = op.output
+        if outvn is None: return 0
+        
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        for addop in descendants:
+            if addop.opcode != "FLOAT_ADD" or len(addop.inputs) != 2: continue
+            if addop.inputs[0] != outvn or addop.inputs[1] != outvn: continue
+            
+            preferred_zext_size = 8 if data.nodes[basevn].size_bits == 4 * 8 else data.nodes[basevn].size_bits * 2
+            # Simulating TypeOpFloatInt2Float::preferredZextSize approximation
+            
+            zextop = PcodeOp(addop.addr, "INT_ZEXT", len(data.nodes), (basevn,))
+            zextout = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zextout, None, preferred_zext_size, "unique"))
+            zextop.output = zextout
+            data.ops.append(zextop)
+            
+            data.op_set_opcode(addop, "FLOAT_INT2FLOAT")
+            data.op_remove_input(addop, 1)
+            data.op_set_input(addop, zextout, 0)
+            return 1
+            
+        return 0
+
+
+class RuleInt2FloatCollapse(Rule):
+    """This rule requires block structure flow conditions which aren't properly ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "int2floatcollapse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleFuncPtrEncoding(Rule):
+    """This rule relies on funcptr_align from architecture info, which isn't currently surfaced in minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "funcptrencoding")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleLzcountShiftBool(Rule):
+    """Simplify LZCOUNT of boolean results."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lzcountshiftbool")
+
+    def get_op_list(self) -> list[str]:
+        return ["LZCOUNT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        outVn = op.output
+        if outVn is None: return 0
+        
+        max_return = 8 * data.nodes[op.inputs[0]].size_bits
+        if bin(max_return).count('1') != 1: return 0
+        
+        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        for baseOp in descendants:
+            if baseOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
+            
+            vn1 = data.nodes[baseOp.inputs[1]]
+            if vn1.kind != "const": continue
+            
+            shift = int(vn1.name, 16)
+            if (max_return >> shift) == 1:
+                newOp = PcodeOp(baseOp.addr, "INT_EQUAL", len(data.nodes), (op.inputs[0], len(data.nodes)))
+                b = len(data.nodes)
+                data.nodes.append(PcodeVarnode(b, "0x0", data.nodes[op.inputs[0]].size_bits, "const"))
+                newOp.inputs = (op.inputs[0], b)
+                
+                eqResVn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(eqResVn, None, 1, "unique"))
+                newOp.output = eqResVn
+                data.ops.append(newOp)
+                
+                data.op_remove_input(baseOp, 1)
+                
+                if data.nodes[baseOp.output].size_bits == 1:
+                    data.op_set_opcode(baseOp, "COPY")
+                else:
+                    data.op_set_opcode(baseOp, "INT_ZEXT")
+                data.op_set_input(baseOp, eqResVn, 0)
+                return 1
+        return 0
+
+
+class RuleFloatSign(Rule):
+    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatsign")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleFloatSignCleanup(Rule):
+    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatsigncleanup")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleFloatRange(Rule):
+    """Simplify FLOAT_LESS and FLOAT_EQUAL into FLOAT_LESSEQUAL, etc."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatrange")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_AND", "BOOL_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1 = op.inputs[0]
+        vn2 = op.inputs[1]
+        
+        cmp1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        cmp2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not cmp1 or not cmp2: return 0
+        
+        opccmp1 = cmp1.opcode
+        if opccmp1 not in ("FLOAT_LESS", "FLOAT_LESSEQUAL"):
+            cmp1, cmp2 = cmp2, cmp1
+            opccmp1 = cmp1.opcode
+            
+        resultopc = "COPY"
+        if opccmp1 == "FLOAT_LESS":
+            if cmp2.opcode == "FLOAT_EQUAL" and op.opcode == "BOOL_OR":
+                resultopc = "FLOAT_LESSEQUAL"
+        elif opccmp1 == "FLOAT_LESSEQUAL":
+            if cmp2.opcode == "FLOAT_NOTEQUAL" and op.opcode == "BOOL_AND":
+                resultopc = "FLOAT_LESS"
+                
+        if resultopc == "COPY": return 0
+        
+        slot1 = 0
+        nvn1 = cmp1.inputs[slot1]
+        if data.nodes[nvn1].kind == "const":
+            slot1 = 1
+            nvn1 = cmp1.inputs[slot1]
+            if data.nodes[nvn1].kind == "const": return 0
+            
+        cvn1 = cmp1.inputs[1 - slot1]
+        
+        slot2 = 0
+        if nvn1 != cmp2.inputs[0]:
+            slot2 = 1
+            if nvn1 != cmp2.inputs[1]: return 0
+            
+        matchvn = cmp2.inputs[1 - slot2]
+        
+        if data.nodes[cvn1].kind == "const":
+            if data.nodes[matchvn].kind != "const": return 0
+            if int(data.nodes[matchvn].name, 16) != int(data.nodes[cvn1].name, 16): return 0
+        elif cvn1 != matchvn:
+            return 0
+            
+        data.op_set_opcode(op, resultopc)
+        data.op_set_input(op, nvn1, slot1)
+        if data.nodes[cvn1].kind == "const":
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, data.nodes[cvn1].name, data.nodes[cvn1].size_bits, "const"))
+            data.op_set_input(op, cnew, 1 - slot1)
+        else:
+            data.op_set_input(op, cvn1, 1 - slot1)
+        return 1
+
+
+class RuleTransformCpool(Rule):
+    """This rule requires CPool resolution which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "transformcpool")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleAliasUpdate(Rule):
+    """This rule requires alias collapsing operations not implemented in the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "aliasupdate")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleMultiCollapse(Rule):
+    """This rule relies heavily on functional equality tracking over MULTIEQUAL graphs which isn't currently ported to minighidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "multicollapse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleCollapseConstants(Rule):
+    """This rule requires expression collapse and Constant tracking which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "collapseconstants")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleIntLessEqual(Rule):
+    """This rule requires replaceLessequal from Funcdata which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "intlessequal")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleLoadVarnode(Rule):
+    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "loadvarnode")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleStoreVarnode(Rule):
+    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "storevarnode")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleShadowVar(Rule):
+    """This rule is commented out in original Ghidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shadowvar")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSwitchSingle(Rule):
+    """This rule requires JumpTable tracking which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "switchsingle")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleThreeWayCompare(Rule):
+    """This rule requires detectThreeWay analysis which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "threewaycompare")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleUndistribute(Rule):
+    """This rule requires undistribute functionality which is partially covered by BitUndistribute and BooleanUndistribute but the base RuleUndistribute logic isn't ported directly."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "undistribute")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleAndStructure(Rule):
+    """This rule requires Type propagation (for pointer types/structs) which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "andstructure")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleBoolZext(Rule):
+    """This rule requires Boolean calculation tracking not present yet."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "boolzext")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleShiftLess(Rule):
+    """This rule handles shift tracking inside conditions but uses architecture bits missing right now."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shiftless")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSignForm2(Rule):
+    """Requires complex sign extraction evaluation logic not built."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signform2")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
@@ -2445,29 +5106,6 @@ class RuleAndMask(Rule):
             
         return 0
 
-class RuleLessOne(Rule):
-    """Simplify x < 1 => x == 0, and x <= 0 => x == 0."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "lessone")
-
-    def get_op_list(self) -> tuple[str, ...]:
-        return ("INT_LESS", "INT_LESSEQUAL")
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 2: return 0
-        if not data.is_constant(op.inputs[1]): return 0
-        
-        val = data.get_constant_value(op.inputs[1])
-        if op.opcode == "INT_LESS" and val != 1: return 0
-        if op.opcode == "INT_LESSEQUAL" and val != 0: return 0
-        
-        data.op_set_opcode(op, "INT_EQUAL")
-        if val != 0:
-            sz = data.nodes[op.inputs[1]].size_bits
-            const_vn = data.new_constant(sz, 0)
-            data.op_set_input(op, const_vn, 1)
-        return 1
-
 class RuleLogicIdentity(Rule):
     """Simplify V & (~V) => 0, V | (~V) => -1, V ^ (~V) => -1."""
     def __init__(self, group: str) -> None:
@@ -2632,79 +5270,6 @@ class RuleSub2Add(Rule):
         data.op_set_input(op, const_vn, 1)
         return 1
 
-class RuleZextEliminate(Rule):
-    """Simplify ZEXT(V) == C => V == C if C fits in V."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "zexteliminate")
-
-    def get_op_list(self) -> tuple[str, ...]:
-        return (
-            "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", 
-            "INT_SLESS", "INT_SLESSEQUAL"
-        )
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 2: return 0
-        in0 = op.inputs[0]
-        in1 = op.inputs[1]
-        
-        zext_slot = -1
-        other_slot = -1
-        
-        def_op0 = data.get_def(in0)
-        def_op1 = data.get_def(in1)
-        
-        if def_op1 and def_op1.opcode == "INT_ZEXT":
-            zext_slot = 1
-            other_slot = 0
-            zext_op = def_op1
-        elif def_op0 and def_op0.opcode == "INT_ZEXT":
-            zext_slot = 0
-            other_slot = 1
-            zext_op = def_op0
-        else:
-            return 0
-            
-        other_vn = op.inputs[other_slot]
-        if not data.is_constant(other_vn): return 0
-        
-        small_size = data.nodes[zext_op.inputs[0]].size_bits
-        val = data.get_constant_value(other_vn)
-        
-        # Check if constant fits in small_size
-        if (val >> small_size) == 0:
-            new_vn = data.new_constant(small_size, val)
-            op = data.op_set_input(op, zext_op.inputs[0], zext_slot)
-            op = data.op_set_input(op, new_vn, other_slot)
-            return 1
-            
-        return 0
-
-
-class RuleEquality(Rule):
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "equality")
-
-    def get_op_list(self) -> list[str]:
-        return ["INT_EQUAL", "INT_NOTEQUAL"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        # V == V -> 1, V != V -> 0
-        if len(op.inputs) != 2:
-            return 0
-        if op.inputs[0] == op.inputs[1]:
-            val = 1 if op.opcode == "INT_EQUAL" else 0
-            # We don't have a newConstant method that injects constants gracefully right here,
-            # but we can resolve this by adding a constant node
-            const_node = len(data.nodes)
-            data.nodes.append(PcodeVarnode(len(data.nodes), hex(val), 1, "const"))
-            
-            data.op_set_opcode(op, "COPY")
-            data.op_remove_input(op, 1)
-            data.op_set_input(op, const_node, 0)
-            return 1
-        return 0
-
 class RuleTrivialBool(Rule):
     def __init__(self, group: str) -> None:
         super().__init__(group, "trivialbool")
@@ -2790,120 +5355,6 @@ class RuleLessEqual(Rule):
         return 1
 
 
-class RuleNotDistribute(Rule):
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "notdistribute")
-
-    def get_op_list(self) -> list[str]:
-        return ["BOOL_NEGATE"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 1:
-            return 0
-        
-        in_node = data.nodes[op.inputs[0]]
-        # Need to find the operation defining in_node
-        def_op = None
-        for cand_op in data.ops:
-            if cand_op.output == op.inputs[0]:
-                def_op = cand_op
-                break
-                
-        if def_op is None:
-            return 0
-            
-        # Is the intermediate variable consumed by anyone else?
-        # A simple check: if more than 1 use, we can't distribute without duplicating the operation.
-        uses = sum(1 for o in data.ops if op.inputs[0] in o.inputs)
-        if uses > 1:
-            return 0
-            
-        if def_op.opcode == "INT_EQUAL":
-            data.op_set_opcode(def_op, "INT_NOTEQUAL")
-        elif def_op.opcode == "INT_NOTEQUAL":
-            data.op_set_opcode(def_op, "INT_EQUAL")
-        elif def_op.opcode == "BOOL_NEGATE":
-            data.op_set_opcode(def_op, "COPY")
-        else:
-            return 0
-            
-        # Bypass the BOOL_NEGATE op
-        data.op_set_opcode(op, "COPY")
-        return 1
-
-class RuleSlessToLess(Rule):
-    """Convert INT_SLESS to INT_LESS when comparing positive values."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "slesstoless")
-
-    def get_op_list(self) -> tuple[str, ...]:
-        return ("INT_SLESS", "INT_SLESSEQUAL")
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 2: return 0
-        sz0 = data.nodes[op.inputs[0]].size_bits
-        mask0 = data.get_nzmask(op.inputs[0])
-        mask1 = data.get_nzmask(op.inputs[1])
-        
-        sign_bit = 1 << (sz0 - 1)
-        if (mask0 & sign_bit) == 0 and (mask1 & sign_bit) == 0:
-            new_opcode = "INT_LESS" if op.opcode == "INT_SLESS" else "INT_LESSEQUAL"
-            data.op_set_opcode(op, new_opcode)
-            return 1
-        return 0
-
-
-class RuleZextSless(Rule):
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "zextsless")
-
-    def get_op_list(self) -> list[str]:
-        return ["INT_SLESS", "INT_SLESSEQUAL"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 2:
-            return 0
-            
-        zext_idx = -1
-        const_idx = -1
-        
-        for i in range(2):
-            inode = data.nodes[op.inputs[i]]
-            if inode.kind == "const":
-                const_idx = i
-                
-        if const_idx == -1:
-            return 0
-            
-        zext_idx = 1 - const_idx
-        
-        def_op = None
-        for cand_op in data.ops:
-            if cand_op.output == op.inputs[zext_idx]:
-                def_op = cand_op
-                break
-                
-        if def_op is None or def_op.opcode != "INT_ZEXT":
-            return 0
-            
-        in_node = data.nodes[def_op.inputs[0]]
-        small_size = in_node.size_bits
-        cnode = data.nodes[op.inputs[const_idx]]
-        val = int(cnode.name, 16)
-        
-        # Is zero extension unnecessary, sign bit must also be 0
-        if (val >> (small_size - 1)) != 0:
-            return 0
-            
-        new_cnode = len(data.nodes)
-        data.nodes.append(PcodeVarnode(new_cnode, hex(val), small_size, "const"))
-        
-        new_opcode = "INT_LESS" if op.opcode == "INT_SLESS" else "INT_LESSEQUAL"
-        data.op_set_opcode(op, new_opcode)
-        data.op_set_input(op, def_op.inputs[0], zext_idx)
-        data.op_set_input(op, new_cnode, const_idx)
-        return 1
-
 class RuleCondNegate(Rule):
     def __init__(self, group: str) -> None:
         super().__init__(group, "condnegate")
@@ -2921,60 +5372,6 @@ class RuleCondNegate(Rule):
         # But if we did have it, we could negate the condition.
         return 0
         
-class RuleBoolNegate(Rule):
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "boolnegate")
-
-    def get_op_list(self) -> list[str]:
-        return ["BOOL_NEGATE"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 1: return 0
-        
-        def_op = None
-        for cand_op in data.ops:
-            if cand_op.output == op.inputs[0]:
-                def_op = cand_op
-                break
-                
-        if def_op is None: return 0
-        
-        # Uses > 1 prevents this
-        uses = sum(1 for o in data.ops if op.inputs[0] in o.inputs)
-        if uses > 1: return 0
-        
-        new_opc = None
-        if def_op.opcode == "BOOL_NEGATE":
-            new_opc = "COPY"
-        elif def_op.opcode == "INT_EQUAL":
-            new_opc = "INT_NOTEQUAL"
-        elif def_op.opcode == "INT_NOTEQUAL":
-            new_opc = "INT_EQUAL"
-        elif def_op.opcode == "INT_LESS":
-            new_opc = "INT_LESSEQUAL"
-            # Swap operands
-        elif def_op.opcode == "INT_LESSEQUAL":
-            new_opc = "INT_LESS"
-            # Swap operands
-        elif def_op.opcode == "INT_SLESS":
-            new_opc = "INT_SLESSEQUAL"
-            # Swap operands
-        elif def_op.opcode == "INT_SLESSEQUAL":
-            new_opc = "INT_SLESS"
-            # Swap operands
-            
-        if new_opc:
-            if def_op.opcode in ["INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL"]:
-                # Swap inputs
-                tmp = def_op.inputs[0]
-                data.op_set_input(def_op, def_op.inputs[1], 0)
-                data.op_set_input(def_op, tmp, 1)
-            data.op_set_opcode(def_op, new_opc)
-            data.op_set_opcode(op, "COPY")
-            return 1
-            
-        return 0
-
 class RuleDoubleShift(Rule):
     def __init__(self, group: str) -> None:
         super().__init__(group, "doubleshift")
