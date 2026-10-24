@@ -2,6 +2,215 @@ from __future__ import annotations
 from typing import Any
 from .block import FlowBlock, BlockGraph
 
+
+
+class LoopBody:
+    def __init__(self, h: 'FlowBlock') -> None:
+        self.head = h
+        self.tails: list['FlowBlock'] = []
+        self.depth: int = 0
+        self.uniquecount: int = 0
+        self.exitblock: 'FlowBlock' | None = None
+        self.immed_container: 'LoopBody' | None = None
+        self.exit_edges: list[tuple['FlowBlock', int]] = []
+
+    def add_tail(self, bl: 'FlowBlock') -> None:
+        self.tails.append(bl)
+
+    
+    def find_base(self, body: list['FlowBlock']) -> None:
+        self.head.mark = 1
+        body.append(self.head)
+        for tail in self.tails:
+            if tail.mark == 0:
+                tail.mark = 1
+                body.append(tail)
+                
+        self.uniquecount = len(body)
+        i = 1
+        while i < len(body):
+            curblock = body[i]
+            i += 1
+            for k in range(len(curblock.in_edges)):
+                if curblock.is_goto_branch(k): # actually we need to check if the edge from parent is goto
+                    continue
+                # in minighidra we check if parent's out edge to curblock is goto
+                parent = curblock.in_edges[k]
+                if parent.mark == 1:
+                    continue
+                # simplified goto check: if any of parent's out edges targeting curblock are not goto, we trace
+                is_goto = True
+                for out_idx in range(len(parent.out_edges)):
+                    if parent.out_edges[out_idx] == curblock and not parent.is_goto_branch(out_idx):
+                        is_goto = False
+                        break
+                if is_goto:
+                    continue
+                    
+                parent.mark = 1
+                body.append(parent)
+                
+    
+    def find(looptop: 'FlowBlock', looporder: list['LoopBody']) -> 'LoopBody | None':
+        for lb in looporder:
+            if lb.head == looptop:
+                return lb
+        return None
+
+    def label_containments(self, body: list['FlowBlock'], looporder: list['LoopBody']) -> None:
+        containlist = []
+        for curblock in body:
+            if curblock != self.head:
+                subloop = LoopBody.find(curblock, looporder)
+                if subloop is not None:
+                    containlist.append(subloop)
+                    subloop.depth += 1
+                    
+        for lb in containlist:
+            if lb.immed_container is None or lb.immed_container.depth < self.depth:
+                lb.immed_container = self
+
+    
+    def extend_to_container(self, container: 'LoopBody', body: list['FlowBlock']) -> None:
+        self.head.mark = 1
+        body.append(self.head)
+        for tail in self.tails:
+            if tail.mark == 0:
+                tail.mark = 1
+                body.append(tail)
+                
+        i = 1
+        while i < len(body):
+            curblock = body[i]
+            i += 1
+            for k in range(len(curblock.in_edges)):
+                if curblock.is_goto_branch(k):
+                    continue
+                parent = curblock.in_edges[k]
+                if parent.mark == 1:
+                    continue
+                if parent == container.exitblock:
+                    continue
+                    
+                is_goto = True
+                for out_idx in range(len(parent.out_edges)):
+                    if parent.out_edges[out_idx] == curblock and not parent.is_goto_branch(out_idx):
+                        is_goto = False
+                        break
+                if is_goto:
+                    continue
+                    
+                parent.mark = 1
+                body.append(parent)
+
+    def find_exit(self, body: list['FlowBlock']) -> None:
+        trialexit = []
+        for tail in self.tails:
+            for j, out_bl in enumerate(tail.out_edges):
+                if tail.is_goto_branch(j):
+                    continue
+                if out_bl.mark == 0:
+                    if self.immed_container is None:
+                        self.exitblock = out_bl
+                        return
+                    trialexit.append(out_bl)
+                    
+        for i, bl in enumerate(body):
+            if i > 0 and i < self.uniquecount:
+                continue
+            for j, out_bl in enumerate(bl.out_edges):
+                if bl.is_goto_branch(j):
+                    continue
+                if out_bl.mark == 0:
+                    if self.immed_container is None:
+                        self.exitblock = out_bl
+                        return
+                    trialexit.append(out_bl)
+                    
+        self.exitblock = None
+        if not trialexit:
+            return
+            
+        if self.immed_container is not None:
+            extension = []
+            self.extend_to_container(self.immed_container, extension)
+            for bl in trialexit:
+                if bl.mark == 1:
+                    self.exitblock = bl
+                    break
+            LoopBody.clear_marks(extension)
+
+    def order_tails(self) -> None:
+        if len(self.tails) <= 1 or self.exitblock is None:
+            return
+            
+        prefindex = -1
+        for i, trial in enumerate(self.tails):
+            found = False
+            for out_bl in trial.out_edges:
+                if out_bl == self.exitblock:
+                    found = True
+                    break
+            if found:
+                prefindex = i
+                break
+                
+        if prefindex > 0:
+            self.tails[0], self.tails[prefindex] = self.tails[prefindex], self.tails[0]
+            
+    def extend(self, body: list['FlowBlock']) -> None:
+        trial = []
+        i = 0
+        while i < len(body):
+            bl = body[i]
+            i += 1
+            for j, curbl in enumerate(bl.out_edges):
+                if bl.is_goto_branch(j):
+                    continue
+                if curbl.mark == 1 or curbl == self.exitblock:
+                    continue
+                    
+                if curbl.visit_count == 0:
+                    trial.append(curbl)
+                curbl.visit_count += 1
+                
+                if curbl.visit_count == len(curbl.in_edges):
+                    curbl.mark = 1
+                    body.append(curbl)
+                    
+        for bl in trial:
+            bl.visit_count = 0
+            
+    def label_exit_edges(self, body: list['FlowBlock']) -> None:
+        for bl in body:
+            for j, curbl in enumerate(bl.out_edges):
+                if bl.is_goto_branch(j):
+                    continue
+                if curbl.mark == 0 and curbl == self.exitblock:
+                    self.exit_edges.append((bl, j))
+
+    def clear_marks(body: list['FlowBlock']) -> None:
+        for b in body:
+            b.mark = 0
+
+    def merge_identical_heads(looporder: list['LoopBody']) -> None:
+        if not looporder:
+            return
+        
+        i = 0
+        while i < len(looporder) - 1:
+            if looporder[i].head == looporder[i+1].head:
+                looporder[i].tails.extend(looporder[i+1].tails)
+                looporder.pop(i+1)
+            else:
+                i += 1
+                
+    def compare_ends(a: 'LoopBody', b: 'LoopBody') -> int:
+        if a.head.index != b.head.index:
+            return a.head.index - b.head.index
+        # comparing tails is slightly complex, skip strict sorting for now if identical head
+        return 0
+
 class CollapseStructure:
     """Recovers hierarchical control flow from flat blocks."""
 
@@ -25,8 +234,54 @@ class CollapseStructure:
                 break
             isolated_count = self._collapse_internal(targetbl)
 
+    
+    def label_loops(self, looporder: list[LoopBody]) -> None:
+        self.loopbody = [] # Keep track of all bodies
+        
+        for bl in self.graph.blocks:
+            for j in range(len(bl.in_edges)):
+                if bl.is_back_edge_in(j):
+                    loopbottom = bl.in_edges[j]
+                    curbody = LoopBody(bl)
+                    curbody.add_tail(loopbottom)
+                    self.loopbody.append(curbody)
+                    looporder.append(curbody)
+                    
+        # sorting by head index to merge later
+        looporder.sort(key=lambda x: x.head.index)
+
     def order_loop_bodies(self) -> None:
-        pass
+        self.graph.calc_forward_dominator([self.graph.blocks[0]] if self.graph.blocks else [])
+        
+        looporder = []
+        self.label_loops(looporder)
+        if self.loopbody:
+            oldsize = len(looporder)
+            LoopBody.merge_identical_heads(looporder)
+            
+            # Remove subsumed bodies
+            if oldsize != len(looporder):
+                self.loopbody = [lb for lb in self.loopbody if lb in looporder]
+                
+            # Rest of loop ordering relies on deep graph logic, omitted for now
+            
+
+            for lb in self.loopbody:
+                body = []
+                lb.find_base(body)
+                lb.label_containments(body, looporder)
+                LoopBody.clear_marks(body)
+                
+            self.loopbody.sort(key=lambda lb: lb.depth, reverse=True)
+            
+            for lb in self.loopbody:
+                body = []
+                lb.find_base(body)
+                lb.find_exit(body)
+                lb.order_tails()
+                lb.extend(body)
+                lb.label_exit_edges(body)
+                LoopBody.clear_marks(body)
 
     def collapse_conditions(self) -> None:
         change = True
@@ -41,7 +296,31 @@ class CollapseStructure:
         return None
 
     def update_loop_body(self) -> bool:
-        return False
+        from minighidra.tracedag import TraceDAG, FloatingEdge
+        
+        # Simplified update_loop_body using TraceDAG to find unstructured gotos
+        # We process the whole graph to find edges that break DAG structure
+        likelygoto = []
+        tracer = TraceDAG(likelygoto)
+        
+        for bl in self.graph.blocks:
+            if not bl.in_edges:
+                tracer.add_root(bl)
+                
+        tracer.initialize()
+        tracer.push_branches()
+        
+        if not likelygoto:
+            return False
+            
+        # Convert floating edges into gotos in the graph
+        for edge in likelygoto:
+            b = edge.bottom
+            d = edge.destnode
+            if d in b.out_edges:
+                idx = b.out_edges.index(d)
+                b.set_goto_branch(idx)
+        return True
 
     def _collapse_internal(self, targetbl: FlowBlock | None) -> int:
         isolated_count = 0

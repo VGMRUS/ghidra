@@ -9,6 +9,71 @@ class FlowBlock:
         self.out_edges: list[FlowBlock] = []
         self.out_edge_flags: dict[int, int] = {}
         self.flags = 0
+        self.immed_dom: 'FlowBlock' | None = None
+        self.mark: int = 0
+        self.visit_count: int = 0
+        self.index: int = 0
+
+    @staticmethod
+    def find_common_block(bl1: FlowBlock | None, bl2: FlowBlock | None) -> FlowBlock | None:
+        b1 = bl1
+        b2 = bl2
+        common = None
+        while True:
+            if b2 is None:
+                while b1 is not None:
+                    if b1.mark != 0:
+                        common = b1
+                        break
+                    b1 = b1.immed_dom
+                break
+            if b1 is None:
+                while b2 is not None:
+                    if b2.mark != 0:
+                        common = b2
+                        break
+                    b2 = b2.immed_dom
+                break
+            if b1.mark != 0:
+                common = b1
+                break
+            b1.mark = 1
+            if b2.mark != 0:
+                common = b2
+                break
+            b2.mark = 1
+            b1 = b1.immed_dom
+            b2 = b2.immed_dom
+            
+        b1 = bl1
+        b2 = bl2
+        while b1 is not None and b1.mark != 0:
+            b1.mark = 0
+            b1 = b1.immed_dom
+        while b2 is not None and b2.mark != 0:
+            b2.mark = 0
+            b2 = b2.immed_dom
+            
+        return common
+
+    @staticmethod
+    def find_condition(bl1: FlowBlock, edge1: int, bl2: FlowBlock, edge2: int) -> Tuple[Optional[FlowBlock], int]:
+        cond = bl1.in_edges[edge1]
+        while len(cond.out_edges) != 2:
+            if len(cond.out_edges) != 1:
+                return None, 0
+            bl1 = cond
+            edge1 = 0
+            cond = bl1.in_edges[0]
+            
+        while cond != bl2.in_edges[edge2]:
+            bl2 = bl2.in_edges[edge2]
+            if len(bl2.out_edges) != 1:
+                return None, 0
+            edge2 = 0
+            
+        slot1 = cond.out_edges.index(bl1)
+        return cond, slot1
 
     def is_default_branch(self, i: int) -> bool:
         return self.out_edge_flags.get(i, 0) & 1 != 0
@@ -22,6 +87,58 @@ class FlowBlock:
     def set_goto_branch(self, i: int) -> None:
         self.out_edge_flags[i] = self.out_edge_flags.get(i, 0) | 2
 
+    def is_loop_dag_out(self, i: int) -> bool:
+        # Simplification: a loop dag edge is one that is not marked as goto
+        # (in full ghidra it also checks back_edge and irreducible)
+        return not self.is_goto_branch(i)
+
+    def is_loop_dag_in(self, i: int) -> bool:
+        # For incoming edge i, check the corresponding out edge of the source
+        in_block = self.in_edges[i]
+        out_idx = in_block.out_edges.index(self)
+        return in_block.is_loop_dag_out(out_idx)
+
+
+    
+    def dominates(self, subBlock: 'FlowBlock') -> bool:
+        while subBlock is not None:
+            if subBlock == self:
+                return True
+            subBlock = subBlock.immed_dom
+        return False
+
+    
+    def is_back_edge_in(self, i: int) -> bool:
+        if i < 0 or i >= len(self.in_edges):
+            return False
+        return self.dominates(self.in_edges[i])
+
+    
+    def restricted_by_conditional(self, cond: 'FlowBlock') -> bool:
+        if len(self.in_edges) == 1:
+            return True
+        if self.immed_dom != cond:
+            return False
+        seen_cond = False
+        for in_block in self.in_edges:
+            if in_block == cond:
+                if seen_cond:
+                    return False
+                seen_cond = True
+                continue
+                
+            curr = in_block
+            must_fail = False
+            while curr != self:
+                if curr == cond:
+                    must_fail = True
+                    break
+                if curr is None:
+                    break
+                curr = curr.immed_dom
+            if must_fail:
+                return False
+        return True
 
     def get_type(self) -> str:
         return self.block_type
@@ -134,12 +251,76 @@ class BlockGraph(FlowBlock):
             bb.name = f"block_{hex(b.start)}"
             self.blocks.append(bb)
             block_map[b.start] = bb
+            bb.index = len(self.blocks) - 1
             
         for b in blocks_data:
             bb = block_map[b.start]
             for succ in b.successors:
                 if succ in block_map:
                     bb.add_out_edge(block_map[succ])
+
+    
+    def calc_forward_dominator(self, rootlist: list['FlowBlock']) -> None:
+        if not self.blocks: return
+        numnodes = len(self.blocks) - 1
+        postorder = [None] * len(self.blocks)
+        for i in range(len(self.blocks)):
+            self.blocks[i].immed_dom = None
+            postorder[numnodes - i] = self.blocks[i]
+            
+        virtualroot = None
+        if len(rootlist) > 1:
+            # We don't implement create_virtual_root fully for now, assume single root
+            pass
+            
+        b = postorder[-1]
+        if len(b.in_edges) != 0:
+            pass # virtual root not fully implemented
+            
+        b.immed_dom = b
+        for i in range(len(b.out_edges)):
+            b.out_edges[i].immed_dom = b
+            
+        changed = True
+        new_idom = None
+        while changed:
+            changed = False
+            for i in range(len(postorder)-2, -1, -1):
+                b = postorder[i]
+                if b.immed_dom != postorder[-1]:
+                    first_proc = -1
+                    for j in range(len(b.in_edges)):
+                        new_idom = b.in_edges[j]
+                        if new_idom.immed_dom is not None:
+                            first_proc = j
+                            break
+                    if first_proc != -1:
+                        for j in range(first_proc+1, len(b.in_edges)):
+                            rho = b.in_edges[j]
+                            if rho.immed_dom is not None:
+                                finger1 = numnodes - self.blocks.index(rho)
+                                finger2 = numnodes - self.blocks.index(new_idom)
+                                while finger1 != finger2:
+                                    while finger1 < finger2:
+                                        finger1 = numnodes - self.blocks.index(postorder[finger1].immed_dom)
+                                    while finger2 < finger1:
+                                        finger2 = numnodes - self.blocks.index(postorder[finger2].immed_dom)
+                                new_idom = postorder[finger1]
+                        
+                        if b.immed_dom != new_idom:
+                            b.immed_dom = new_idom
+                            changed = True
+
+        postorder[-1].immed_dom = None
+
+    def build_dom_tree(self) -> list[list['FlowBlock']]:
+        child = [[] for _ in range(len(self.blocks) + 1)]
+        for bl in self.blocks:
+            if bl.immed_dom is not None:
+                child[self.blocks.index(bl.immed_dom)].append(bl)
+            else:
+                child[len(self.blocks)].append(bl)
+        return child
 
     def new_block_list(self, nodes: list[FlowBlock]) -> BlockList:
         new_list = BlockList(nodes)
