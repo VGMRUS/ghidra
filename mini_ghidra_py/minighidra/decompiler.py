@@ -6124,16 +6124,15 @@ class SemanticDecompiler:
             return lines
         if last.is_jump:
             if last.computed_targets:
-                targets = ", ".join(
-                    self._branch_target(target) for target in last.computed_targets
-                )
                 indirect = (
                     self._read_operand(state, decoded.operands[0], last)
                     if decoded.operands
                     else _var("computed_target", self.bits)
                 )
-                lines.append(f"/* computed jump to one of: {targets} */")
-                lines.append(f"goto *({self._render(indirect)});")
+                lines.append(f"switch ((uint32_t){self._render(indirect)}) {{")
+                for target in last.computed_targets:
+                    lines.append(f"  case {target:#x}: goto {self._branch_target(target)};")
+                lines.append("}")
             elif last.branch_target is not None:
                 target_function = self.analyzer.functions.get(last.branch_target)
                 if (
@@ -8661,6 +8660,13 @@ def _insert_bits(
         mask = _mask(width) << offset
         value = (int(old.value) & ~mask) | ((int(new.value) & _mask(width)) << offset)
         return _const(value & _mask(total_bits), total_bits)
+    if old.kind == "const" and int(old.value) == 0:
+        return _binary("shl", _zero_extend(new, total_bits), _const(offset, 8), total_bits)
+    if old.kind == "insert" and len(old.args) == 3:
+        older, older_new, older_offset = old.args
+        if older_offset.kind == "const" and int(older_offset.value) == offset and older_new.bits == width:
+            # Overwriting the exact same slice
+            return _Expr("insert", args=(older, new, _const(offset, 8)), bits=total_bits)
     return _Expr("insert", args=(old, new, _const(offset, 8)), bits=total_bits)
 
 
