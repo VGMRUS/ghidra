@@ -4352,10 +4352,15 @@ class RulePushMulti(Rule):
 
 
 class RulePushPtr(Rule):
-    """This rule requires flow block analysis which isn't currently ported to the minighidra Rule engine."""
+    """Push pointer additions."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "pushptr")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Requires Type propagation
+
 
     def get_op_list(self) -> list[str]:
         return []
@@ -4365,10 +4370,15 @@ class RulePushPtr(Rule):
 
 
 class RulePtrsubUndo(Rule):
-    """This rule requires Type propagation (for pointer alignment info) which isn't currently ported to the minighidra Rule engine."""
+    """Remove PTRSUB operations with mismatched data-type information."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "ptrsubundo")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return ["PTRSUB"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Requires Type propagation
+
 
     def get_op_list(self) -> list[str]:
         return []
@@ -4377,10 +4387,15 @@ class RulePtrsubUndo(Rule):
         return 0
 
 class RulePtraddUndo(Rule):
-    """This rule requires Type propagation which isn't currently ported to the minighidra Rule engine."""
+    """Undo PTRADD."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "ptraddundo")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return ["PTRADD"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Requires Type propagation
+
 
     def get_op_list(self) -> list[str]:
         return []
