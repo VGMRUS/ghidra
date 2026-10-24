@@ -41,6 +41,33 @@ class FlowBlock:
             return False
         return self.dominates(self.in_edges[i])
 
+    
+    def restricted_by_conditional(self, cond: 'FlowBlock') -> bool:
+        if len(self.in_edges) == 1:
+            return True
+        if self.immed_dom != cond:
+            return False
+        seen_cond = False
+        for in_block in self.in_edges:
+            if in_block == cond:
+                if seen_cond:
+                    return False
+                seen_cond = True
+                continue
+                
+            curr = in_block
+            must_fail = False
+            while curr != self:
+                if curr == cond:
+                    must_fail = True
+                    break
+                if curr is None:
+                    break
+                curr = curr.immed_dom
+            if must_fail:
+                return False
+        return True
+
     def get_type(self) -> str:
         return self.block_type
 
