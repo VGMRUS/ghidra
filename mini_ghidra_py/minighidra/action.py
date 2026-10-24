@@ -59,11 +59,8 @@ class ActionDatabase:
         from .blockaction import ActionBlockStructure, ActionFinalStructure, ActionConditionalConst, ActionSwitchNorm
 
         from .rule import (
-            ActionPool, RuleLessEqual, RuleNotDistribute, RuleZextSless, RuleBoolNegate, RuleDoubleShift, RuleIdentityEl, RuleSubCancel, RuleDoubleSub, RuleShift2Mult, RulePropagateCopy, Rule2Comp2Mult, RuleShiftAnd, RuleLess2Zero, RuleLessEqual2Zero, RuleSLess2Zero, RuleEqual2Constant, RuleTrivialBool, RuleEquality, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add,
-            RulePiece2Zext, RulePiece2Sext, RuleTermOrder, RuleBxor2NotEqual,
-            RuleAndOrLump, RuleOrCollapse, RuleAndMask, RuleLogicIdentity,
-            RuleDoubleLoad, RulePullsubMulti, RuleLessOne, RuleZextEliminate,
-            RuleSlessToLess
+            ActionPool,
+            RuleOrConsume, RuleNegateIdentity, RuleShiftBitops, RuleRightShiftAnd, RuleEquality, RuleIntLessEqualRewrite, RuleHighOrderAnd, RuleZextCommute, RuleZextShiftZext, RuleAndDistribute, RuleLessOne, RuleAndCommute, RuleAndPiece, RuleAndZext, RuleAndCompare, RuleDoubleArithShift, RuleConcatShift, RuleLeftRight, RuleShiftCompare, RuleShiftPiece, RuleZextEliminate, RuleSlessToLess, RuleZextSless, RuleBitUndistribute, RuleLogic2Bool, RuleNotDistribute, RuleBoolNegate, RuleSubCommute, RuleConcatCommute, RuleConcatZero, RuleConcatZext, RuleMultNegOne, Rule2Comp2Sub, RuleBooleanUndistribute, RuleBooleanDedup, RuleEqual2Zero, RuleSignShift, RuleTestSign, RuleSubZext, RuleDumptyHump, RuleHumptyOr, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RulePiece2Zext, RulePiece2Sext, RuleTermOrder, RuleBxor2NotEqual, RuleAndOrLump, RuleOrCollapse, RuleAndMask, RuleLogicIdentity, RuleDoubleLoad, RulePullsubMulti, RuleSub2Add, RuleTrivialBool, RuleLessEqual, RuleCondNegate, RuleDoubleShift, RuleIdentityEl, RuleSubCancel, RuleDoubleSub, RuleShift2Mult, RulePropagateCopy, Rule2Comp2Mult, RuleShiftAnd, RuleLess2Zero, RuleLessEqual2Zero, RuleEqual2Constant, RuleSLess2Zero
         )
 
         universal = ActionGroup("universal", "universal")
