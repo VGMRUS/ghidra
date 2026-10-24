@@ -59,7 +59,7 @@ class ActionDatabase:
         from .blockaction import ActionBlockStructure, ActionFinalStructure, ActionConditionalConst, ActionSwitchNorm
 
         from .rule import (
-            ActionPool, RuleLessEqual, RuleNotDistribute, RuleTrivialBool, RuleEquality, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add,
+            ActionPool, RuleLessEqual, RuleNotDistribute, RuleZextSless, RuleBoolNegate, RuleDoubleShift, RuleIdentityEl, RuleSubCancel, RuleDoubleSub, RuleShift2Mult, RulePropagateCopy, Rule2Comp2Mult, RuleShiftAnd, RuleLess2Zero, RuleLessEqual2Zero, RuleTrivialBool, RuleEquality, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add,
             RulePiece2Zext, RulePiece2Sext, RuleTermOrder, RuleBxor2NotEqual,
             RuleAndOrLump, RuleOrCollapse, RuleAndMask, RuleLogicIdentity,
             RuleDoubleLoad, RulePullsubMulti, RuleLessOne, RuleZextEliminate,
