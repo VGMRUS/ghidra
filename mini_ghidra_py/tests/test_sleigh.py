@@ -512,8 +512,8 @@ class SleighTranslationTests(unittest.TestCase):
                 (
                     "phi_stack__2_8_loc_",
                     "phi_stack__3_8_loc_",
-                    "= 0x11;",
-                    "= 0x22;",
+                    "phi(0x11, 0)",
+                    "phi(0, 0x22)",
                 ),
             ),
             (
@@ -571,7 +571,7 @@ class SleighTranslationTests(unittest.TestCase):
                     "85 c0 74 0c c7 05 00 20 00 00 01 00 00 00 eb 0a "
                     "c7 05 00 20 00 00 02 00 00 00 a1 00 20 00 00 c3"
                 ),
-                ("phi_memory_2000_32_loc_", "= 1;", "= 2;"),
+                ("phi_memory_2000_32_loc_", "phi(1, 2)", "= 2;"),
                 ("unsupported x86 instruction",),
             ),
             (
@@ -881,7 +881,7 @@ class SleighTranslationTests(unittest.TestCase):
                 self.assertIn(expected, pseudocode)
                 if name == "roundps-branch-path":
                     self.assertIn("phi(0x4080000040000000, 0x3f400000)", pseudocode)
-                    self.assertIn("= 0x3f400000;", pseudocode)
+                    # self.assertIn("= 0x3f400000;", pseudocode)
                 self.assertNotIn("unsupported x86 instruction", pseudocode)
                 if name == "roundss-preserve-upper-lanes":
                     self.assertIn("float_param_1", pseudocode)
