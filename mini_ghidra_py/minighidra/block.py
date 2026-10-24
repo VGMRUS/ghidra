@@ -9,6 +9,10 @@ class FlowBlock:
         self.out_edges: list[FlowBlock] = []
         self.out_edge_flags: dict[int, int] = {}
         self.flags = 0
+        self.immed_dom: 'FlowBlock' | None = None
+        self.mark: int = 0
+        self.visit_count: int = 0
+        self.index: int = 0
 
     def is_default_branch(self, i: int) -> bool:
         return self.out_edge_flags.get(i, 0) & 1 != 0
@@ -30,6 +34,12 @@ class FlowBlock:
                 return True
             subBlock = subBlock.immed_dom
         return False
+
+    
+    def is_back_edge_in(self, i: int) -> bool:
+        if i < 0 or i >= len(self.in_edges):
+            return False
+        return self.dominates(self.in_edges[i])
 
     def get_type(self) -> str:
         return self.block_type
@@ -142,6 +152,7 @@ class BlockGraph(FlowBlock):
             bb.name = f"block_{hex(b.start)}"
             self.blocks.append(bb)
             block_map[b.start] = bb
+            bb.index = len(self.blocks) - 1
             
         for b in blocks_data:
             bb = block_map[b.start]
@@ -169,7 +180,7 @@ class BlockGraph(FlowBlock):
             
         b.immed_dom = b
         for i in range(len(b.out_edges)):
-            b.get_out(i).immed_dom = b
+            b.out_edges[i].immed_dom = b
             
         changed = True
         new_idom = None
@@ -180,13 +191,13 @@ class BlockGraph(FlowBlock):
                 if b.immed_dom != postorder[-1]:
                     first_proc = -1
                     for j in range(len(b.in_edges)):
-                        new_idom = b.get_in(j)
+                        new_idom = b.in_edges[j]
                         if new_idom.immed_dom is not None:
                             first_proc = j
                             break
                     if first_proc != -1:
                         for j in range(first_proc+1, len(b.in_edges)):
-                            rho = b.get_in(j)
+                            rho = b.in_edges[j]
                             if rho.immed_dom is not None:
                                 finger1 = numnodes - self.blocks.index(rho)
                                 finger2 = numnodes - self.blocks.index(new_idom)

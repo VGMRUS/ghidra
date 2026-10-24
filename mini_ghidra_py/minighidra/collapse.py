@@ -2,6 +2,93 @@ from __future__ import annotations
 from typing import Any
 from .block import FlowBlock, BlockGraph
 
+
+class LoopBody:
+    def __init__(self, h: 'FlowBlock') -> None:
+        self.head = h
+        self.tails: list['FlowBlock'] = []
+        self.depth: int = 0
+        self.uniquecount: int = 0
+        self.exitblock: 'FlowBlock' | None = None
+        
+    def add_tail(self, bl: 'FlowBlock') -> None:
+        self.tails.append(bl)
+
+    
+    def find_base(self, body: list['FlowBlock']) -> None:
+        self.head.mark = 1
+        body.append(self.head)
+        for tail in self.tails:
+            if tail.mark == 0:
+                tail.mark = 1
+                body.append(tail)
+                
+        self.uniquecount = len(body)
+        i = 1
+        while i < len(body):
+            curblock = body[i]
+            i += 1
+            for k in range(len(curblock.in_edges)):
+                if curblock.is_goto_branch(k): # actually we need to check if the edge from parent is goto
+                    continue
+                # in minighidra we check if parent's out edge to curblock is goto
+                parent = curblock.in_edges[k]
+                if parent.mark == 1:
+                    continue
+                # simplified goto check: if any of parent's out edges targeting curblock are not goto, we trace
+                is_goto = True
+                for out_idx in range(len(parent.out_edges)):
+                    if parent.out_edges[out_idx] == curblock and not parent.is_goto_branch(out_idx):
+                        is_goto = False
+                        break
+                if is_goto:
+                    continue
+                    
+                parent.mark = 1
+                body.append(parent)
+                
+    
+    def find(looptop: 'FlowBlock', looporder: list['LoopBody']) -> 'LoopBody | None':
+        for lb in looporder:
+            if lb.head == looptop:
+                return lb
+        return None
+
+    def label_containments(self, body: list['FlowBlock'], looporder: list['LoopBody']) -> None:
+        containlist = []
+        for curblock in body:
+            if curblock != self.head:
+                subloop = LoopBody.find(curblock, looporder)
+                if subloop is not None:
+                    containlist.append(subloop)
+                    subloop.depth += 1
+                    
+        for lb in containlist:
+            if lb.immed_container is None or lb.immed_container.depth < self.depth:
+                lb.immed_container = self
+
+    def clear_marks(body: list['FlowBlock']) -> None:
+        for b in body:
+            b.mark = 0
+
+    def merge_identical_heads(looporder: list['LoopBody']) -> None:
+        if not looporder:
+            return
+        
+        i = 0
+        while i < len(looporder) - 1:
+            if looporder[i].head == looporder[i+1].head:
+                looporder[i].tails.extend(looporder[i+1].tails)
+                looporder.pop(i+1)
+            else:
+                i += 1
+                
+    def compare_ends(a: 'LoopBody', b: 'LoopBody') -> int:
+        if a.head.index != b.head.index:
+            return a.head.index - b.head.index
+        # comparing tails is slightly complex, skip strict sorting for now if identical head
+        return 0
+
 class CollapseStructure:
     """Recovers hierarchical control flow from flat blocks."""
 
@@ -25,8 +112,46 @@ class CollapseStructure:
                 break
             isolated_count = self._collapse_internal(targetbl)
 
+    
+    def label_loops(self, looporder: list[LoopBody]) -> None:
+        self.loopbody = [] # Keep track of all bodies
+        
+        for bl in self.graph.blocks:
+            for j in range(len(bl.in_edges)):
+                if bl.is_back_edge_in(j):
+                    loopbottom = bl.in_edges[j]
+                    curbody = LoopBody(bl)
+                    curbody.add_tail(loopbottom)
+                    self.loopbody.append(curbody)
+                    looporder.append(curbody)
+                    
+        # sorting by head index to merge later
+        looporder.sort(key=lambda x: x.head.index)
+
     def order_loop_bodies(self) -> None:
-        pass
+        self.graph.calc_forward_dominator([self.graph.blocks[0]] if self.graph.blocks else [])
+        
+        looporder = []
+        self.label_loops(looporder)
+        if self.loopbody:
+            oldsize = len(looporder)
+            LoopBody.merge_identical_heads(looporder)
+            
+            # Remove subsumed bodies
+            if oldsize != len(looporder):
+                self.loopbody = [lb for lb in self.loopbody if lb in looporder]
+                
+            # Rest of loop ordering relies on deep graph logic, omitted for now
+            
+            for lb in self.loopbody:
+                body = []
+                lb.find_base(body)
+                lb.label_containments(body, looporder)
+                LoopBody.clear_marks(body)
+                
+            self.loopbody.sort(key=lambda lb: lb.depth, reverse=True)
+
+        
 
     def collapse_conditions(self) -> None:
         change = True
