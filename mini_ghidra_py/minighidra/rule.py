@@ -2863,6 +2863,40 @@ class RuleSubNormal(Rule):
         data.op_set_opcode(op, shiftop.opcode)
         return 1
 
+
+class RuleCarryElim(Rule):
+    """Simplify INT_CARRY when adding a constant: V carry c => c <= V (where c is 2s-comp)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "carryelim")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_CARRY"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        off = int(cnode.name, 16)
+        if off == 0:
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+            
+        mask = (1 << cnode.size_bits) - 1
+        off = (-off) & mask
+        
+        data.op_set_opcode(op, "INT_LESSEQUAL")
+        data.op_set_input(op, op.inputs[0], 1)
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(off), data.nodes[op.inputs[0]].size_bits, "const"))
+        data.op_set_input(op, cnew, 0)
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
