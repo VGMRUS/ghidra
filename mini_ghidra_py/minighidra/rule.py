@@ -4174,6 +4174,265 @@ class RulePtraddUndo(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
+
+class RulePiecePathology(Rule):
+    """This rule relies heavily on indirects, call specifications, and consumption which are not ported into minighidra's AST rules."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "piecepathology")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePieceStructure(Rule):
+    """This rule requires Type propagation (for struct layout info) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "piecestructure")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePopcountBoolXor(Rule):
+    """Simplify POPCOUNT of boolean results combined into INT_XOR."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "popcountboolxor")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return ["POPCOUNT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # minighidra lacks full POPCOUNT semantics and NZMask tracking of bit positions through AST natively
+        return 0
+
+
+class RulePtrArith(Rule):
+    """This rule requires Type propagation (for pointer types) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrarith")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePtrFlow(Rule):
+    """This rule requires Type propagation (for pointer types) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrflow")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleRangeMeld(Rule):
+    """This rule requires CircleRange math/interval analysis which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "rangemeld")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSegment(Rule):
+    """This rule requires SegmentOp userops support which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "segment")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSelectCse(Rule):
+    """This rule requires CSE Hash calculation which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "selectcse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleCollectTerms(Rule):
+    """This rule requires TermOrder analysis which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "collectterms")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleEarlyRemoval(Rule):
+    """This is mostly handled by ActionDeadCode rather than a Rule in minighidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "earlyremoval")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleFloatCast(Rule):
+    """Simplify FLOAT_FLOAT2FLOAT and FLOAT_TRUNC applied to FLOAT_FLOAT2FLOAT or FLOAT_INT2FLOAT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatcast")
+
+    def get_op_list(self) -> list[str]:
+        return ["FLOAT_FLOAT2FLOAT", "FLOAT_TRUNC"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        vn1 = op.inputs[0]
+        castop = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not castop or len(castop.inputs) != 1: return 0
+        
+        opc2 = castop.opcode
+        if opc2 not in ("FLOAT_FLOAT2FLOAT", "FLOAT_INT2FLOAT"): return 0
+        
+        opc1 = op.opcode
+        vn2 = castop.inputs[0]
+        
+        insize1 = data.nodes[vn1].size_bits
+        insize2 = data.nodes[vn2].size_bits
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        if opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
+            if insize1 > outsize:
+                data.op_set_input(op, vn2, 0)
+                if outsize == insize2:
+                    data.op_set_opcode(op, "COPY")
+                return 1
+            elif insize2 < insize1:
+                data.op_set_input(op, vn2, 0)
+                return 1
+        elif opc2 == "FLOAT_INT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
+            data.op_set_input(op, vn2, 0)
+            data.op_set_opcode(op, "FLOAT_INT2FLOAT")
+            return 1
+        elif opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_TRUNC":
+            data.op_set_input(op, vn2, 0)
+            return 1
+        return 0
+
+
+class RuleIgnoreNan(Rule):
+    """This rule requires floating-point comparisons tracking and data configuration which isn't ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ignorenan")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleUnsigned2Float(Rule):
+    """Simplify conversion: T = int2float((X >> 1) | X & 1); T + T => int2float( zext(X) )"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "unsigned2float")
+
+    def get_op_list(self) -> list[str]:
+        return ["FLOAT_INT2FLOAT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        invn = op.inputs[0]
+        orop = next((cand for cand in data.ops if cand.output == invn), None)
+        if not orop or orop.opcode != "INT_OR" or len(orop.inputs) != 2: return 0
+        
+        shiftop = None
+        andop = None
+        for i in range(2):
+            cnd = next((cand for cand in data.ops if cand.output == orop.inputs[i]), None)
+            if cnd and cnd.opcode == "INT_RIGHT":
+                shiftop = cnd
+                andop = next((cand for cand in data.ops if cand.output == orop.inputs[1 - i]), None)
+                break
+                
+        if not shiftop: return 0
+        
+        cshift = data.nodes[shiftop.inputs[1]]
+        if cshift.kind != "const" or int(cshift.name, 16) != 1: return 0
+        
+        basevn = shiftop.inputs[0]
+        if not andop: return 0
+        
+        if andop.opcode == "INT_ZEXT" and len(andop.inputs) == 1:
+            andop = next((cand for cand in data.ops if cand.output == andop.inputs[0]), None)
+            
+        if not andop or andop.opcode != "INT_AND" or len(andop.inputs) != 2: return 0
+        
+        cand_const = data.nodes[andop.inputs[1]]
+        if cand_const.kind != "const" or int(cand_const.name, 16) != 1: return 0
+        
+        vn = andop.inputs[0]
+        if basevn != vn:
+            subop = next((cand for cand in data.ops if cand.output == vn), None)
+            if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return 0
+            csub = data.nodes[subop.inputs[1]]
+            if csub.kind != "const" or int(csub.name, 16) != 0: return 0
+            vn = subop.inputs[0]
+            if basevn != vn: return 0
+            
+        outvn = op.output
+        if outvn is None: return 0
+        
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        for addop in descendants:
+            if addop.opcode != "FLOAT_ADD" or len(addop.inputs) != 2: continue
+            if addop.inputs[0] != outvn or addop.inputs[1] != outvn: continue
+            
+            preferred_zext_size = 8 if data.nodes[basevn].size_bits == 4 * 8 else data.nodes[basevn].size_bits * 2
+            # Simulating TypeOpFloatInt2Float::preferredZextSize approximation
+            
+            zextop = PcodeOp(addop.addr, "INT_ZEXT", len(data.nodes), (basevn,))
+            zextout = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zextout, None, preferred_zext_size, "unique"))
+            zextop.output = zextout
+            data.ops.append(zextop)
+            
+            data.op_set_opcode(addop, "FLOAT_INT2FLOAT")
+            data.op_remove_input(addop, 1)
+            data.op_set_input(addop, zextout, 0)
+            return 1
+            
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
