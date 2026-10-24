@@ -4084,6 +4084,96 @@ class RulePtrsubCharConstant(Rule):
         # Relies heavily on full typing + StringManager which we do not have.
         return 0
 
+
+class RuleRightShiftSub(Rule):
+    """This rule is commented out in original Ghidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "rightshiftsub")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleConditionalMove(Rule):
+    """This rule requires block structure analysis in rules which isn't currently implemented."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "conditionalmove")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return ["MULTIEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePullsubIndirect(Rule):
+    """This rule relies heavily on alias analysis and indirects which are not fully structured in minighidra yet"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pullsubindirect")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePushMulti(Rule):
+    """This rule requires flow block analysis which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pushmulti")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePushPtr(Rule):
+    """This rule requires flow block analysis which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pushptr")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RulePtrsubUndo(Rule):
+    """This rule requires Type propagation (for pointer alignment info) which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrsubundo")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RulePtraddUndo(Rule):
+    """This rule requires Type propagation which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptraddundo")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
