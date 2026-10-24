@@ -23,6 +23,14 @@ class FlowBlock:
         self.out_edge_flags[i] = self.out_edge_flags.get(i, 0) | 2
 
 
+    
+    def dominates(self, subBlock: 'FlowBlock') -> bool:
+        while subBlock is not None:
+            if subBlock == self:
+                return True
+            subBlock = subBlock.immed_dom
+        return False
+
     def get_type(self) -> str:
         return self.block_type
 
@@ -140,6 +148,69 @@ class BlockGraph(FlowBlock):
             for succ in b.successors:
                 if succ in block_map:
                     bb.add_out_edge(block_map[succ])
+
+    
+    def calc_forward_dominator(self, rootlist: list['FlowBlock']) -> None:
+        if not self.blocks: return
+        numnodes = len(self.blocks) - 1
+        postorder = [None] * len(self.blocks)
+        for i in range(len(self.blocks)):
+            self.blocks[i].immed_dom = None
+            postorder[numnodes - i] = self.blocks[i]
+            
+        virtualroot = None
+        if len(rootlist) > 1:
+            # We don't implement create_virtual_root fully for now, assume single root
+            pass
+            
+        b = postorder[-1]
+        if len(b.in_edges) != 0:
+            pass # virtual root not fully implemented
+            
+        b.immed_dom = b
+        for i in range(len(b.out_edges)):
+            b.get_out(i).immed_dom = b
+            
+        changed = True
+        new_idom = None
+        while changed:
+            changed = False
+            for i in range(len(postorder)-2, -1, -1):
+                b = postorder[i]
+                if b.immed_dom != postorder[-1]:
+                    first_proc = -1
+                    for j in range(len(b.in_edges)):
+                        new_idom = b.get_in(j)
+                        if new_idom.immed_dom is not None:
+                            first_proc = j
+                            break
+                    if first_proc != -1:
+                        for j in range(first_proc+1, len(b.in_edges)):
+                            rho = b.get_in(j)
+                            if rho.immed_dom is not None:
+                                finger1 = numnodes - self.blocks.index(rho)
+                                finger2 = numnodes - self.blocks.index(new_idom)
+                                while finger1 != finger2:
+                                    while finger1 < finger2:
+                                        finger1 = numnodes - self.blocks.index(postorder[finger1].immed_dom)
+                                    while finger2 < finger1:
+                                        finger2 = numnodes - self.blocks.index(postorder[finger2].immed_dom)
+                                new_idom = postorder[finger1]
+                        
+                        if b.immed_dom != new_idom:
+                            b.immed_dom = new_idom
+                            changed = True
+
+        postorder[-1].immed_dom = None
+
+    def build_dom_tree(self) -> list[list['FlowBlock']]:
+        child = [[] for _ in range(len(self.blocks) + 1)]
+        for bl in self.blocks:
+            if bl.immed_dom is not None:
+                child[self.blocks.index(bl.immed_dom)].append(bl)
+            else:
+                child[len(self.blocks)].append(bl)
+        return child
 
     def new_block_list(self, nodes: list[FlowBlock]) -> BlockList:
         new_list = BlockList(nodes)
