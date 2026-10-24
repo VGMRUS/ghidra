@@ -754,3 +754,283 @@ class RuleSlessToLess(Rule):
             return 1
         return 0
 
+
+class RuleZextSless(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "zextsless")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SLESS", "INT_SLESSEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2:
+            return 0
+            
+        zext_idx = -1
+        const_idx = -1
+        
+        for i in range(2):
+            inode = data.nodes[op.inputs[i]]
+            if inode.kind == "const":
+                const_idx = i
+                
+        if const_idx == -1:
+            return 0
+            
+        zext_idx = 1 - const_idx
+        
+        def_op = None
+        for cand_op in data.ops:
+            if cand_op.output == op.inputs[zext_idx]:
+                def_op = cand_op
+                break
+                
+        if def_op is None or def_op.opcode != "INT_ZEXT":
+            return 0
+            
+        in_node = data.nodes[def_op.inputs[0]]
+        small_size = in_node.size_bits
+        cnode = data.nodes[op.inputs[const_idx]]
+        val = int(cnode.name, 16)
+        
+        # Is zero extension unnecessary, sign bit must also be 0
+        if (val >> (small_size - 1)) != 0:
+            return 0
+            
+        new_cnode = len(data.nodes)
+        data.nodes.append(PcodeVarnode(new_cnode, hex(val), small_size, "const"))
+        
+        new_opcode = "INT_LESS" if op.opcode == "INT_SLESS" else "INT_LESSEQUAL"
+        data.op_set_opcode(op, new_opcode)
+        data.op_set_input(op, def_op.inputs[0], zext_idx)
+        data.op_set_input(op, new_cnode, const_idx)
+        return 1
+
+class RuleCondNegate(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "condnegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["CBRANCH"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2:
+            return 0
+            
+        # Is it a boolean flip?
+        # In minighidra, we don't naturally encode boolean flip in the instruction 
+        # structure directly on CBRANCH in the same way. The Sleigh translator handles flip during translation.
+        # But if we did have it, we could negate the condition.
+        return 0
+        
+class RuleBoolNegate(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "boolnegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_NEGATE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        
+        def_op = None
+        for cand_op in data.ops:
+            if cand_op.output == op.inputs[0]:
+                def_op = cand_op
+                break
+                
+        if def_op is None: return 0
+        
+        # Uses > 1 prevents this
+        uses = sum(1 for o in data.ops if op.inputs[0] in o.inputs)
+        if uses > 1: return 0
+        
+        new_opc = None
+        if def_op.opcode == "BOOL_NEGATE":
+            new_opc = "COPY"
+        elif def_op.opcode == "INT_EQUAL":
+            new_opc = "INT_NOTEQUAL"
+        elif def_op.opcode == "INT_NOTEQUAL":
+            new_opc = "INT_EQUAL"
+        elif def_op.opcode == "INT_LESS":
+            new_opc = "INT_LESSEQUAL"
+            # Swap operands
+        elif def_op.opcode == "INT_LESSEQUAL":
+            new_opc = "INT_LESS"
+            # Swap operands
+        elif def_op.opcode == "INT_SLESS":
+            new_opc = "INT_SLESSEQUAL"
+            # Swap operands
+        elif def_op.opcode == "INT_SLESSEQUAL":
+            new_opc = "INT_SLESS"
+            # Swap operands
+            
+        if new_opc:
+            if def_op.opcode in ["INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL"]:
+                # Swap inputs
+                tmp = def_op.inputs[0]
+                data.op_set_input(def_op, def_op.inputs[1], 0)
+                data.op_set_input(def_op, tmp, 1)
+            data.op_set_opcode(def_op, new_opc)
+            data.op_set_opcode(op, "COPY")
+            return 1
+            
+        return 0
+
+class RuleDoubleShift(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "doubleshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_LEFT", "INT_RIGHT", "INT_MULT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        node2 = data.nodes[op.inputs[1]]
+        if node2.kind != "const": return 0
+        
+        # Get defining operation
+        def_op = None
+        for cand_op in data.ops:
+            if cand_op.output == op.inputs[0]:
+                def_op = cand_op
+                break
+                
+        if def_op is None: return 0
+        
+        opc2 = def_op.opcode
+        if opc2 not in ["INT_LEFT", "INT_RIGHT", "INT_MULT"]: return 0
+        
+        if len(def_op.inputs) != 2: return 0
+        node1 = data.nodes[def_op.inputs[1]]
+        if node1.kind != "const": return 0
+        
+        opc1 = op.opcode
+        
+        def is_power_of_two(n):
+            return (n != 0) and (n & (n-1) == 0)
+            
+        def leastsigbit_set(n):
+            if n == 0: return -1
+            return (n & -n).bit_length() - 1
+
+        val1 = int(node2.name, 16)
+        if opc1 == "INT_MULT":
+            if not is_power_of_two(val1): return 0
+            sa1 = leastsigbit_set(val1)
+            opc1 = "INT_LEFT"
+        else:
+            sa1 = val1
+            
+        val2 = int(node1.name, 16)
+        if opc2 == "INT_MULT":
+            if not is_power_of_two(val2): return 0
+            sa2 = leastsigbit_set(val2)
+            opc2 = "INT_LEFT"
+        else:
+            sa2 = val2
+            
+        if opc1 == opc2: # Shifts in the same direction
+            size = data.nodes[op.inputs[0]].size_bits
+            if sa1 + sa2 < size:
+                new_cnode = len(data.nodes)
+                data.nodes.append(PcodeVarnode(new_cnode, hex(sa1 + sa2), node1.size_bits, "const"))
+                data.op_set_opcode(op, opc1)
+                data.op_set_input(op, def_op.inputs[0], 0)
+                data.op_set_input(op, new_cnode, 1)
+                return 1
+        return 0
+
+class RuleIdentityEl(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "identityel")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ADD", "INT_XOR", "INT_OR", "BOOL_XOR", "BOOL_OR", "INT_MULT", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        node = data.nodes[op.inputs[1]]
+        if node.kind != "const": return 0
+        
+        val = int(node.name, 16)
+        if val == 0 and op.opcode != "INT_MULT":
+            data.op_set_opcode(op, "COPY")
+            data.op_remove_input(op, 1)
+            return 1
+            
+        if op.opcode == "INT_MULT":
+            if val == 1:
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                return 1
+            if val == 0:
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 0)
+                return 1
+                
+        return 0
+
+class RuleSubCancel(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subcancel")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        node = data.nodes[op.inputs[1]]
+        if node.kind != "const": return 0
+        
+        offset = int(node.name, 16)
+        out_node = data.nodes[op.output]
+        out_size = out_node.size_bits
+        
+        def_op = None
+        for cand_op in data.ops:
+            if cand_op.output == op.inputs[0]:
+                def_op = cand_op
+                break
+                
+        if def_op is None: return 0
+        
+        opc = def_op.opcode
+        if opc not in ["INT_ZEXT", "INT_SEXT", "INT_AND"]: return 0
+        
+        if opc == "INT_AND":
+            if offset == 0:
+                node_and_c = data.nodes[def_op.inputs[1]]
+                if node_and_c.kind == "const":
+                    mask = int(node_and_c.name, 16)
+                    if mask == ((1 << out_size) - 1):
+                        data.op_set_input(op, def_op.inputs[0], 0)
+                        return 1
+            return 0
+            
+        far_in_node = data.nodes[def_op.inputs[0]]
+        far_in_size = far_in_node.size_bits
+        
+        if offset == 0:
+            if far_in_size == out_size:
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, def_op.inputs[0], 0)
+                return 1
+            if out_size < far_in_size:
+                data.op_set_input(op, def_op.inputs[0], 0)
+                return 1
+            if out_size > far_in_size:
+                data.op_set_opcode(op, opc)
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, def_op.inputs[0], 0)
+                return 1
+        elif offset >= far_in_size // 8:
+            if opc == "INT_ZEXT":
+                cnode = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnode, hex(0), out_size, "const"))
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, cnode, 0)
+                return 1
+        return 0
