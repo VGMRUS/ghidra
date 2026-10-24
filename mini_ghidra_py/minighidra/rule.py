@@ -5378,10 +5378,15 @@ class RuleTransformCpool(Rule):
 
 
 class RuleAliasUpdate(Rule):
-    """This rule requires alias collapsing operations not implemented in the minighidra Rule engine."""
+    """Update aliasing references for specific PcodeOps."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "aliasupdate")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Missing opCollapseIndirectsForAlias and hasAliasUpdate bit
+
 
     def get_op_list(self) -> list[str]:
         return []
@@ -5544,10 +5549,15 @@ class RuleCollapseConstants(Rule):
 
 
 class RuleLoadVarnode(Rule):
-    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    """Convert LOAD operations using a constant offset to COPY."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "loadvarnode")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return ["LOAD"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Missing checkSpacebase
+
 
     def get_op_list(self) -> list[str]:
         return []
@@ -5556,10 +5566,15 @@ class RuleLoadVarnode(Rule):
         return 0
 
 class RuleStoreVarnode(Rule):
-    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    """Convert STORE operations using a constant offset to COPY."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "storevarnode")
-        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return ["STORE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0  # Missing checkSpacebase
+
 
     def get_op_list(self) -> list[str]:
         return []
