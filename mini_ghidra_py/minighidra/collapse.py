@@ -78,9 +78,6 @@ class CollapseStructure:
                     if self.rule_block_if_else(bl):
                         change = True
                         continue
-                    if self.rule_block_if_no_exit(bl):
-                        change = True
-                        continue
                     if self.rule_block_while_do(bl):
                         change = True
                         continue
@@ -88,6 +85,9 @@ class CollapseStructure:
                         change = True
                         continue
                     if self.rule_block_inf_loop(bl):
+                        change = True
+                        continue
+                    if self.rule_block_if_no_exit(bl):
                         change = True
                         continue
                     if self.rule_block_switch(bl):
@@ -173,7 +173,76 @@ class CollapseStructure:
         if bl.out_edges[0] != bl: return False
         self.graph.new_block_inf_loop(bl)
         return True
-    def rule_block_if_no_exit(self, bl: FlowBlock) -> bool: return False
+
+    def rule_block_if_no_exit(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        if bl.block_type == "switch": return False
+        if bl.out_edges[0] == bl: return False
+        if bl.out_edges[1] == bl: return False
+        
+        for i in range(2):
+            clauseblock = bl.out_edges[i]
+            if len(clauseblock.in_edges) != 1: continue
+            if len(clauseblock.out_edges) != 0: continue
+            if clauseblock.block_type == "switch": continue
+            
+            if i == 0:
+                otherblock = bl.out_edges[1]
+                if len(otherblock.in_edges) == 1 and len(otherblock.out_edges) == 0 and otherblock.block_type != "switch":
+                    self.graph.new_block_if_no_exit(bl, clauseblock, otherblock)
+                    return True
+            
+            self.graph.new_block_if_no_exit(bl, clauseblock)
+            return True
+            
+        return False
+
+    def rule_block_switch(self, bl: FlowBlock) -> bool:
+        if bl.block_type != "switch_out" and len(bl.out_edges) <= 2: return False
+        
+        exitblock = None
+        sizeout = len(bl.out_edges)
+        
+        for i in range(sizeout):
+            curbl = bl.out_edges[i]
+            if curbl == bl:
+                exitblock = curbl
+                break
+            if len(curbl.out_edges) > 1:
+                exitblock = curbl
+                break
+            if len(curbl.in_edges) > 1:
+                exitblock = curbl
+                break
+                
+        if exitblock is None:
+            for i in range(sizeout):
+                curbl = bl.out_edges[i]
+                if curbl.block_type == "switch": return False
+                if len(curbl.out_edges) == 1:
+                    if exitblock is not None:
+                        if exitblock != curbl.out_edges[0]: return False
+                    else:
+                        exitblock = curbl.out_edges[0]
+        else:
+            for i in range(sizeout):
+                curbl = bl.out_edges[i]
+                if curbl == exitblock: continue
+                if len(curbl.in_edges) > 1: return False
+                if len(curbl.out_edges) > 1: return False
+                if len(curbl.out_edges) == 1:
+                    if curbl.out_edges[0] != exitblock: return False
+                if curbl.block_type == "switch": return False
+                
+        cases = [bl]
+        for i in range(sizeout):
+            curbl = bl.out_edges[i]
+            if curbl == exitblock: continue
+            cases.append(curbl)
+            
+        self.graph.new_block_switch(cases, exitblock is not None)
+        return True
+
     
     def rule_block_while_do(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
@@ -192,7 +261,7 @@ class CollapseStructure:
 
     def rule_block_do_while(self, bl: FlowBlock) -> bool: return False
     def rule_block_inf_loop(self, bl: FlowBlock) -> bool: return False
-    def rule_block_switch(self, bl: FlowBlock) -> bool: return False
+
 
     def get_change_count(self) -> int:
         return self.change_count

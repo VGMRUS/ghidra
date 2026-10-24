@@ -55,73 +55,173 @@ class BlockDoWhile(FlowBlock):
         super().__init__("dowhile")
         self.body_block = body_block
 
+class BlockInfLoop(FlowBlock):
+    def __init__(self, body_block: FlowBlock) -> None:
+        super().__init__("infloop")
+        self.body_block = body_block
+
+class BlockSwitch(FlowBlock):
+    def __init__(self, cases: list[FlowBlock], has_exit: bool) -> None:
+        super().__init__("switch")
+        self.cases = cases
+        self.has_exit = has_exit
+
+class BlockIfNoExit(FlowBlock):
+    def __init__(self, cond_block: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> None:
+        super().__init__("ifnoexit")
+        self.cond_block = cond_block
+        self.true_block = true_block
+        self.false_block = false_block
+
+class BlockInfLoop(FlowBlock):
+    def __init__(self, body_block: FlowBlock) -> None:
+        super().__init__("infloop")
+        self.body_block = body_block
+
+class BlockSwitch(FlowBlock):
+    def __init__(self, cases: list[FlowBlock], has_exit: bool) -> None:
+        super().__init__("switch")
+        self.cases = cases
+        self.has_exit = has_exit
+
+class BlockIfNoExit(FlowBlock):
+    def __init__(self, cond_block: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> None:
+        super().__init__("ifnoexit")
+        self.cond_block = cond_block
+        self.true_block = true_block
+        self.false_block = false_block
+
+class BlockInfLoop(FlowBlock):
+    def __init__(self, body_block: FlowBlock) -> None:
+        super().__init__("infloop")
+        self.body_block = body_block
+
+class BlockSwitch(FlowBlock):
+    def __init__(self, cases: list[FlowBlock], has_exit: bool) -> None:
+        super().__init__("switch")
+        self.cases = cases
+        self.has_exit = has_exit
+
+class BlockIfNoExit(FlowBlock):
+    def __init__(self, cond_block: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> None:
+        super().__init__("ifnoexit")
+        self.cond_block = cond_block
+        self.true_block = true_block
+        self.false_block = false_block
+
 class BlockGraph(FlowBlock):
     def __init__(self) -> None:
         super().__init__("graph")
         self.blocks: list[FlowBlock] = []
 
-    def build_copy(self, basic_blocks: list[Any]) -> None:
-        pass
+    def build_copy(self, blocks_data: list[Any]) -> None:
+        """Build the BlockGraph from the raw SSA blocks."""
+        self.blocks = []
+        block_map = {}
+        for b in blocks_data:
+            bb = BlockBasic(b.start)
+            bb.name = f"block_{hex(b.start)}"
+            self.blocks.append(bb)
+            block_map[b.start] = bb
+            
+        for b in blocks_data:
+            bb = block_map[b.start]
+            for succ in b.successors:
+                if succ in block_map:
+                    bb.add_out_edge(block_map[succ])
 
-    def replace_block(self, original: FlowBlock, new_block: FlowBlock) -> None:
-        """Splice new_block into the graph replacing original, maintaining edges."""
-        idx = self.blocks.index(original)
-        self.blocks[idx] = new_block
-        
-        # We need to remap inputs that were pointing to original
-        for in_block in original.in_edges:
-            try:
-                out_idx = in_block.out_edges.index(original)
-                in_block.out_edges[out_idx] = new_block
-                new_block.in_edges.append(in_block)
-            except ValueError:
-                pass
-        
-        # Outputs that original was pointing to
-        for out_block in original.out_edges:
-            try:
-                in_idx = out_block.in_edges.index(original)
-                out_block.in_edges[in_idx] = new_block
-                new_block.out_edges.append(out_block)
-            except ValueError:
-                pass
-                
-        # Sub-blocks are removed from graph.blocks since they are now encapsulated
-        
     def new_block_list(self, nodes: list[FlowBlock]) -> BlockList:
         new_list = BlockList(nodes)
-        self.replace_block(nodes[0], new_list)
-        # For the internal nodes, we remap the final output edge to be the new_list's output
-        last_block = nodes[-1]
-        for out in last_block.out_edges:
-            try:
-                idx = out.in_edges.index(last_block)
-                out.in_edges[idx] = new_list
-                if new_list not in new_list.out_edges:
-                    new_list.out_edges.append(out)
-            except ValueError:
-                pass
-                
+        
+        first = nodes[0]
+        last = nodes[-1]
+        
+        # Inputs to first -> new_list
+        for in_block in list(first.in_edges):
+            idx = in_block.out_edges.index(first)
+            in_block.out_edges[idx] = new_list
+            new_list.in_edges.append(in_block)
+        first.in_edges.clear()
+        
+        # Outputs from last -> new_list
+        for out_block in list(last.out_edges):
+            idx = last.out_edges.index(out_block)
+            last.out_edges[idx] = new_list  # Wait, list.out_edges doesn't matter for last, we need to clear it and add to new_list
+            # Actually better:
+            out_idx = out_block.in_edges.index(last)
+            out_block.in_edges[out_idx] = new_list
+            new_list.out_edges.append(out_block)
+        last.out_edges.clear()
+        
+        # Update blocks
+        idx = self.blocks.index(first)
+        self.blocks[idx] = new_list
         for node in nodes[1:]:
             if node in self.blocks:
                 self.blocks.remove(node)
+                
         return new_list
 
     def new_block_if(self, cond: FlowBlock, body: FlowBlock) -> BlockIf:
         new_if = BlockIf(cond, body)
-        self.replace_block(cond, new_if)
         
+        # Inputs to cond -> new_if
+        for in_block in list(cond.in_edges):
+            idx = in_block.out_edges.index(cond)
+            in_block.out_edges[idx] = new_if
+            new_if.in_edges.append(in_block)
+        cond.in_edges.clear()
+        
+        # Outputs:
+        # cond points to body and outblock
+        # body points to outblock
+        outblock = body.out_edges[0]
+        
+        # Remove cond -> outblock
+        cond.out_edges.remove(outblock)
+        outblock.in_edges.remove(cond)
+        
+        # Remove body -> outblock
+        body.out_edges.remove(outblock)
+        outblock.in_edges.remove(body)
+        
+        # new_if -> outblock
+        new_if.out_edges.append(outblock)
+        outblock.in_edges.append(new_if)
+        
+        idx = self.blocks.index(cond)
+        self.blocks[idx] = new_if
         if body in self.blocks:
             self.blocks.remove(body)
             
-        # The output of body (and the false branch of cond) now becomes the output of new_if
-        # This is a simplification.
         return new_if
 
     def new_block_while_do(self, cond: FlowBlock, body: FlowBlock) -> BlockWhileDo:
         new_loop = BlockWhileDo(cond, body)
-        self.replace_block(cond, new_loop)
         
+        # Inputs to cond (excluding body) -> new_loop
+        for in_block in list(cond.in_edges):
+            if in_block == body:
+                continue
+            idx = in_block.out_edges.index(cond)
+            in_block.out_edges[idx] = new_loop
+            new_loop.in_edges.append(in_block)
+            cond.in_edges.remove(in_block)
+            
+        # Outputs: cond has outblock
+        # One of cond's out_edges is body, the other is outblock
+        outblock = cond.out_edges[0] if cond.out_edges[0] != body else cond.out_edges[1]
+        
+        # Remove cond -> outblock
+        cond.out_edges.remove(outblock)
+        outblock.in_edges.remove(cond)
+        
+        # new_loop -> outblock
+        new_loop.out_edges.append(outblock)
+        outblock.in_edges.append(new_loop)
+        
+        idx = self.blocks.index(cond)
+        self.blocks[idx] = new_loop
         if body in self.blocks:
             self.blocks.remove(body)
             
@@ -129,8 +229,26 @@ class BlockGraph(FlowBlock):
 
     def new_block_if_else(self, cond: FlowBlock, true_body: FlowBlock, false_body: FlowBlock) -> BlockIfElse:
         new_if = BlockIfElse(cond, true_body, false_body)
-        self.replace_block(cond, new_if)
         
+        for in_block in list(cond.in_edges):
+            idx = in_block.out_edges.index(cond)
+            in_block.out_edges[idx] = new_if
+            new_if.in_edges.append(in_block)
+        cond.in_edges.clear()
+        
+        outblock = true_body.out_edges[0]
+        
+        true_body.out_edges.remove(outblock)
+        outblock.in_edges.remove(true_body)
+        
+        false_body.out_edges.remove(outblock)
+        outblock.in_edges.remove(false_body)
+        
+        new_if.out_edges.append(outblock)
+        outblock.in_edges.append(new_if)
+        
+        idx = self.blocks.index(cond)
+        self.blocks[idx] = new_if
         if true_body in self.blocks: self.blocks.remove(true_body)
         if false_body in self.blocks: self.blocks.remove(false_body)
             
@@ -138,13 +256,92 @@ class BlockGraph(FlowBlock):
 
     def new_block_do_while(self, body: FlowBlock) -> BlockDoWhile:
         new_loop = BlockDoWhile(body)
-        self.replace_block(body, new_loop)
+        
+        for in_block in list(body.in_edges):
+            if in_block == body: continue
+            idx = in_block.out_edges.index(body)
+            in_block.out_edges[idx] = new_loop
+            new_loop.in_edges.append(in_block)
+            body.in_edges.remove(in_block)
+            
+        outblock = body.out_edges[0] if body.out_edges[0] != body else body.out_edges[1]
+        
+        body.out_edges.remove(outblock)
+        outblock.in_edges.remove(body)
+        
+        new_loop.out_edges.append(outblock)
+        outblock.in_edges.append(new_loop)
+        
+        idx = self.blocks.index(body)
+        self.blocks[idx] = new_loop
         return new_loop
 
     def new_block_inf_loop(self, body: FlowBlock) -> FlowBlock:
-        # Placeholder for BlockInfLoop since it wasn't defined
-        # We can just reuse BlockDoWhile with True condition
-        new_loop = BlockDoWhile(body)
-        self.replace_block(body, new_loop)
+        new_loop = BlockInfLoop(body)
+        
+        for in_block in list(body.in_edges):
+            if in_block == body: continue
+            idx = in_block.out_edges.index(body)
+            in_block.out_edges[idx] = new_loop
+            new_loop.in_edges.append(in_block)
+            body.in_edges.remove(in_block)
+            
+        idx = self.blocks.index(body)
+        self.blocks[idx] = new_loop
         return new_loop
 
+    def new_block_switch(self, cases: list[FlowBlock], has_exit: bool) -> FlowBlock:
+        new_switch = BlockSwitch(cases, has_exit)
+        cond = cases[0]
+        
+        for in_block in list(cond.in_edges):
+            idx = in_block.out_edges.index(cond)
+            in_block.out_edges[idx] = new_switch
+            new_switch.in_edges.append(in_block)
+        cond.in_edges.clear()
+        
+        exit_block = None
+        for c in cases:
+            for out in list(c.out_edges):
+                if out not in cases:
+                    exit_block = out
+                    c.out_edges.remove(out)
+                    out.in_edges.remove(c)
+        
+        if exit_block:
+            new_switch.out_edges.append(exit_block)
+            exit_block.in_edges.append(new_switch)
+            
+        idx = self.blocks.index(cond)
+        self.blocks[idx] = new_switch
+        for c in cases[1:]:
+            if c in self.blocks:
+                self.blocks.remove(c)
+        return new_switch
+        
+    def new_block_if_no_exit(self, cond: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> FlowBlock:
+        new_if = BlockIfNoExit(cond, true_block, false_block)
+        
+        for in_block in list(cond.in_edges):
+            idx = in_block.out_edges.index(cond)
+            in_block.out_edges[idx] = new_if
+            new_if.in_edges.append(in_block)
+        cond.in_edges.clear()
+        
+        # If there is a false block, it has no exit. If there isn't, the cond's other out edge is the outblock.
+        outblock = None
+        if false_block is None:
+            outblock = cond.out_edges[1] if cond.out_edges[0] == true_block else cond.out_edges[0]
+            cond.out_edges.remove(outblock)
+            outblock.in_edges.remove(cond)
+            new_if.out_edges.append(outblock)
+            outblock.in_edges.append(new_if)
+        else:
+            # both true and false block have no exits. new_if has no out edges
+            pass
+            
+        idx = self.blocks.index(cond)
+        self.blocks[idx] = new_if
+        if true_block in self.blocks: self.blocks.remove(true_block)
+        if false_block and false_block in self.blocks: self.blocks.remove(false_block)
+        return new_if
