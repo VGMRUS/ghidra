@@ -5765,7 +5765,7 @@ class SemanticDecompiler:
         return f"phi_{safe}_loc_{block_start:X}"
 
     def _structure_control_flow(self, body: list[str]) -> list[str]:
-        from .block import BlockGraph, FlowBlock, BlockBasic, BlockList, BlockIf, BlockIfElse, BlockWhileDo, BlockDoWhile, BlockInfLoop, BlockSwitch, BlockIfNoExit
+        from .block import BlockGraph, FlowBlock, BlockBasic, BlockList, BlockIf, BlockIfElse, BlockWhileDo, BlockDoWhile, BlockInfLoop, BlockSwitch, BlockIfNoExit, BlockCondition
         from .collapse import CollapseStructure
         import re
 
@@ -5859,6 +5859,12 @@ class SemanticDecompiler:
                 res.append("while (true) {")
                 res.extend(indent(render_block(b.body_block)))
                 res.append("}")
+                return res
+            elif isinstance(b, BlockCondition):
+                cond1, stmts1 = extract_condition(render_block(b.cond1))
+                cond2, stmts2 = extract_condition(render_block(b.cond2))
+                res = stmts1 + stmts2
+                res.append(f"if (({cond1}) {b.op} ({cond2})) goto placeholder;")
                 return res
             elif isinstance(b, BlockIfNoExit):
                 cond, body_stmts = extract_condition(render_block(b.cond_block))

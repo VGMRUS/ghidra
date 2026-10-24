@@ -29,7 +29,13 @@ class CollapseStructure:
         pass
 
     def collapse_conditions(self) -> None:
-        pass
+        change = True
+        while change:
+            change = False
+            for i in range(len(self.graph.blocks)):
+                if i < len(self.graph.blocks) and self.rule_block_or(self.graph.blocks[i]):
+                    change = True
+                    break
 
     def select_goto(self) -> FlowBlock | None:
         return None
@@ -66,13 +72,13 @@ class CollapseStructure:
                     if self.rule_block_goto(bl):
                         change = True
                         continue
+                    if self.rule_block_or(bl):
+                        change = True
+                        continue
                     if self.rule_block_cat(bl):
                         change = True
                         continue
                     if self.rule_block_proper_if(bl):
-                        change = True
-                        continue
-                    if self.rule_block_proper_else(bl):
                         change = True
                         continue
                     if self.rule_block_if_else(bl):
@@ -107,6 +113,40 @@ class CollapseStructure:
 
     def rule_block_goto(self, bl: FlowBlock) -> bool:
         return False
+
+    def rule_block_or(self, bl: FlowBlock) -> bool:
+        if len(bl.out_edges) != 2: return False
+        
+        for i in range(2):
+            orblock = bl.out_edges[i]
+            if orblock == bl: continue
+            if len(orblock.in_edges) != 1: continue
+            if len(orblock.out_edges) != 2: continue
+            
+            clauseblock = bl.out_edges[1 - i]
+            if clauseblock == bl: continue
+            if clauseblock == orblock: continue
+            
+            # Check if clauses match
+            match = False
+            for j in range(2):
+                if clauseblock == orblock.out_edges[j]:
+                    match = True
+                    break
+                    
+            if not match: continue
+            if orblock.out_edges[1 - j] == bl: continue
+            
+            # We found a matching condition
+            # op is || if we jump to clauseblock on true? Let's just use "&&" or "||" based on which branch
+            # We don't have isGotoOut so we simplify
+            # Let's say if false out goes to next condition, it's &&
+            # For minighidra, we just use "&&" for now, rendering will refine it.
+            self.graph.new_block_condition(bl, orblock, "&&")
+            return True
+        return False
+
+
         
     def rule_block_cat(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 1: return False
@@ -142,7 +182,6 @@ class CollapseStructure:
             
         return False
 
-    def rule_block_proper_else(self, bl: FlowBlock) -> bool: return False
     def rule_block_if_else(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
         tc = bl.out_edges[0]
@@ -259,8 +298,6 @@ class CollapseStructure:
             
         return False
 
-    def rule_block_do_while(self, bl: FlowBlock) -> bool: return False
-    def rule_block_inf_loop(self, bl: FlowBlock) -> bool: return False
 
 
     def get_change_count(self) -> int:
