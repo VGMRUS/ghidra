@@ -4567,17 +4567,36 @@ class RuleAliasUpdate(Rule):
         return 0
 
 class RuleMultiCollapse(Rule):
-    """This rule relies heavily on functional equality tracking over MULTIEQUAL graphs which isn't currently ported to minighidra."""
+    """Collapses MULTIEQUAL operations where all branches produce the same varnode."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "multicollapse")
-        self.disabled = True
 
     def get_op_list(self) -> list[str]:
-        return []
+        return ["MULTIEQUAL"]
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
+        if not op.inputs: return 0
+        
+        # We only match absolute identical inputs or loop-backs to the output itself
+        # Functional equality (value equivalence via identical AST expressions) is skipped for now.
+        defcopyr = None
+        for i, in_vn in enumerate(op.inputs):
+            # Skip loop-backs
+            if in_vn == op.output:
+                continue
+            if defcopyr is None:
+                defcopyr = in_vn
+            elif in_vn != defcopyr:
+                return 0
+                
+        if defcopyr is None:
+            return 0
+            
+        data.op_set_opcode(op, "COPY")
+        while len(op.inputs) > 1:
+            data.op_remove_input(op, 1)
+        data.op_set_input(op, defcopyr, 0)
+        return 1
 
 class RuleCollapseConstants(Rule):
     """This rule requires expression collapse and Constant tracking which isn't currently ported to minighidra Rule engine."""
@@ -4696,16 +4715,6 @@ class RuleShiftLess(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
-class RuleSignForm2(Rule):
-    """Requires complex sign extraction evaluation logic not built."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "signform2")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
 

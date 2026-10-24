@@ -133,6 +133,7 @@ class ActionParamShiftStop(Action):
         return 0
 
 
+
 class ActionFuncLink(Action):
     """Prepares input and output parameters for function calls based on active tracking."""
     def __init__(self, group: str) -> None:
@@ -140,7 +141,23 @@ class ActionFuncLink(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        if not hasattr(data, "call_specs"): return 0
+        for call_spec in data.call_specs:
+            input_locked = call_spec.is_input_active
+            varargs = getattr(call_spec, 'is_dotdotdot', False)
+            
+            if not input_locked or varargs:
+                call_spec.set_input_active()
+                
+            if input_locked:
+                pass
+                
+            if call_spec.op.output is not None:
+                pass
+            else:
+                call_spec.set_output_active()
+                
+        return self.count
 
 class ActionFuncLinkOutOnly(Action):
     """Prepares only output parameters for function calls based on active tracking."""
@@ -149,8 +166,11 @@ class ActionFuncLinkOutOnly(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
-
+        if not hasattr(data, "call_specs"): return 0
+        for call_spec in data.call_specs:
+            if call_spec.op.output is None:
+                call_spec.set_output_active()
+        return self.count
 
 class ActionNonzeroMask(Action):
     """Triggers calculation of non-zero masks for all variables.
