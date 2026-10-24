@@ -1947,6 +1947,181 @@ class RuleBooleanDedup(Rule):
         data.op_set_input(op, newop.output, 1)
         return 1
 
+
+class RuleEqual2Zero(Rule):
+    """Simplify INT_EQUAL/INT_NOTEQUAL with zero: A + -B == 0 => A == B"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "equal2zero")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        
+        vn, addvn = op.inputs[0], op.inputs[1]
+        cnode = data.nodes[vn]
+        if cnode.kind == "const" and int(cnode.name, 16) == 0:
+            pass
+        else:
+            addvn, vn = vn, addvn
+            cnode = data.nodes[vn]
+            if cnode.kind != "const" or int(cnode.name, 16) != 0: return 0
+            
+        addop = None
+        for cand in data.ops:
+            if cand.output == addvn:
+                addop = cand
+                break
+                
+        if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
+        
+        # Check all uses of addvn are boolean (which in minighidra just means comparisons)
+        for cand in data.ops:
+            if addvn in cand.inputs:
+                if cand.opcode not in ("INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL"):
+                    return 0
+                    
+        in0, in1 = addop.inputs[0], addop.inputs[1]
+        in1node = data.nodes[in1]
+        
+        if in1node.kind == "const":
+            val = int(in1node.name, 16)
+            unneg_val = (-val) & ((1 << in1node.size_bits) - 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(unneg_val), in1node.size_bits, "const"))
+            
+            data.op_set_input(op, in0, 0)
+            data.op_set_input(op, cnew, 1)
+            return 1
+        else:
+            def is_negate_mult(v):
+                defop = next((cand for cand in data.ops if cand.output == v), None)
+                if defop and defop.opcode == "INT_MULT" and len(defop.inputs) == 2:
+                    cn = data.nodes[defop.inputs[1]]
+                    if cn.kind == "const" and int(cn.name, 16) == ((1 << cn.size_bits) - 1):
+                        return defop.inputs[0]
+                return None
+                
+            unneg0 = is_negate_mult(in0)
+            unneg1 = is_negate_mult(in1)
+            
+            if unneg0 is not None:
+                data.op_set_input(op, in1, 0)
+                data.op_set_input(op, unneg0, 1)
+                return 1
+            elif unneg1 is not None:
+                data.op_set_input(op, in0, 0)
+                data.op_set_input(op, unneg1, 1)
+                return 1
+                
+        return 0
+
+
+class RuleSignShift(Rule):
+    """Convert V >> 31 to (V s>> 31) * -1 when used in ADD, MULT, EQUAL, NOTEQUAL"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_RIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        inVn = op.inputs[0]
+        sz = data.nodes[inVn].size_bits
+        if int(cnode.name, 16) != 8 * sz - 1: return 0
+        
+        doConversion = False
+        outVn = op.output
+        if outVn is None: return 0
+        
+        for cand in data.ops:
+            if outVn in cand.inputs:
+                if cand.opcode in ("INT_EQUAL", "INT_NOTEQUAL"):
+                    if data.nodes[cand.inputs[1]].kind == "const":
+                        doConversion = True
+                        break
+                elif cand.opcode in ("INT_ADD", "INT_MULT"):
+                    doConversion = True
+                    break
+                    
+        if not doConversion: return 0
+        
+        shiftOp = PcodeOp(op.addr, "INT_SRIGHT", len(data.nodes), (inVn, op.inputs[1]))
+        data.nodes.append(PcodeVarnode(shiftOp.output, None, sz, "unique"))
+        data.ops.append(shiftOp)
+        
+        data.op_set_input(op, shiftOp.output, 0)
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex((1 << sz) - 1), sz, "const"))
+        data.op_set_input(op, cnew, 1)
+        data.op_set_opcode(op, "INT_MULT")
+        return 1
+
+class RuleTestSign(Rule):
+    """Convert sign-bit test to signed comparison: (V s>> 31) != 0 => V s< 0"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "testsign")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        inVn = op.inputs[0]
+        sz = data.nodes[inVn].size_bits
+        if int(cnode.name, 16) != 8 * sz - 1: return 0
+        
+        outVn = op.output
+        if outVn is None: return 0
+        
+        compareOps = []
+        for cand in data.ops:
+            if cand.opcode in ("INT_EQUAL", "INT_NOTEQUAL") and cand.inputs[0] == outVn:
+                if data.nodes[cand.inputs[1]].kind == "const":
+                    compareOps.append(cand)
+                    
+        if not compareOps: return 0
+        
+        resultCode = 0
+        for compareOp in compareOps:
+            compSize = data.nodes[compareOp.inputs[0]].size_bits
+            offset = int(data.nodes[compareOp.inputs[1]].name, 16)
+            
+            sgn = 0
+            if offset == 0:
+                sgn = 1
+            elif offset == ((1 << compSize) - 1):
+                sgn = -1
+            else:
+                continue
+                
+            if compareOp.opcode == "INT_NOTEQUAL":
+                sgn = -sgn
+                
+            zeroVn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zeroVn, hex(0), sz, "const"))
+            
+            if sgn == 1:
+                data.op_set_input(compareOp, inVn, 1)
+                data.op_set_input(compareOp, zeroVn, 0)
+                data.op_set_opcode(compareOp, "INT_SLESSEQUAL")
+            else:
+                data.op_set_input(compareOp, inVn, 0)
+                data.op_set_input(compareOp, zeroVn, 1)
+                data.op_set_opcode(compareOp, "INT_SLESS")
+                
+            resultCode = 1
+            
+        return resultCode
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
