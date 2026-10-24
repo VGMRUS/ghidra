@@ -4433,6 +4433,166 @@ class RuleUnsigned2Float(Rule):
             
         return 0
 
+
+class RuleInt2FloatCollapse(Rule):
+    """This rule requires block structure flow conditions which aren't properly ported into the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "int2floatcollapse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleFuncPtrEncoding(Rule):
+    """This rule relies on funcptr_align from architecture info, which isn't currently surfaced in minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "funcptrencoding")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleLzcountShiftBool(Rule):
+    """Simplify LZCOUNT of boolean results."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lzcountshiftbool")
+
+    def get_op_list(self) -> list[str]:
+        return ["LZCOUNT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        outVn = op.output
+        if outVn is None: return 0
+        
+        max_return = 8 * data.nodes[op.inputs[0]].size_bits
+        if bin(max_return).count('1') != 1: return 0
+        
+        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        for baseOp in descendants:
+            if baseOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
+            
+            vn1 = data.nodes[baseOp.inputs[1]]
+            if vn1.kind != "const": continue
+            
+            shift = int(vn1.name, 16)
+            if (max_return >> shift) == 1:
+                newOp = PcodeOp(baseOp.addr, "INT_EQUAL", len(data.nodes), (op.inputs[0], len(data.nodes)))
+                b = len(data.nodes)
+                data.nodes.append(PcodeVarnode(b, "0x0", data.nodes[op.inputs[0]].size_bits, "const"))
+                newOp.inputs = (op.inputs[0], b)
+                
+                eqResVn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(eqResVn, None, 1, "unique"))
+                newOp.output = eqResVn
+                data.ops.append(newOp)
+                
+                data.op_remove_input(baseOp, 1)
+                
+                if data.nodes[baseOp.output].size_bits == 1:
+                    data.op_set_opcode(baseOp, "COPY")
+                else:
+                    data.op_set_opcode(baseOp, "INT_ZEXT")
+                data.op_set_input(baseOp, eqResVn, 0)
+                return 1
+        return 0
+
+
+class RuleFloatSign(Rule):
+    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatsign")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleFloatSignCleanup(Rule):
+    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatsigncleanup")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleFloatRange(Rule):
+    """Simplify FLOAT_LESS and FLOAT_EQUAL into FLOAT_LESSEQUAL, etc."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "floatrange")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_AND", "BOOL_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1 = op.inputs[0]
+        vn2 = op.inputs[1]
+        
+        cmp1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        cmp2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not cmp1 or not cmp2: return 0
+        
+        opccmp1 = cmp1.opcode
+        if opccmp1 not in ("FLOAT_LESS", "FLOAT_LESSEQUAL"):
+            cmp1, cmp2 = cmp2, cmp1
+            opccmp1 = cmp1.opcode
+            
+        resultopc = "COPY"
+        if opccmp1 == "FLOAT_LESS":
+            if cmp2.opcode == "FLOAT_EQUAL" and op.opcode == "BOOL_OR":
+                resultopc = "FLOAT_LESSEQUAL"
+        elif opccmp1 == "FLOAT_LESSEQUAL":
+            if cmp2.opcode == "FLOAT_NOTEQUAL" and op.opcode == "BOOL_AND":
+                resultopc = "FLOAT_LESS"
+                
+        if resultopc == "COPY": return 0
+        
+        slot1 = 0
+        nvn1 = cmp1.inputs[slot1]
+        if data.nodes[nvn1].kind == "const":
+            slot1 = 1
+            nvn1 = cmp1.inputs[slot1]
+            if data.nodes[nvn1].kind == "const": return 0
+            
+        cvn1 = cmp1.inputs[1 - slot1]
+        
+        slot2 = 0
+        if nvn1 != cmp2.inputs[0]:
+            slot2 = 1
+            if nvn1 != cmp2.inputs[1]: return 0
+            
+        matchvn = cmp2.inputs[1 - slot2]
+        
+        if data.nodes[cvn1].kind == "const":
+            if data.nodes[matchvn].kind != "const": return 0
+            if int(data.nodes[matchvn].name, 16) != int(data.nodes[cvn1].name, 16): return 0
+        elif cvn1 != matchvn:
+            return 0
+            
+        data.op_set_opcode(op, resultopc)
+        data.op_set_input(op, nvn1, slot1)
+        if data.nodes[cvn1].kind == "const":
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, data.nodes[cvn1].name, data.nodes[cvn1].size_bits, "const"))
+            data.op_set_input(op, cnew, 1 - slot1)
+        else:
+            data.op_set_input(op, cvn1, 1 - slot1)
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
