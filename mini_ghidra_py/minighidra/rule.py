@@ -4696,16 +4696,6 @@ class RuleShiftLess(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
-class RuleSignForm2(Rule):
-    """Requires complex sign extraction evaluation logic not built."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "signform2")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
 
