@@ -2897,6 +2897,145 @@ class RuleCarryElim(Rule):
         data.op_set_input(op, cnew, 0)
         return 1
 
+
+class RuleScarry(Rule):
+    """Simplify signed comparisons using INT_SCARRY and constants"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "scarry")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SCARRY"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        avn = data.nodes[op.inputs[0]]
+        bvn = data.nodes[op.inputs[1]]
+        
+        if (avn.kind == "const" and int(avn.name, 16) == 0) or (bvn.kind == "const" and int(bvn.name, 16) == 0):
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+            
+        return 0
+
+
+class RuleSborrow(Rule):
+    """Simplify signed comparisons using INT_SBORROW"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "sborrow")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SBORROW"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        bvn = data.nodes[op.inputs[1]]
+        if bvn.kind == "const" and int(bvn.name, 16) == 0:
+            data.op_remove_input(op, 1)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", 1, "const"))
+            data.op_set_input(op, cnew, 0)
+            data.op_set_opcode(op, "COPY")
+            return 1
+        return 0
+
+
+class RuleDivChain(Rule):
+    """Simplify chained divisions: (V / c) / d => V / (c * d)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "divchain")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_DIV", "INT_SDIV"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        opc2 = op.opcode
+        cnode2 = data.nodes[op.inputs[1]]
+        if cnode2.kind != "const": return 0
+        
+        vn = op.inputs[0]
+        divOp = next((cand for cand in data.ops if cand.output == vn), None)
+        if not divOp or len(divOp.inputs) != 2: return 0
+        
+        opc1 = divOp.opcode
+        if opc1 != opc2 and (opc2 != "INT_DIV" or opc1 != "INT_RIGHT"): return 0
+        
+        cnode1 = data.nodes[divOp.inputs[1]]
+        if cnode1.kind != "const": return 0
+        
+        count = sum(1 for cand in data.ops if vn in cand.inputs)
+        if count != 1: return 0
+        
+        val2 = int(cnode2.name, 16)
+        if opc1 == opc2:
+            val1 = int(cnode1.name, 16)
+        else:
+            sa = int(cnode1.name, 16)
+            val1 = 1 << sa
+            
+        baseVn = divOp.inputs[0]
+        sz = data.nodes[vn].size_bits
+        mask = (1 << sz) - 1
+        
+        resval = (val1 * val2) & mask
+        if resval == 0: return 0
+        
+        def signbit_negative(v, size):
+            return (v & (1 << (size - 1))) != 0
+            
+        def mostsigbit_set(v):
+            if v == 0: return -1
+            return v.bit_length() - 1
+            
+        abs1 = val1
+        if signbit_negative(val1, sz): abs1 = (~val1 + 1) & mask
+        abs2 = val2
+        if signbit_negative(val2, sz): abs2 = (~val2 + 1) & mask
+        
+        bitcount = mostsigbit_set(abs1) + mostsigbit_set(abs2) + 2
+        if opc2 == "INT_DIV" and bitcount > sz: return 0
+        if opc2 == "INT_SDIV" and bitcount > sz - 2: return 0
+        
+        data.op_set_input(op, baseVn, 0)
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(resval), sz, "const"))
+        data.op_set_input(op, cnew, 1)
+        return 1
+
+
+class RuleSignForm(Rule):
+    """Normalize sign extraction: sub(sext(V), c) => V s>> 31"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signform")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        sextout = op.inputs[0]
+        sextop = next((cand for cand in data.ops if cand.output == sextout), None)
+        if not sextop or sextop.opcode != "INT_SEXT" or len(sextop.inputs) != 1: return 0
+        
+        a = sextop.inputs[0]
+        if data.nodes[a].size_bits != data.nodes[op.output].size_bits: return 0
+        
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        c = int(cnode.name, 16)
+        
+        if c * 8 < data.nodes[a].size_bits: return 0
+        
+        data.op_set_input(op, a, 0)
+        n = data.nodes[a].size_bits - 1
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(n), 4 * 8, "const"))
+        data.op_set_input(op, cnew, 1)
+        data.op_set_opcode(op, "INT_SRIGHT")
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
