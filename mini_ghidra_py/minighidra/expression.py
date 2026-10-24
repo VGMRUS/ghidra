@@ -180,3 +180,84 @@ class AddExpression:
             return True
             
         return False
+
+def functional_equality_level(vn1_id: int, vn2_id: int, res1: list[int | None], res2: list[int | None], data) -> int:
+    """Check if two varnodes are functionally equal (have identical defining ops).
+    Returns:
+       0 - fully functionally equal
+       1 - functionally equal except for one differing input (stored in res1[0], res2[0])
+      -1 - not functionally equal
+    """
+    if vn1_id == vn2_id: return 0
+    if data.is_constant(vn1_id) and data.is_constant(vn2_id):
+        if data.get_constant_value(vn1_id) == data.get_constant_value(vn2_id):
+            return 0
+        return -1
+    
+    op1 = data.get_def(vn1_id)
+    op2 = data.get_def(vn2_id)
+    if op1 is None or op2 is None: return -1
+    if op1.opcode != op2.opcode: return -1
+    
+    # Don't try to functionally equate loads, stores, calls, etc. easily right now.
+    if op1.opcode in ("LOAD", "STORE", "CALL", "CALLIND", "CALLOTHER", "BRANCH", "CBRANCH", "BRANCHIND"):
+        return -1
+        
+    if len(op1.inputs) != len(op2.inputs): return -1
+    num = len(op1.inputs)
+    
+    # PTRADD has a 3rd input (element size), which must be identical.
+    if op1.opcode == "PTRADD":
+        if num == 3:
+            sz1 = data.get_constant_value(op1.inputs[2]) if data.is_constant(op1.inputs[2]) else None
+            sz2 = data.get_constant_value(op2.inputs[2]) if data.is_constant(op2.inputs[2]) else None
+            if sz1 is None or sz1 != sz2: return -1
+            num = 2
+            
+    r1 = list(op1.inputs[:num])
+    r2 = list(op2.inputs[:num])
+    
+    def func_eq_0(v1, v2):
+        if v1 == v2: return 0
+        if data.is_constant(v1) and data.is_constant(v2):
+            if data.get_constant_value(v1) == data.get_constant_value(v2):
+                return 0
+        return -1
+
+    if num == 1:
+        if func_eq_0(r1[0], r2[0]) == 0: return 0
+        res1[0] = r1[0]
+        res2[0] = r2[0]
+        return 1
+        
+    if num == 2:
+        eq0 = func_eq_0(r1[0], r2[0])
+        eq1 = func_eq_0(r1[1], r2[1])
+        if eq0 == 0 and eq1 == 0:
+            return 0
+        if eq0 == 0:
+            res1[0] = r1[1]
+            res2[0] = r2[1]
+            return 1
+        if eq1 == 0:
+            res1[0] = r1[0]
+            res2[0] = r2[0]
+            return 1
+            
+        # Try commutative swap if supported
+        is_commutative = op1.opcode in ("INT_ADD", "INT_MULT", "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL", "INT_NOTEQUAL", "FLOAT_ADD", "FLOAT_MULT", "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "BOOL_AND", "BOOL_OR", "BOOL_XOR")
+        if is_commutative:
+            eq0_swap = func_eq_0(r1[0], r2[1])
+            eq1_swap = func_eq_0(r1[1], r2[0])
+            if eq0_swap == 0 and eq1_swap == 0:
+                return 0
+            if eq0_swap == 0:
+                res1[0] = r1[1]
+                res2[0] = r2[0]
+                return 1
+            if eq1_swap == 0:
+                res1[0] = r1[0]
+                res2[0] = r2[1]
+                return 1
+                
+    return -1
