@@ -2743,6 +2743,17 @@ class PcodeLikeGraph:
             pass
         return new_op
 
+    def is_boolean_value(self, vn_id: int) -> bool:
+        node = self.nodes[vn_id]
+        if node.kind == "const":
+            val = int(node.name, 16)
+            return val == 0 or val == 1
+        if node.size_bits == 1:
+            return True
+        # Further checks in original ghidra look for boolean producing ops
+        # In minighidra, we just use size == 1
+        return False
+
     def op_destroy(self, op: PcodeOp) -> None:
         self.clear_nzmask_cache()
         # PcodeOp uses slots via dataclass
