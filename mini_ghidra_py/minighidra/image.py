@@ -266,6 +266,15 @@ class BinaryImage:
     def executable_sections(self):
         return [section for section in self.sections if section.executable and section.data]
 
+    def read_memory(self, address: int, size: int) -> bytes:
+        section = self.section_at(address, file_backed=True)
+        if section is None:
+            raise ValueError(f"Address {address:#x} is not mapped.")
+        offset = address - section.start
+        if offset + size > len(section.data):
+            raise ValueError(f"Read out of bounds at {address:#x}")
+        return bytes(section.data[offset:offset+size])
+
     def section_at(self, address: int, *, file_backed: bool = False):
         for section in self.sections:
             if section.contains(address, file_backed=file_backed):

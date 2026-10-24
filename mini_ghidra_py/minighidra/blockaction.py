@@ -170,21 +170,26 @@ class ActionSwitchNorm(Action):
         analyzer = getattr(data, 'analyzer', None)
         if not analyzer:
             return 0
-        # In minighidra we don't have explicit JumpTable objects like Ghidra C++.
-        # Computed jumps are managed via analyzer._resolve_computed_jumps().
-        # We simulate the normalization of switch branches via structural resets.
-        for block in list(data.blocks):
-            if not block.is_switch_out:
-                continue
-            # Logic for fold_in_guards and match_model goes here in full implementation
-            # For now we just reset structure when switch outputs change.
-            if hasattr(data, 'structure'):
-                data.structure.clear()
-                count += 1
+            
+        try:
+            from .jumptable import JumpTable
+        except ImportError:
+            return 0
+
+        for op in data.ops:
+            if op.opcode == "BRANCHIND":
+                jt = JumpTable(data, op)
+                if jt.recover_model(analyzer):
+                    jt.build_addresses(analyzer)
+                    if jt.is_labelled():
+                        # We recovered the switch target addresses natively!
+                        for addr in jt.addresses:
+                            analyzer._record_xref(op.address, addr, "switch")
+                        if hasattr(data, 'structure'):
+                            data.structure.clear()
+                        count += 1
+                        
         return count
-
-
-
 
 class ActionStructureTransform(Action):
     """Finalizes structural transformation passes over the graph.
