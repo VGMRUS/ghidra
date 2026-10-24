@@ -381,6 +381,32 @@ class Analyzer:
                     continue
                 self._record_xref(instruction.address, target, "scalar")
 
+    def _disassemble_from(self, address: int) -> None:
+        """Disassemble starting from address to fix linear sweep desyncs."""
+        section = self.image.section_at(address, file_backed=True)
+        if section is None or not section.executable:
+            return
+        offset = address - section.start
+        if offset < 0 or offset >= len(section.data):
+            return
+        
+        # Disassemble a small chunk and add to instructions until we resync
+        chunk = section.data[offset:offset + 128]
+        try:
+            decoded = self._md.disasm(chunk, address)
+            for raw_instruction in decoded:
+                if not raw_instruction.id:
+                    continue
+                # If we hit an existing instruction, we assume we've resynced
+                if raw_instruction.address in self.instructions:
+                    break
+                instruction = self._make_instruction(raw_instruction)
+                self.instructions[instruction.address] = instruction
+                self.instruction_addresses.append(instruction.address)
+        except Exception:
+            pass
+        self.instruction_addresses.sort()
+
     def _discover_address_tables(
         self, minimum_entries: int = 3, max_entries: int = 512
     ) -> None:
@@ -400,15 +426,13 @@ class Analyzer:
                 *instruction.scalar_references,
             ):
                 section = self.image.section_at(target, file_backed=True)
-                if section is not None and not section.executable:
+                if section is not None:
                     candidates.add(target)
 
         accepted_ranges: list[tuple[int, int]] = []
         for address in sorted(candidates):
             section = self.image.section_at(address, file_backed=True)
-            if section is None or section.executable:
-                continue
-            if any(start <= address < end for start, end in accepted_ranges):
+            if section is None:
                 continue
 
             offset = address - section.start
@@ -420,6 +444,10 @@ class Analyzer:
                     break
                 target = int.from_bytes(section.data[entry_offset:entry_end], "little")
                 target_section = self.image.section_at(target, file_backed=True)
+                
+                if target not in self.instructions:
+                    self._disassemble_from(target)
+
                 if (
                     target not in self.instructions
                     or target_section is None

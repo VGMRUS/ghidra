@@ -347,6 +347,29 @@ class RuleAndMask(Rule):
             
         return 0
 
+class RuleLessOne(Rule):
+    """Simplify x < 1 => x == 0, and x <= 0 => x == 0."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lessone")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("INT_LESS", "INT_LESSEQUAL")
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        if not data.is_constant(op.inputs[1]): return 0
+        
+        val = data.get_constant_value(op.inputs[1])
+        if op.opcode == "INT_LESS" and val != 1: return 0
+        if op.opcode == "INT_LESSEQUAL" and val != 0: return 0
+        
+        data.op_set_opcode(op, "INT_EQUAL")
+        if val != 0:
+            sz = data.nodes[op.inputs[1]].size_bits
+            const_vn = data.new_constant(sz, 0)
+            data.op_set_input(op, const_vn, 1)
+        return 1
+
 class RuleLogicIdentity(Rule):
     """Simplify V & (~V) => 0, V | (~V) => -1, V ^ (~V) => -1."""
     def __init__(self, group: str) -> None:
@@ -510,4 +533,73 @@ class RuleSub2Add(Rule):
         op = data.op_set_opcode(op, "INT_ADD")
         data.op_set_input(op, const_vn, 1)
         return 1
+
+class RuleZextEliminate(Rule):
+    """Simplify ZEXT(V) == C => V == C if C fits in V."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "zexteliminate")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return (
+            "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", 
+            "INT_SLESS", "INT_SLESSEQUAL"
+        )
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        in0 = op.inputs[0]
+        in1 = op.inputs[1]
+        
+        zext_slot = -1
+        other_slot = -1
+        
+        def_op0 = data.get_def(in0)
+        def_op1 = data.get_def(in1)
+        
+        if def_op1 and def_op1.opcode == "INT_ZEXT":
+            zext_slot = 1
+            other_slot = 0
+            zext_op = def_op1
+        elif def_op0 and def_op0.opcode == "INT_ZEXT":
+            zext_slot = 0
+            other_slot = 1
+            zext_op = def_op0
+        else:
+            return 0
+            
+        other_vn = op.inputs[other_slot]
+        if not data.is_constant(other_vn): return 0
+        
+        small_size = data.nodes[zext_op.inputs[0]].size_bits
+        val = data.get_constant_value(other_vn)
+        
+        # Check if constant fits in small_size
+        if (val >> small_size) == 0:
+            new_vn = data.new_constant(small_size, val)
+            op = data.op_set_input(op, zext_op.inputs[0], zext_slot)
+            op = data.op_set_input(op, new_vn, other_slot)
+            return 1
+            
+        return 0
+
+class RuleSlessToLess(Rule):
+    """Convert INT_SLESS to INT_LESS when comparing positive values."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "slesstoless")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("INT_SLESS", "INT_SLESSEQUAL")
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        sz0 = data.nodes[op.inputs[0]].size_bits
+        mask0 = data.get_nzmask(op.inputs[0])
+        mask1 = data.get_nzmask(op.inputs[1])
+        
+        sign_bit = 1 << (sz0 - 1)
+        if (mask0 & sign_bit) == 0 and (mask1 & sign_bit) == 0:
+            new_opcode = "INT_LESS" if op.opcode == "INT_SLESS" else "INT_LESSEQUAL"
+            data.op_set_opcode(op, new_opcode)
+            return 1
+        return 0
 
