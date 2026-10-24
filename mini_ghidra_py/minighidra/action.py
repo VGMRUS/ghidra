@@ -84,21 +84,7 @@ class ActionDeindirect(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         return 0
 
-class ActionDeterminedBranch(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "determinedbranch")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionDoNothing(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "donothing")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 class ActionDominantCopy(Action):
     """This action is currently stubbed/disabled in the Python port."""
@@ -172,13 +158,6 @@ class ActionLaneDivide(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         return 0
 
-class ActionLateDoNothing(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "latedonothing")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 class ActionLikelyTrash(Action):
     """This action is currently stubbed/disabled in the Python port."""
@@ -220,13 +199,6 @@ class ActionMergeMultiEntry(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         return 0
 
-class ActionMultiCse(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "multicse")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 class ActionNodeJoin(Action):
     """This action is currently stubbed/disabled in the Python port."""
@@ -300,13 +272,6 @@ class ActionPreferComplement(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         return 0
 
-class ActionRedundBranch(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "redundbranch")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 class ActionRestructureVarnode(Action):
     """This action is currently stubbed/disabled in the Python port."""
