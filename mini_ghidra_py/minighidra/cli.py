@@ -739,8 +739,7 @@ class Console:
         for function in functions:
             decompiler = SemanticDecompiler(self.analyzer)
             try:
-                high_func = decompiler.decompile(function)
-                code = high_func.print_c()
+                code = decompiler.decompile(function)
             except Exception as e:
                 code = f"/* Error al decompilar {function.name}: {e} */"
             lines.append(code)
