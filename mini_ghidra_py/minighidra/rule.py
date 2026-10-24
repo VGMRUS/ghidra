@@ -4606,6 +4606,134 @@ class RuleTransformCpool(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
+
+class RuleAliasUpdate(Rule):
+    """This rule requires alias collapsing operations not implemented in the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "aliasupdate")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleMultiCollapse(Rule):
+    """This rule relies heavily on functional equality tracking over MULTIEQUAL graphs which isn't currently ported to minighidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "multicollapse")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleCollapseConstants(Rule):
+    """This rule requires expression collapse and Constant tracking which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "collapseconstants")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleIntLessEqual(Rule):
+    """This rule requires replaceLessequal from Funcdata which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "intlessequal")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleLoadVarnode(Rule):
+    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "loadvarnode")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleStoreVarnode(Rule):
+    """This rule requires architecture Spacebase resolution which isn't currently ported."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "storevarnode")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleShadowVar(Rule):
+    """This rule is commented out in original Ghidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shadowvar")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleSwitchSingle(Rule):
+    """This rule requires JumpTable tracking which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "switchsingle")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleThreeWayCompare(Rule):
+    """This rule requires detectThreeWay analysis which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "threewaycompare")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+
+class RuleUndistribute(Rule):
+    """This rule requires undistribute functionality which is partially covered by BitUndistribute and BooleanUndistribute but the base RuleUndistribute logic isn't ported directly."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "undistribute")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
