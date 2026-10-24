@@ -2386,6 +2386,160 @@ class RuleHumptyDumpty(Rule):
             data.op_set_opcode(op, "SUBPIECE")
         return 1
 
+
+class RuleBooleanNegate(Rule):
+    """Simplify comparison of boolean value with 0 or 1: V != 0 => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "booleannegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        if val not in (0, 1): return 0
+        
+        subbool = op.inputs[0]
+        if not data.is_boolean_value(subbool): return 0
+        
+        negate = (op.opcode == "INT_NOTEQUAL")
+        if val == 0:
+            negate = not negate
+            
+        data.op_remove_input(op, 1)
+        data.op_set_input(op, subbool, 0)
+        
+        if negate:
+            data.op_set_opcode(op, "BOOL_NEGATE")
+        else:
+            data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleXorSwap(Rule):
+    """Simplify limited chains of XOR operations: V = (a ^ b) ^ a => V = b"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "xorswap")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_XOR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        for i in range(2):
+            vn = op.inputs[i]
+            op2 = next((cand for cand in data.ops if cand.output == vn), None)
+            if not op2 or op2.opcode != "INT_XOR" or len(op2.inputs) != 2: continue
+            
+            othervn = op.inputs[1 - i]
+            vn0 = op2.inputs[0]
+            vn1 = op2.inputs[1]
+            
+            if othervn == vn0:
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "COPY")
+                data.op_set_input(op, vn1, 0)
+                return 1
+            elif othervn == vn1:
+                data.op_remove_input(op, 1)
+                data.op_set_opcode(op, "COPY")
+                data.op_set_input(op, vn0, 0)
+                return 1
+        return 0
+
+
+class RuleOrMask(Rule):
+    """Collapse unnecessary INT_OR: V | 0xffffffff => 0xffffffff"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ormask")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        outsz = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[0]].size_bits
+        mask = (1 << outsz) - 1
+        
+        if (val & mask) != mask: return 0
+        
+        data.op_set_opcode(op, "COPY")
+        data.op_set_input(op, op.inputs[1], 0)
+        data.op_remove_input(op, 1)
+        return 1
+
+
+class RuleTrivialShift(Rule):
+    """Simplify shifts by 0 (to COPY) or by >= size (to 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "trivialshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_LEFT", "INT_RIGHT", "INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        val = int(cnode.name, 16)
+        sz = data.nodes[op.inputs[0]].size_bits
+        
+        if val != 0:
+            if val < sz: return 0
+            if op.opcode == "INT_SRIGHT": return 0
+            
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, "0x0", sz, "const"))
+            data.op_set_input(op, cnew, 0)
+            
+        data.op_remove_input(op, 1)
+        data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleLessNotEqual(Rule):
+    """Convert (a <= b) & (a != b) to a < b"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lessnotequal")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1, vn2 = op.inputs[0], op.inputs[1]
+        op_less = next((cand for cand in data.ops if cand.output == vn1), None)
+        op_equal = next((cand for cand in data.ops if cand.output == vn2), None)
+        
+        if not op_less or not op_equal: return 0
+        
+        opc = op_less.opcode
+        if opc not in ("INT_LESSEQUAL", "INT_SLESSEQUAL"):
+            op_less, op_equal = op_equal, op_less
+            opc = op_less.opcode
+            if opc not in ("INT_LESSEQUAL", "INT_SLESSEQUAL"): return 0
+            
+        if op_equal.opcode != "INT_NOTEQUAL": return 0
+        
+        a, b = op_less.inputs[0], op_less.inputs[1]
+        c, d = op_equal.inputs[0], op_equal.inputs[1]
+        
+        if (a == c and b == d) or (a == d and b == c):
+            data.op_set_input(op, a, 0)
+            data.op_set_input(op, b, 1)
+            data.op_set_opcode(op, "INT_SLESS" if opc == "INT_SLESSEQUAL" else "INT_LESS")
+            return 1
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
