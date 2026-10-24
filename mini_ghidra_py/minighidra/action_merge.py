@@ -69,3 +69,14 @@ class ActionMergeType(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 1
         return 0
+
+
+class ActionDominantCopy(Action):
+    """This action operates on the SSA merge phase in Ghidra to trim copies.
+    In Python minighidra, we currently defer SSA structural trims."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "dominantcopy")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0

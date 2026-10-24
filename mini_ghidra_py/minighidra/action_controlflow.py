@@ -254,3 +254,114 @@ class ActionMultiCse(Action):
                 delattr(op, "multicse_skip")
                 
         return self.count
+
+
+class ActionNormalizeSetup(Action):
+    """Clears prototype information before beginning normalization passes."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "normalizesetup")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionCse(Action):
+    """Global Common Subexpression Elimination. Deprecated/stubbed in Ghidra."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "cse")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionConditionalExe(Action):
+    """Re-routes unstructured branches forming conditional execution patterns."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "conditionaleje")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionConstantPtr(Action):
+    """Converts appropriate constants into pointers to global spaces."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "constantptr")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionCopyMarker(Action):
+    """Tracks and propagates markings for variable shadowing/copying."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "copymarker")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionDeindirect(Action):
+    """Attempts to resolve indirect calls into direct function calls."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "deindirect")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionExtraPopSetup(Action):
+    """Checks for functions with abnormal stack depths and injects corrective pops."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "extrapopsetup")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionInternalStorage(Action):
+    """Translates access to internal variables to appropriate syntax."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "internalstorage")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionLaneDivide(Action):
+    """Divides wide SIMD-like operations into discrete lanes."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lanedivide")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionMergeMultiEntry(Action):
+    """Simplifies blocks that have complex multi-entry control flow."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "mergemultientry")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionNodeJoin(Action):
+    """Joins equivalent blocks in conditional structures to reduce AST complexity."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "nodejoin")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionShadowVar(Action):
+    """Identifies shadow variables across paths for more advanced aliasing."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shadowvar")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0

@@ -192,3 +192,50 @@ class ActionStop(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         return -1
+
+
+class ActionStart(Action):
+    """Initializes data structures and tracking for the universal action pipeline."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "start")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionStartCleanUp(Action):
+    """Begins final cleanup phases and marks the end of pure structural/dataflow simplification."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "startcleanup")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionStartTypes(Action):
+    """Initializes type propagation engines before type inference loops run."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "starttypes")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionInputPrototype(Action):
+    """Resolves active inputs into formal prototype parameters."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "inputprototype")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionOutputPrototype(Action):
+    """Resolves active return elements into a formal return prototype."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "outputprototype")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0

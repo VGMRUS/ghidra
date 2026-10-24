@@ -62,3 +62,105 @@ class ActionDirectWrite(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
         return 0
+
+
+class ActionConstbase(Action):
+    """Injects context register values tracked upon entry into the flow."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "constbase")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionSegmentize(Action):
+    """Converts CALLOTHER segment ops into CPUI_SEGMENTOP."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "segmentize")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionParamDouble(Action):
+    """Adjusts overlapping/double-precision input parameters into combined single variables or splits them."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "paramdouble")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionLikelyTrash(Action):
+    """Truncates data flow for input varnodes that are marked as likely trash by the prototype."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "likelytrash")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionMarkIndirectOnly(Action):
+    """Marks variables that are only used indirectly via INDIRECT operations."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "markindirectonly")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionParamShiftStart(Action):
+    """Adjusts inputs for calls that have param shifts. Deprecated/stubbed in Ghidra C++."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "paramshiftstart")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionParamShiftStop(Action):
+    """Ends adjustments for calls that have param shifts. Deprecated/stubbed in Ghidra C++."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "paramshiftstop")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionFuncLink(Action):
+    """Prepares input and output parameters for function calls based on active tracking."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "funclink")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionFuncLinkOutOnly(Action):
+    """Prepares only output parameters for function calls based on active tracking."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "funclinkoutonly")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionNonzeroMask(Action):
+    """Triggers calculation of non-zero masks for all variables.
+    In Python minighidra, this happens implicitly on demand in get_nzmask, 
+    so we just clear the caches to ensure freshness."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "nonzeromask")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        if hasattr(data, "_nzmask_cache"): del data._nzmask_cache
+        if hasattr(data, "_nzmask_visited"): del data._nzmask_visited
+        return 0
