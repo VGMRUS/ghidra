@@ -103,6 +103,23 @@ class BlockCondition(FlowBlock):
         self.cond2 = cond2
         self.op = op
 
+
+class BlockGoto(FlowBlock):
+    def __init__(self, target: FlowBlock) -> None:
+        super().__init__("goto")
+        self.gototarget = target
+
+class BlockMultiGoto(FlowBlock):
+    def __init__(self, target: FlowBlock) -> None:
+        super().__init__("multigoto")
+        self.gotoedges: list[FlowBlock] = []
+
+class BlockIfGoto(BlockIf):
+    def __init__(self, cond: FlowBlock, target: FlowBlock) -> None:
+        super().__init__(cond, None)
+        self.block_type = "ifgoto"
+        self.gototarget = target
+
 class BlockGraph(FlowBlock):
     def __init__(self) -> None:
         super().__init__("graph")
@@ -313,6 +330,74 @@ class BlockGraph(FlowBlock):
                 self.blocks.remove(c)
         return new_switch
         
+
+    def new_block_goto(self, bl: FlowBlock) -> BlockGoto:
+        new_goto = BlockGoto(bl.out_edges[0])
+        # A BlockGoto replaces bl, but we just link inputs
+        for in_block in list(bl.in_edges):
+            idx = in_block.out_edges.index(bl)
+            in_block.out_edges[idx] = new_goto
+            new_goto.in_edges.append(in_block)
+        bl.in_edges.clear()
+        
+        # Link outputs
+        for i, out_block in enumerate(list(bl.out_edges)):
+            idx = out_block.in_edges.index(bl)
+            out_block.in_edges[idx] = new_goto
+            new_goto.out_edges.append(out_block)
+        bl.out_edges.clear()
+        
+        self.blocks.remove(bl)
+        self.blocks.append(new_goto)
+        return new_goto
+
+    def new_block_multigoto(self, bl: FlowBlock, outedge: int) -> BlockMultiGoto:
+        if bl.block_type == "multigoto":
+            new_goto = bl
+        else:
+            new_goto = BlockMultiGoto(bl)
+            # Link inputs
+            for in_block in list(bl.in_edges):
+                idx = in_block.out_edges.index(bl)
+                in_block.out_edges[idx] = new_goto
+                new_goto.in_edges.append(in_block)
+            bl.in_edges.clear()
+            
+            # Link outputs
+            for out_block in list(bl.out_edges):
+                idx = out_block.in_edges.index(bl)
+                out_block.in_edges[idx] = new_goto
+                new_goto.out_edges.append(out_block)
+            bl.out_edges.clear()
+            
+            self.blocks.remove(bl)
+            self.blocks.append(new_goto)
+            
+        new_goto.gotoedges.append(new_goto.out_edges[outedge])
+        return new_goto
+
+    def new_block_if_goto(self, bl: FlowBlock) -> BlockIfGoto:
+        # In Ghidra, IfGoto replaces the branch that is goto
+        # Here we just create BlockIfGoto and pass it
+        target = bl.out_edges[1] if bl.is_goto_branch(1) else bl.out_edges[0]
+        new_ifgoto = BlockIfGoto(bl, target)
+        
+        for in_block in list(bl.in_edges):
+            idx = in_block.out_edges.index(bl)
+            in_block.out_edges[idx] = new_ifgoto
+            new_ifgoto.in_edges.append(in_block)
+        bl.in_edges.clear()
+        
+        for out_block in list(bl.out_edges):
+            idx = out_block.in_edges.index(bl)
+            out_block.in_edges[idx] = new_ifgoto
+            new_ifgoto.out_edges.append(out_block)
+        bl.out_edges.clear()
+        
+        self.blocks.remove(bl)
+        self.blocks.append(new_ifgoto)
+        return new_ifgoto
+
     def new_block_condition(self, b1: FlowBlock, b2: FlowBlock, op: str) -> BlockCondition:
         new_cond = BlockCondition(b1, b2, op)
         

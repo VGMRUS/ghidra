@@ -115,22 +115,41 @@ class CollapseStructure:
         return isolated_count
 
     def rule_block_goto(self, bl: FlowBlock) -> bool:
+        sizeout = len(bl.out_edges)
+        for i in range(sizeout):
+            if bl.is_goto_branch(i):
+                if bl.block_type == "switch_out":
+                    self.graph.new_block_multigoto(bl, i)
+                    return True
+                if sizeout == 2:
+                    if not bl.is_goto_branch(1):
+                        # True branch must be goto
+                        # In full ghidra: if bl.negateCondition(True): dataflow_changecount += 1
+                        pass
+                    self.graph.new_block_if_goto(bl)
+                    return True
+                if sizeout == 1:
+                    self.graph.new_block_goto(bl)
+                    return True
         return False
 
     def rule_block_or(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
+        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
+        if bl.block_type == "switch_out": return False
         
         for i in range(2):
             orblock = bl.out_edges[i]
             if orblock == bl: continue
             if len(orblock.in_edges) != 1: continue
             if len(orblock.out_edges) != 2: continue
+            if orblock.block_type == "switch_out": continue
             
             clauseblock = bl.out_edges[1 - i]
             if clauseblock == bl: continue
             if clauseblock == orblock: continue
             
-            # Check if clauses match
+            j = 0
             match = False
             for j in range(2):
                 if clauseblock == orblock.out_edges[j]:
@@ -140,43 +159,49 @@ class CollapseStructure:
             if not match: continue
             if orblock.out_edges[1 - j] == bl: continue
             
-            # We found a matching condition
-            # op is || if we jump to clauseblock on true? Let's just use "&&" or "||" based on which branch
-            # We don't have isGotoOut so we simplify
-            # Let's say if false out goes to next condition, it's &&
-            # For minighidra, we just use "&&" for now, rendering will refine it.
-            self.graph.new_block_condition(bl, orblock, "&&")
+            self.graph.new_block_condition(bl, orblock, "&&" if i == 0 else "||")
             return True
+            
         return False
 
-
-        
     def rule_block_cat(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 1: return False
-        if len(bl.in_edges) == 1 and len(bl.in_edges[0].out_edges) == 1: return False # Must be start of chain
+        if bl.block_type == "switch_out": return False
+        if len(bl.in_edges) == 1 and len(bl.in_edges[0].out_edges) == 1:
+            return False # Must be start of chain
+            
         outblock = bl.out_edges[0]
-        if outblock == bl: return False # No looping
+        if outblock == bl: return False
         if len(outblock.in_edges) != 1: return False
-
+        # In ghidra: if not bl.isDecisionOut(0): return False
+        if outblock.block_type == "switch_out": return False
+        
         nodes = [bl, outblock]
+        
         while len(outblock.out_edges) == 1:
             outbl2 = outblock.out_edges[0]
             if outbl2 == bl: break
             if len(outbl2.in_edges) != 1: break
+            if outbl2.block_type == "switch_out": break
             outblock = outbl2
             nodes.append(outblock)
-
+            
         self.graph.new_block_list(nodes)
         return True
 
     def rule_block_proper_if(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
+        if bl.block_type == "switch_out": return False
         if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
+        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
 
         for i in range(2):
             clauseblock = bl.out_edges[i]
             if len(clauseblock.in_edges) != 1: continue
             if len(clauseblock.out_edges) != 1: continue
+            if getattr(clauseblock, "block_type", "") == "switch_out": continue
+            if clauseblock.is_goto_branch(0): continue
+            
             outblock = clauseblock.out_edges[0]
             if outblock != bl.out_edges[1 - i]: continue
 
@@ -187,6 +212,8 @@ class CollapseStructure:
 
     def rule_block_if_else(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
+        if bl.block_type == "switch_out": return False
+        
         tc = bl.out_edges[0]
         fc = bl.out_edges[1]
         
@@ -199,13 +226,22 @@ class CollapseStructure:
         if outblock == bl: return False
         if outblock != fc.out_edges[0]: return False
         
+        if tc.block_type == "switch_out": return False
+        if fc.block_type == "switch_out": return False
+        if tc.is_goto_branch(0): return False
+        if fc.is_goto_branch(0): return False
+        
         self.graph.new_block_if_else(bl, tc, fc)
         return True
 
     def rule_block_do_while(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
+        if bl.block_type == "switch_out": return False
+        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
+        
         for i in range(2):
             if bl.out_edges[i] != bl: continue
+            
             self.graph.new_block_do_while(bl)
             return True
         return False
@@ -218,23 +254,23 @@ class CollapseStructure:
 
     def rule_block_if_no_exit(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch": return False
-        if bl.out_edges[0] == bl: return False
-        if bl.out_edges[1] == bl: return False
+        if bl.block_type == "switch_out": return False
+        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
+        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
         
         for i in range(2):
             clauseblock = bl.out_edges[i]
             if len(clauseblock.in_edges) != 1: continue
             if len(clauseblock.out_edges) != 0: continue
-            if clauseblock.block_type == "switch": continue
+            if clauseblock.block_type == "switch_out": continue
             
             if i == 0:
                 otherblock = bl.out_edges[1]
-                if len(otherblock.in_edges) == 1 and len(otherblock.out_edges) == 0 and otherblock.block_type != "switch":
+                if len(otherblock.in_edges) == 1 and len(otherblock.out_edges) == 0 and otherblock.block_type != "switch_out":
                     self.graph.new_block_if_no_exit(bl, clauseblock, otherblock)
                     return True
-            
-            self.graph.new_block_if_no_exit(bl, clauseblock)
+                    
+            self.graph.new_block_if(bl, clauseblock)
             return True
             
         return False
@@ -291,12 +327,15 @@ class CollapseStructure:
     
     def rule_block_while_do(self, bl: FlowBlock) -> bool:
         if len(bl.out_edges) != 2: return False
+        if bl.block_type == "switch_out": return False
         if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
+        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
 
         for i in range(2):
             clauseblock = bl.out_edges[i]
             if len(clauseblock.in_edges) != 1: continue
             if len(clauseblock.out_edges) != 1: continue
+            if clauseblock.block_type == "switch_out": continue
             if clauseblock.out_edges[0] != bl: continue
 
             self.graph.new_block_while_do(bl, clauseblock)
