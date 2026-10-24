@@ -3940,6 +3940,150 @@ class RuleDivTermAdd2(Rule):
             return 1
         return 0
 
+
+class RuleConcatLeftShift(Rule):
+    """Simplify concat(V, zext(W) << c) => concat(concat(V, W), 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "concatleftshift")
+
+    def get_op_list(self) -> list[str]:
+        return ["PIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn2 = op.inputs[1]
+        shiftop = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
+        
+        cnode = data.nodes[shiftop.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        sa = int(cnode.name, 16)
+        if (sa & 7) != 0: return 0
+        
+        tmpvn = shiftop.inputs[0]
+        zextop = next((cand for cand in data.ops if cand.output == tmpvn), None)
+        if not zextop or zextop.opcode != "INT_ZEXT" or len(zextop.inputs) != 1: return 0
+        
+        b = zextop.inputs[0]
+        vn1 = op.inputs[0]
+        
+        sa //= 8
+        if sa + data.nodes[b].size_bits != data.nodes[tmpvn].size_bits: return 0
+        
+        newop = PcodeOp(op.addr, "PIECE", len(data.nodes), (vn1, b))
+        newout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newout, None, data.nodes[vn1].size_bits + data.nodes[b].size_bits, "unique"))
+        newop.output = newout
+        data.ops.append(newop)
+        
+        out_size = data.nodes[op.output].size_bits if op.output is not None else 0
+        diff = out_size - data.nodes[newout].size_bits
+        if diff < 0: return 0
+        
+        data.op_set_input(op, newout, 0)
+        c_diff = len(data.nodes)
+        data.nodes.append(PcodeVarnode(c_diff, "0x0", diff, "const"))
+        data.op_set_input(op, c_diff, 1)
+        return 1
+
+
+class RuleExpandLoad(Rule):
+    """Push BOOL_AND through INT_AND into INT_EQUAL where one side is a LOAD/INDIRECT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "expandload")
+
+    def get_op_list(self) -> list[str]:
+        return ["LOAD"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        outVn = op.output
+        if outVn is None: return 0
+        outSize = data.nodes[outVn].size_bits // 8
+        rootPtr = op.inputs[1]
+        
+        # Checking logic here is heavily tied to type recovery which is not fully present.
+        # We skip implementing a full equivalent since TypePointer, etc. aren't implemented here.
+        # Returning 0 to keep it stubbed safely.
+        return 0
+
+
+class RuleExtensionPush(Rule):
+    """Duplicate extension (INT_ZEXT/INT_SEXT) through operations to avoid truncating."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "extensionpush")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT", "INT_SEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        inVn = op.inputs[0]
+        if data.nodes[inVn].kind == "const": return 0
+        outVn = op.output
+        if outVn is None: return 0
+        
+        addcount = 0
+        ptrcount = 0
+        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        for decOp in descendants:
+            if decOp.opcode == "PTRADD":
+                ptrcount += 1
+            elif decOp.opcode == "INT_ADD":
+                sub_out = decOp.output
+                if sub_out is None: return 0
+                sub_desc = [c for c in data.ops if sub_out in c.inputs]
+                if len(sub_desc) != 1 or sub_desc[0].opcode != "PTRADD":
+                    return 0
+                addcount += 1
+            else:
+                return 0
+                
+        if addcount + ptrcount <= 1: return 0
+        
+        if addcount > 0:
+            if len([c for c in data.ops if inVn in c.inputs]) != 1: return 0
+            
+        # Duplicating extension to descendants:
+        for decOp in descendants:
+            newext = PcodeOp(decOp.addr, op.opcode, len(data.nodes), (inVn,))
+            newext_out = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newext_out, None, data.nodes[outVn].size_bits, "unique"))
+            newext.output = newext_out
+            data.ops.append(newext)
+            
+            for i, slot_vn in enumerate(decOp.inputs):
+                if slot_vn == outVn:
+                    data.op_set_input(decOp, newext_out, i)
+        
+        return 1
+
+
+class RuleStructOffset0(Rule):
+    """Convert LOAD/STORE to first element of structure into PTRSUB"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "structoffset0")
+
+    def get_op_list(self) -> list[str]:
+        return ["LOAD", "STORE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # Requires advanced Type propagation which is not in minighidra
+        # Safely return 0.
+        return 0
+
+
+class RulePtrsubCharConstant(Rule):
+    """Convert PTRSUB into a pointer constant to a string if appropriate"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "ptrsubcharconstant")
+
+    def get_op_list(self) -> list[str]:
+        return ["PTRSUB"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # Relies heavily on full typing + StringManager which we do not have.
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
