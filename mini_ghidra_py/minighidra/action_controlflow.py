@@ -98,3 +98,159 @@ class ActionNormalizeBranches(Action):
             
         # clear dead ops (ActionDeadCode will clean up usually, but we could do it here)
         return self.count
+
+
+class ActionDeterminedBranch(Action):
+    """Removes conditional branches whose condition is statically known."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "determinedbranch")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        changed = True
+        while changed:
+            changed = False
+            for op in list(data.ops):
+                if op.opcode == "CBRANCH" and len(op.inputs) >= 2:
+                    cond_vn = op.inputs[1]
+                    cond_node = data.nodes[cond_vn]
+                    if cond_node.kind == "const":
+                        val = int(cond_node.name, 16)
+                        
+                        # CBRANCH condition: if val != 0 branch is taken.
+                        # Wait, what if there's a boolean flip?
+                        flip = getattr(op, "boolean_flip", False)
+                        taken = (val != 0) ^ flip
+                        
+                        if taken:
+                            # It's always taken, convert to unconditional BRANCH
+                            data.op_remove_input(op, 1)
+                            data.op_set_opcode(op, "BRANCH")
+                        else:
+                            # It's never taken, just remove the operation entirely
+                            data.op_destroy(op)
+                            
+                        self.count += 1
+                        changed = True
+                        
+        return self.count
+
+
+class ActionRedundBranch(Action):
+    """Removes redundant conditional branches that jump to the same fallthrough block."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "redundbranch")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        if not hasattr(data, "ssa_function"): return 0
+        blocks = data.ssa_function.blocks
+        
+        changed = True
+        while changed:
+            changed = False
+            for bb in blocks:
+                if len(bb.successors) == 2 and bb.successors[0] == bb.successors[1]:
+                    ops_in_b = [op for op in data.ops if bb.start <= op.addr < bb.start + bb.size]
+                    if not ops_in_b: continue
+                    cbranch = next((op for op in reversed(ops_in_b) if op.opcode == "CBRANCH"), None)
+                    if cbranch:
+                        data.op_destroy(cbranch)
+                        bb.successors = [bb.successors[0]]
+                        self.count += 1
+                        changed = True
+        return self.count
+
+
+class ActionDoNothing(Action):
+    """Removes blocks that contain no operations and simply fall through."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "donothing")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        if not hasattr(data, "ssa_function"): return 0
+        blocks = data.ssa_function.blocks
+        if not blocks: return 0
+        
+        changed = True
+        while changed:
+            changed = False
+            for i, bb in enumerate(blocks):
+                if i == 0: continue # keep entry block
+                
+                if len(bb.successors) == 1 and bb.successors[0] != bb.start:
+                    ops_in_b = [op for op in data.ops if bb.start <= op.addr < bb.start + bb.size]
+                    has_ops = any(op.opcode != "IMARK" for op in ops_in_b)
+                    
+                    if not has_ops:
+                        target = bb.successors[0]
+                        incoming = [b for b in blocks if bb.start in b.successors]
+                        for inc in incoming:
+                            inc.successors = [target if s == bb.start else s for s in inc.successors]
+                            
+                        for op in ops_in_b:
+                            data.op_destroy(op)
+                            
+                        blocks.remove(bb)
+                        self.count += 1
+                        changed = True
+                        break
+                        
+        return self.count
+
+
+class ActionLateDoNothing(ActionDoNothing):
+    """Removes empty blocks that became empty after later stages (like DeadCode removal)."""
+    def __init__(self, group: str) -> None:
+        # ActionDoNothing's __init__ takes 1 argument but super().__init__ in it takes group, name
+        super().__init__(group)
+        self.name = "latedonothing"
+
+
+class ActionMultiCse(Action):
+    """Common Subexpression Elimination within a single basic block."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "multicse")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        if not hasattr(data, "ssa_function"): return 0
+        
+        no_cse = {
+            "LOAD", "STORE", "BRANCH", "CBRANCH", "BRANCHIND", "CALL", 
+            "CALLIND", "CALLOTHER", "RETURN", "MULTIEQUAL", "INDIRECT", "IMARK"
+        }
+        
+        changed = True
+        while changed:
+            changed = False
+            for bb in data.ssa_function.blocks:
+                ops_in_b = [op for op in data.ops if bb.start <= op.addr < bb.start + bb.size]
+                
+                for i in range(len(ops_in_b)):
+                    op1 = ops_in_b[i]
+                    if op1.opcode in no_cse or op1.output is None: continue
+                    if getattr(op1, "multicse_skip", False): continue
+                    
+                    for j in range(i + 1, len(ops_in_b)):
+                        op2 = ops_in_b[j]
+                        if getattr(op2, "multicse_skip", False): continue
+                        
+                        if op1.opcode == op2.opcode and op1.inputs == op2.inputs:
+                            # Convert op2 to COPY of op1.output
+                            while len(op2.inputs) > 0:
+                                data.op_remove_input(op2, 0)
+                                
+                            data.op_set_opcode(op2, "COPY")
+                            data.op_set_input(op2, op1.output, 0)
+                            
+                            setattr(op2, "multicse_skip", True)
+                            self.count += 1
+                            changed = True
+                            
+        for op in data.ops:
+            if hasattr(op, "multicse_skip"):
+                delattr(op, "multicse_skip")
+                
+        return self.count
