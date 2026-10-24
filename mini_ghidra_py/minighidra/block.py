@@ -14,6 +14,25 @@ class FlowBlock:
         self.visit_count: int = 0
         self.index: int = 0
 
+    @staticmethod
+    def find_condition(bl1: FlowBlock, edge1: int, bl2: FlowBlock, edge2: int) -> Tuple[Optional[FlowBlock], int]:
+        cond = bl1.in_edges[edge1]
+        while len(cond.out_edges) != 2:
+            if len(cond.out_edges) != 1:
+                return None, 0
+            bl1 = cond
+            edge1 = 0
+            cond = bl1.in_edges[0]
+            
+        while cond != bl2.in_edges[edge2]:
+            bl2 = bl2.in_edges[edge2]
+            if len(bl2.out_edges) != 1:
+                return None, 0
+            edge2 = 0
+            
+        slot1 = cond.out_edges.index(bl1)
+        return cond, slot1
+
     def is_default_branch(self, i: int) -> bool:
         return self.out_edge_flags.get(i, 0) & 1 != 0
 

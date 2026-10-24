@@ -279,11 +279,14 @@ class ActionCse(Action):
 class ActionConditionalExe(Action):
     """Re-routes unstructured branches forming conditional execution patterns."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, "conditionaleje")
+        super().__init__(group, "conditionalexe")
 
     def apply(self, data: PcodeLikeGraph) -> int:
-        self.count = 0
-        return 0
+        from minighidra.condexe import ActionConditionalExe as CondExeImpl
+        impl = CondExeImpl(self.name)
+        res = impl.apply(data)
+        self.count += impl.count
+        return res
 
 class ActionConstantPtr(Action):
     """Converts appropriate constants into pointers to global spaces."""

@@ -16,6 +16,31 @@ class TypeOp:
         """Infer input type at 'slot' from output type and other inputs (backward propagation)."""
         return None
 
+    @staticmethod
+    def float_sign_manipulation(op: PcodeOp, data: PcodeLikeGraph) -> str | None:
+        """Returns FLOAT_ABS or FLOAT_NEG if the operation manipulates float sign bit, else None."""
+        opc = op.opcode
+        if opc == "INT_AND" and len(op.inputs) == 2:
+            in1 = op.inputs[1]
+            if in1 >= 0:
+                node = data.nodes[in1]
+                if node.kind == "const":
+                    val = int(node.name, 16) if node.name else 0
+                    mask = (1 << node.size_bits) - 1
+                    if mask >> 1 == val:
+                        return "FLOAT_ABS"
+        elif opc == "INT_XOR" and len(op.inputs) == 2:
+            in1 = op.inputs[1]
+            if in1 >= 0:
+                node = data.nodes[in1]
+                if node.kind == "const":
+                    val = int(node.name, 16) if node.name else 0
+                    mask = (1 << node.size_bits) - 1
+                    test_val = mask ^ (mask >> 1)
+                    if test_val == val:
+                        return "FLOAT_NEG"
+        return None
+
 class TypeOpCopy(TypeOp):
     @staticmethod
     def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
