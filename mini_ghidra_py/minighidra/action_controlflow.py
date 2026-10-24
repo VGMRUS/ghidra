@@ -303,6 +303,7 @@ class ActionCopyMarker(Action):
         self.count = 0
         return 0
 
+
 class ActionDeindirect(Action):
     """Attempts to resolve indirect calls into direct function calls."""
     def __init__(self, group: str) -> None:
@@ -310,7 +311,37 @@ class ActionDeindirect(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        if not hasattr(data, "call_specs"):
+            return 0
+            
+        for fc in data.call_specs:
+            op = fc.op
+            if op.opcode != "CALLIND":
+                continue
+                
+            if not op.inputs:
+                continue
+                
+            vn = op.inputs[0]
+            node = data.nodes[vn]
+            
+            while node.kind != "const":
+                def_op = None
+                for cand in data.ops:
+                    if cand.output == vn:
+                        def_op = cand
+                        break
+                if def_op and def_op.opcode == "COPY":
+                    vn = def_op.inputs[0]
+                    node = data.nodes[vn]
+                else:
+                    break
+                    
+            if node.kind == "const":
+                data.op_set_opcode(op, "CALL")
+                self.count += 1
+                
+        return self.count
 
 class ActionExtraPopSetup(Action):
     """Checks for functions with abnormal stack depths and injects corrective pops."""
