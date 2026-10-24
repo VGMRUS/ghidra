@@ -2122,6 +2122,217 @@ class RuleTestSign(Rule):
             
         return resultCode
 
+
+class RuleSubZext(Rule):
+    """Simplify INT_ZEXT applied to SUBPIECE expressions"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subzext")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        subvn = op.inputs[0]
+        subop = None
+        for cand in data.ops:
+            if cand.output == subvn:
+                subop = cand
+                break
+        if not subop: return 0
+        
+        if subop.opcode == "SUBPIECE" and len(subop.inputs) == 2:
+            basevn = subop.inputs[0]
+            if data.nodes[basevn].size_bits != data.nodes[op.output].size_bits: return 0
+            
+            cnode = data.nodes[subop.inputs[1]]
+            if cnode.kind != "const": return 0
+            
+            offset = int(cnode.name, 16)
+            if offset != 0:
+                count = sum(1 for cand in data.ops if subvn in cand.inputs)
+                if count != 1: return 0
+                
+                newvn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(newvn, None, data.nodes[basevn].size_bits, "unique"))
+                
+                data.op_set_input(op, newvn, 0)
+                data.op_set_opcode(subop, "INT_RIGHT")
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(offset * 8), cnode.size_bits, "const"))
+                data.op_set_input(subop, cnew, 1)
+                subop.output = newvn
+            else:
+                data.op_set_input(op, basevn, 0)
+                
+            val = (1 << data.nodes[subvn].size_bits) - 1
+            constvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(constvn, hex(val), data.nodes[basevn].size_bits, "const"))
+            
+            data.op_set_opcode(op, "INT_AND")
+            op.inputs = (op.inputs[0], constvn)
+            return 1
+            
+        elif subop.opcode == "INT_RIGHT" and len(subop.inputs) == 2:
+            shiftop = subop
+            scnode = data.nodes[shiftop.inputs[1]]
+            if scnode.kind != "const": return 0
+            
+            midvn = shiftop.inputs[0]
+            subop2 = None
+            for cand in data.ops:
+                if cand.output == midvn:
+                    subop2 = cand
+                    break
+            if not subop2 or subop2.opcode != "SUBPIECE" or len(subop2.inputs) != 2: return 0
+            
+            basevn = subop2.inputs[0]
+            if data.nodes[basevn].size_bits != data.nodes[op.output].size_bits: return 0
+            
+            count_mid = sum(1 for cand in data.ops if midvn in cand.inputs)
+            if count_mid != 1: return 0
+            
+            count_sub = sum(1 for cand in data.ops if subvn in cand.inputs)
+            if count_sub != 1: return 0
+            
+            subcnode = data.nodes[subop2.inputs[1]]
+            if subcnode.kind != "const": return 0
+            
+            val = (1 << data.nodes[midvn].size_bits) - 1
+            sa = int(scnode.name, 16)
+            val >>= sa
+            sa += int(subcnode.name, 16) * 8
+            
+            newvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(newvn, None, data.nodes[basevn].size_bits, "unique"))
+            
+            data.op_set_input(op, newvn, 0)
+            data.op_set_input(shiftop, basevn, 0)
+            
+            cnew2 = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew2, hex(sa), scnode.size_bits, "const"))
+            data.op_set_input(shiftop, cnew2, 1)
+            shiftop.output = newvn
+            
+            constvn = len(data.nodes)
+            data.nodes.append(PcodeVarnode(constvn, hex(val), data.nodes[basevn].size_bits, "const"))
+            
+            data.op_set_opcode(op, "INT_AND")
+            op.inputs = (op.inputs[0], constvn)
+            return 1
+            
+        return 0
+
+
+class RuleDumptyHump(Rule):
+    """Simplify join and break apart: sub( concat(V,W), c) => sub(W,c)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "dumptyhump")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        base = op.inputs[0]
+        pieceop = None
+        for cand in data.ops:
+            if cand.output == base:
+                pieceop = cand
+                break
+        if not pieceop or pieceop.opcode != "PIECE" or len(pieceop.inputs) != 2: return 0
+        
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        offset = int(cnode.name, 16)
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        vn1 = pieceop.inputs[0]
+        vn2 = pieceop.inputs[1]
+        sz2 = data.nodes[vn2].size_bits
+        
+        if offset < sz2:
+            if offset + outsize > sz2: return 0
+            vn = vn2
+        else:
+            vn = vn1
+            offset -= sz2
+            
+        vnode = data.nodes[vn]
+        sz = vnode.size_bits
+        
+        if offset == 0 and outsize == sz:
+            data.op_set_opcode(op, "COPY")
+            data.op_remove_input(op, 1)
+            data.op_set_input(op, vn, 0)
+        else:
+            data.op_set_input(op, vn, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(offset), cnode.size_bits, "const"))
+            data.op_set_input(op, cnew, 1)
+        return 1
+
+class RuleHumptyOr(Rule):
+    """Simplify masked pieces INT_ORed together: (V & ff00) | (V & 00ff) => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "humptyor")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1, vn2 = op.inputs[0], op.inputs[1]
+        
+        and1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not and1 or and1.opcode != "INT_AND" or len(and1.inputs) != 2: return 0
+        
+        and2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not and2 or and2.opcode != "INT_AND" or len(and2.inputs) != 2: return 0
+        
+        a, b = and1.inputs[0], and1.inputs[1]
+        c, d = and2.inputs[0], and2.inputs[1]
+        
+        if a == c:
+            c = d
+        elif a == d:
+            pass
+        elif b == c:
+            b, a, c = a, c, d
+        elif b == d:
+            b, a = a, d
+        else:
+            return 0
+            
+        bnode, cnode = data.nodes[b], data.nodes[c]
+        if bnode.kind == "const" and cnode.kind == "const":
+            totalbits = int(bnode.name, 16) | int(cnode.name, 16)
+            asz = data.nodes[a].size_bits
+            if totalbits == ((1 << asz) - 1):
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, a, 0)
+            else:
+                data.op_set_opcode(op, "INT_AND")
+                data.op_set_input(op, a, 0)
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(totalbits), asz, "const"))
+                data.op_set_input(op, cnew, 1)
+        else:
+            amask = data.get_nzmask(a)
+            bmask = data.get_nzmask(b)
+            cmask = data.get_nzmask(c)
+            if (bmask & amask) == 0 or (cmask & amask) == 0: return 0
+            
+            newOrOp = PcodeOp(op.addr, "INT_OR", len(data.nodes), (b, c))
+            data.nodes.append(PcodeVarnode(newOrOp.output, None, data.nodes[a].size_bits, "unique"))
+            data.ops.append(newOrOp)
+            
+            data.op_set_input(op, a, 0)
+            data.op_set_input(op, newOrOp.output, 1)
+            data.op_set_opcode(op, "INT_AND")
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
