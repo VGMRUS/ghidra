@@ -73,41 +73,12 @@ class BlockIfNoExit(FlowBlock):
         self.true_block = true_block
         self.false_block = false_block
 
-class BlockInfLoop(FlowBlock):
-    def __init__(self, body_block: FlowBlock) -> None:
-        super().__init__("infloop")
-        self.body_block = body_block
-
-class BlockSwitch(FlowBlock):
-    def __init__(self, cases: list[FlowBlock], has_exit: bool) -> None:
-        super().__init__("switch")
-        self.cases = cases
-        self.has_exit = has_exit
-
-class BlockIfNoExit(FlowBlock):
-    def __init__(self, cond_block: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> None:
-        super().__init__("ifnoexit")
-        self.cond_block = cond_block
-        self.true_block = true_block
-        self.false_block = false_block
-
-class BlockInfLoop(FlowBlock):
-    def __init__(self, body_block: FlowBlock) -> None:
-        super().__init__("infloop")
-        self.body_block = body_block
-
-class BlockSwitch(FlowBlock):
-    def __init__(self, cases: list[FlowBlock], has_exit: bool) -> None:
-        super().__init__("switch")
-        self.cases = cases
-        self.has_exit = has_exit
-
-class BlockIfNoExit(FlowBlock):
-    def __init__(self, cond_block: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> None:
-        super().__init__("ifnoexit")
-        self.cond_block = cond_block
-        self.true_block = true_block
-        self.false_block = false_block
+class BlockCondition(FlowBlock):
+    def __init__(self, cond1: FlowBlock, cond2: FlowBlock, op: str) -> None:
+        super().__init__("condition")
+        self.cond1 = cond1
+        self.cond2 = cond2
+        self.op = op
 
 class BlockGraph(FlowBlock):
     def __init__(self) -> None:
@@ -319,6 +290,36 @@ class BlockGraph(FlowBlock):
                 self.blocks.remove(c)
         return new_switch
         
+    def new_block_condition(self, b1: FlowBlock, b2: FlowBlock, op: str) -> BlockCondition:
+        new_cond = BlockCondition(b1, b2, op)
+        
+        # In a condition b1 -> b2. We replace b1 with new_cond.
+        # But both b1 and b2 are part of the condition.
+        for in_block in list(b1.in_edges):
+            idx = in_block.out_edges.index(b1)
+            in_block.out_edges[idx] = new_cond
+            new_cond.in_edges.append(in_block)
+        b1.in_edges.clear()
+        
+        # Output edges are the outputs of b2, plus the output of b1 that doesn't go to b2
+        for out in list(b2.out_edges):
+            idx = out.in_edges.index(b2)
+            out.in_edges[idx] = new_cond
+            new_cond.out_edges.append(out)
+        b2.out_edges.clear()
+        
+        for out in list(b1.out_edges):
+            if out == b2: continue
+            idx = out.in_edges.index(b1)
+            out.in_edges[idx] = new_cond
+            new_cond.out_edges.append(out)
+        
+        idx = self.blocks.index(b1)
+        self.blocks[idx] = new_cond
+        if b2 in self.blocks: self.blocks.remove(b2)
+        
+        return new_cond
+
     def new_block_if_no_exit(self, cond: FlowBlock, true_block: FlowBlock, false_block: FlowBlock | None = None) -> FlowBlock:
         new_if = BlockIfNoExit(cond, true_block, false_block)
         
@@ -345,3 +346,10 @@ class BlockGraph(FlowBlock):
         if true_block in self.blocks: self.blocks.remove(true_block)
         if false_block and false_block in self.blocks: self.blocks.remove(false_block)
         return new_if
+
+class BlockCondition(FlowBlock):
+    def __init__(self, cond1: FlowBlock, cond2: FlowBlock, op: str) -> None:
+        super().__init__("condition")
+        self.cond1 = cond1
+        self.cond2 = cond2
+        self.op = op # "&&" or "||"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional
-from .paramid import PcodeLikeGraph, PcodeOp
+from .paramid import PcodeLikeGraph, PcodeOp, PcodeVarnode
 from .action import Action
 
 class Rule:
@@ -581,6 +581,157 @@ class RuleZextEliminate(Rule):
             return 1
             
         return 0
+
+
+class RuleEquality(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "equality")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        # V == V -> 1, V != V -> 0
+        if len(op.inputs) != 2:
+            return 0
+        if op.inputs[0] == op.inputs[1]:
+            val = 1 if op.opcode == "INT_EQUAL" else 0
+            # We don't have a newConstant method that injects constants gracefully right here,
+            # but we can resolve this by adding a constant node
+            const_node = len(data.nodes)
+            data.nodes.append(PcodeVarnode(len(data.nodes), hex(val), 1, "const"))
+            
+            data.op_set_opcode(op, "COPY")
+            data.op_remove_input(op, 1)
+            data.op_set_input(op, const_node, 0)
+            return 1
+        return 0
+
+class RuleTrivialBool(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "trivialbool")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_XOR", "BOOL_AND", "BOOL_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2:
+            return 0
+            
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const":
+            return 0
+            
+        val = int(cnode.name, 16)
+        opc = ""
+        vn_idx = -1
+        
+        if op.opcode == "BOOL_XOR":
+            vn_idx = op.inputs[0]
+            opc = "BOOL_NEGATE" if val == 1 else "COPY"
+        elif op.opcode == "BOOL_AND":
+            opc = "COPY"
+            if val == 1:
+                vn_idx = op.inputs[0]
+            else:
+                # copy false
+                const_node = len(data.nodes)
+                data.nodes.append(PcodeVarnode(len(data.nodes), hex(0), 1, "const"))
+                vn_idx = const_node
+        elif op.opcode == "BOOL_OR":
+            opc = "COPY"
+            if val == 1:
+                const_node = len(data.nodes)
+                data.nodes.append(PcodeVarnode(len(data.nodes), hex(1), 1, "const"))
+                vn_idx = const_node
+            else:
+                vn_idx = op.inputs[0]
+        else:
+            return 0
+            
+        data.op_remove_input(op, 1)
+        data.op_set_opcode(op, opc)
+        data.op_set_input(op, vn_idx, 0)
+        return 1
+
+
+class RuleLessEqual(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "lessequal")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_LESSEQUAL", "INT_SLESSEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2:
+            return 0
+        node = data.nodes[op.inputs[1]]
+        if node.kind != "const":
+            return 0
+            
+        val = int(node.name, 16)
+        # Check max size (we can't easily increment 0xFFFFFFFF)
+        size = node.size_bits
+        mask = (1 << size) - 1
+        
+        # Don't translate if it wraps around
+        if op.opcode == "INT_LESSEQUAL" and val == mask:
+            return 0
+        if op.opcode == "INT_SLESSEQUAL" and val == (1 << (size - 1)) - 1:
+            return 0
+            
+        new_val = val + 1
+        new_opc = "INT_LESS" if op.opcode == "INT_LESSEQUAL" else "INT_SLESS"
+        
+        const_node = len(data.nodes)
+        data.nodes.append(PcodeVarnode(const_node, hex(new_val), size, "const"))
+        
+        data.op_set_opcode(op, new_opc)
+        data.op_remove_input(op, 1)
+        data.op_set_input(op, const_node, 1)
+        return 1
+
+
+class RuleNotDistribute(Rule):
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "notdistribute")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_NEGATE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1:
+            return 0
+        
+        in_node = data.nodes[op.inputs[0]]
+        # Need to find the operation defining in_node
+        def_op = None
+        for cand_op in data.ops:
+            if cand_op.output == op.inputs[0]:
+                def_op = cand_op
+                break
+                
+        if def_op is None:
+            return 0
+            
+        # Is the intermediate variable consumed by anyone else?
+        # A simple check: if more than 1 use, we can't distribute without duplicating the operation.
+        uses = sum(1 for o in data.ops if op.inputs[0] in o.inputs)
+        if uses > 1:
+            return 0
+            
+        if def_op.opcode == "INT_EQUAL":
+            data.op_set_opcode(def_op, "INT_NOTEQUAL")
+        elif def_op.opcode == "INT_NOTEQUAL":
+            data.op_set_opcode(def_op, "INT_EQUAL")
+        elif def_op.opcode == "BOOL_NEGATE":
+            data.op_set_opcode(def_op, "COPY")
+        else:
+            return 0
+            
+        # Bypass the BOOL_NEGATE op
+        data.op_set_opcode(op, "COPY")
+        return 1
 
 class RuleSlessToLess(Rule):
     """Convert INT_SLESS to INT_LESS when comparing positive values."""
