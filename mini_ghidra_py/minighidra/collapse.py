@@ -87,6 +87,9 @@ class CollapseStructure:
                     if self.rule_block_while_do(bl):
                         change = True
                         continue
+                    if self.rule_case_fallthru(bl):
+                        fullchange = True
+                        break
                     if self.rule_block_do_while(bl):
                         change = True
                         continue
@@ -273,6 +276,9 @@ class CollapseStructure:
                     if curbl.out_edges[0] != exitblock: return False
                 if curbl.block_type == "switch": return False
                 
+        if not self._check_switch_skips(bl, exitblock):
+            return True
+            
         cases = [bl]
         for i in range(sizeout):
             curbl = bl.out_edges[i]
@@ -299,6 +305,68 @@ class CollapseStructure:
         return False
 
 
+
+
+    def rule_case_fallthru(self, bl: FlowBlock) -> bool:
+        if bl.block_type != "switch_out": return False
+        sizeout = len(bl.out_edges)
+        nonfallthru = 0
+        fallthru = []
+        
+        for i in range(sizeout):
+            curbl = bl.out_edges[i]
+            if curbl == bl: return False
+            if len(curbl.in_edges) > 2 or len(curbl.out_edges) > 1:
+                nonfallthru += 1
+            elif len(curbl.out_edges) == 1:
+                target = curbl.out_edges[0]
+                if len(target.in_edges) == 2 and len(target.out_edges) <= 1:
+                    inslot = target.in_edges.index(curbl)
+                    if target.in_edges[1 - inslot] == bl:
+                        fallthru.append(curbl)
+            
+            if nonfallthru > 1: return False
+            
+        if not fallthru: return False
+        
+        for curbl in fallthru:
+            curbl.set_goto_branch(0)
+            
+        return True
+
+
+    def _check_switch_skips(self, switchbl: FlowBlock, exitblock: FlowBlock | None) -> bool:
+        if exitblock is None:
+            return True
+            
+        sizeout = len(switchbl.out_edges)
+        defaultnottoexit = False
+        anyskiptoexit = False
+        
+        for edgenum in range(sizeout):
+            if switchbl.out_edges[edgenum] == exitblock:
+                if not switchbl.is_default_branch(edgenum):
+                    anyskiptoexit = True
+            else:
+                if switchbl.is_default_branch(edgenum):
+                    defaultnottoexit = True
+                    
+        if not anyskiptoexit:
+            return True
+            
+        if not defaultnottoexit and getattr(switchbl, "block_type", "") == "multigoto":
+            if getattr(switchbl, "has_default_goto", lambda: False)():
+                defaultnottoexit = True
+                
+        if not defaultnottoexit:
+            return True
+            
+        for edgenum in range(sizeout):
+            if switchbl.out_edges[edgenum] == exitblock:
+                if not switchbl.is_default_branch(edgenum):
+                    switchbl.set_goto_branch(edgenum)
+                    
+        return False
 
     def get_change_count(self) -> int:
         return self.change_count
