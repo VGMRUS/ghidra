@@ -48,10 +48,14 @@ class ActionConditionalConst(Action):
         self.count = 0
         return 0
 
+
+
+
 class ActionSwitchNorm(Action):
-    """Normalizes switch statements to a standard form."""
+    """Normalizes switch statements to a standard form. (Disabled/Stubbed)"""
     def __init__(self, group: str) -> None:
         super().__init__(group, "switchnorm")
+        self.disabled = True
     def apply(self, data: PcodeLikeGraph) -> int:
-        self.count = 0
         return 0
+
