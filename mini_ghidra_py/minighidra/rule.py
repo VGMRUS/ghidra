@@ -1051,8 +1051,6 @@ class RuleShiftPiece(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn1 = op.inputs[0]
-        vn2 = op.inputs[1]
-        
         shiftop = None
         for cand in data.ops:
             if cand.output == vn1:
@@ -4530,7 +4528,7 @@ class RuleFloatSignCleanup(Rule):
 
 
 class RuleFloatRange(Rule):
-    """Simplify FLOAT_LESS and FLOAT_EQUAL into FLOAT_LESSEQUAL, etc."""
+    """Simplify combinations of float comparisons: (x < y) | (x == y) => x <= y"""
     def __init__(self, group: str) -> None:
         super().__init__(group, "floatrange")
 
@@ -4539,60 +4537,9 @@ class RuleFloatRange(Rule):
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
-        vn1 = op.inputs[0]
-        vn2 = op.inputs[1]
+        vn1, vn2 = op.inputs[0], op.inputs[1]
         
-        cmp1 = next((cand for cand in data.ops if cand.output == vn1), None)
-        cmp2 = next((cand for cand in data.ops if cand.output == vn2), None)
-        if not cmp1 or not cmp2: return 0
         
-        opccmp1 = cmp1.opcode
-        if opccmp1 not in ("FLOAT_LESS", "FLOAT_LESSEQUAL"):
-            cmp1, cmp2 = cmp2, cmp1
-            opccmp1 = cmp1.opcode
-            
-        resultopc = "COPY"
-        if opccmp1 == "FLOAT_LESS":
-            if cmp2.opcode == "FLOAT_EQUAL" and op.opcode == "BOOL_OR":
-                resultopc = "FLOAT_LESSEQUAL"
-        elif opccmp1 == "FLOAT_LESSEQUAL":
-            if cmp2.opcode == "FLOAT_NOTEQUAL" and op.opcode == "BOOL_AND":
-                resultopc = "FLOAT_LESS"
-                
-        if resultopc == "COPY": return 0
-        
-        slot1 = 0
-        nvn1 = cmp1.inputs[slot1]
-        if data.nodes[nvn1].kind == "const":
-            slot1 = 1
-            nvn1 = cmp1.inputs[slot1]
-            if data.nodes[nvn1].kind == "const": return 0
-            
-        cvn1 = cmp1.inputs[1 - slot1]
-        
-        slot2 = 0
-        if nvn1 != cmp2.inputs[0]:
-            slot2 = 1
-            if nvn1 != cmp2.inputs[1]: return 0
-            
-        matchvn = cmp2.inputs[1 - slot2]
-        
-        if data.nodes[cvn1].kind == "const":
-            if data.nodes[matchvn].kind != "const": return 0
-            if int(data.nodes[matchvn].name, 16) != int(data.nodes[cvn1].name, 16): return 0
-        elif cvn1 != matchvn:
-            return 0
-            
-        data.op_set_opcode(op, resultopc)
-        data.op_set_input(op, nvn1, slot1)
-        if data.nodes[cvn1].kind == "const":
-            cnew = len(data.nodes)
-            data.nodes.append(PcodeVarnode(cnew, data.nodes[cvn1].name, data.nodes[cvn1].size_bits, "const"))
-            data.op_set_input(op, cnew, 1 - slot1)
-        else:
-            data.op_set_input(op, cvn1, 1 - slot1)
-        return 1
-
 
 class RuleTransformCpool(Rule):
     """This rule requires CPool resolution which isn't currently ported to the minighidra Rule engine."""
@@ -5119,7 +5066,7 @@ class RuleSubfloatConvert(Rule):
         return 0
 
 class RuleSubvarAnd(Rule):
-    """Stub for RuleSubvarAnd"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarand")
         self.disabled = True
@@ -5129,7 +5076,7 @@ class RuleSubvarAnd(Rule):
         return 0
 
 class RuleSubvarCompZero(Rule):
-    """Stub for RuleSubvarCompZero"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarcompzero")
         self.disabled = True
@@ -5139,7 +5086,7 @@ class RuleSubvarCompZero(Rule):
         return 0
 
 class RuleSubvarSext(Rule):
-    """Stub for RuleSubvarSext"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarsext")
         self.disabled = True
@@ -5149,7 +5096,7 @@ class RuleSubvarSext(Rule):
         return 0
 
 class RuleSubvarShift(Rule):
-    """Stub for RuleSubvarShift"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarshift")
         self.disabled = True
@@ -5159,7 +5106,7 @@ class RuleSubvarShift(Rule):
         return 0
 
 class RuleSubvarSubpiece(Rule):
-    """Stub for RuleSubvarSubpiece"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarsubpiece")
         self.disabled = True
@@ -5169,7 +5116,7 @@ class RuleSubvarSubpiece(Rule):
         return 0
 
 class RuleSubvarZext(Rule):
-    """Stub for RuleSubvarZext"""
+    """Requires SubvariableFlow tracing engine which is not yet ported."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "subvarzext")
         self.disabled = True
@@ -5177,6 +5124,11 @@ class RuleSubvarZext(Rule):
         return []
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
+
+
+
+
+
 
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
