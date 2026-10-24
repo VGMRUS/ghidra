@@ -118,6 +118,7 @@ class Analyzer:
         self._discover_macho_function_starts()
         self._discover_pattern_function_starts()
         self._record_scalar_reference_xrefs()
+        self._find_data_pointers()
         self._discover_address_tables()
         self._resolve_computed_jumps()
         self._infer_no_return_functions()
@@ -238,6 +239,7 @@ class Analyzer:
         self.xrefs_by_target[target].append(xref)
         self.xrefs_by_source[source].append(xref)
 
+
     def _record_instruction_xrefs(self, instruction: Instruction) -> None:
         if instruction.branch_target is not None:
             if instruction.is_call:
@@ -247,11 +249,20 @@ class Analyzer:
             else:
                 kind = "jump"
             self._record_xref(instruction.address, instruction.branch_target, kind)
+            
+
         for target in (
             *instruction.memory_references,
             *instruction.indexed_memory_references,
         ):
-            self._record_xref(instruction.address, target, "memory")
+            if instruction.is_call and instruction.branch_target is None:
+                self._record_xref(instruction.address, target, "call")
+                self._record_xref(instruction.address, target, "memory")
+            elif instruction.is_jump and instruction.branch_target is None:
+                self._record_xref(instruction.address, target, "jump")
+                self._record_xref(instruction.address, target, "memory")
+            else:
+                self._record_xref(instruction.address, target, "memory")
 
     def _find_strings(self, min_length: int = 4) -> None:
         ascii_pattern = re.compile(rb"[\x20-\x7e]{" + str(min_length).encode() + rb",}")
@@ -373,12 +384,13 @@ class Analyzer:
                 section = self.image.section_at(target)
                 if section is None:
                     continue
-                if (
-                    section.executable
-                    and target not in self.function_seeds
-                    and target not in self._name_by_address
-                ):
-                    continue
+                if section.executable:
+                    if target not in self.function_seeds and target not in self._name_by_address:
+                        # If it points to an instruction we disassembled (or can), it might be a function pointer
+                        if target in self.instructions or target > instruction.address:
+                            self._add_seed(target, "", "scalar")
+                        else:
+                            continue
                 self._record_xref(instruction.address, target, "scalar")
 
     def _disassemble_from(self, address: int) -> None:
@@ -406,6 +418,30 @@ class Analyzer:
         except Exception:
             pass
         self.instruction_addresses.sort()
+
+
+    def _find_data_pointers(self) -> None:
+        pointer_size = self.image.bits // 8
+        for section in self.image.sections:
+            if not section.data or section.executable:
+                continue
+                
+            data = section.data
+            for offset in range(0, len(data) - pointer_size + 1, pointer_size):
+                target = int.from_bytes(data[offset:offset + pointer_size], "little")
+                if target == 0:
+                    continue
+                    
+                target_section = self.image.section_at(target)
+                if target_section is not None:
+                    # If it points to an executable section, it could be a function pointer
+                    if target_section.executable:
+                        if target in self.instructions or target in self.function_seeds or target in self._name_by_address:
+                            self._record_xref(section.start + offset, target, "data")
+                    else:
+                        # Data pointer to data
+                        if target in self._name_by_address:
+                            self._record_xref(section.start + offset, target, "data")
 
     def _discover_address_tables(
         self, minimum_entries: int = 3, max_entries: int = 512
