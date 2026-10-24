@@ -292,10 +292,11 @@ class RuleAndOrLump(Rule):
         op = data.op_set_input(op, const_vn, 1)
         return 1
 
-class RuleOrMask(Rule):
-    """Simplify INT_OR with full mask: V = W | 0xffff => V = 0xffff."""
+class RuleOrCollapse(Rule):
+    """Simplify INT_OR with full mask: V = W | 0xffff => V = 0xffff. 
+       Also handles general V | C => C if V_nzmask | C == C."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, "ormask")
+        super().__init__(group, "orcollapse")
 
     def get_op_list(self) -> tuple[str, ...]:
         return ("INT_OR",)
@@ -304,18 +305,18 @@ class RuleOrMask(Rule):
         if len(op.inputs) != 2: return 0
         if not data.is_constant(op.inputs[1]): return 0
         
-        size = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[1]].size_bits
-        mask = (1 << size) - 1
+        mask = data.get_nzmask(op.inputs[0])
         val = data.get_constant_value(op.inputs[1])
         
-        if (val & mask) != mask: return 0
+        if (mask | val) != val: return 0
         
-        op = data.op_remove_input(op, 1)
+        # Result is just the constant value
+        op = data.op_remove_input(op, 0)
         data.op_set_opcode(op, "COPY")
         return 1
 
 class RuleAndMask(Rule):
-    """Simplify INT_AND with 0 or full mask."""
+    """Simplify INT_AND with 0 or full mask, taking nzmask into account."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "andmask")
 
@@ -324,23 +325,21 @@ class RuleAndMask(Rule):
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
-        if not data.is_constant(op.inputs[1]): return 0
         
-        size = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[1]].size_bits
-        mask = (1 << size) - 1
-        val = data.get_constant_value(op.inputs[1]) & mask
+        mask1 = data.get_nzmask(op.inputs[0])
+        mask2 = data.get_nzmask(op.inputs[1])
+        andmask = mask1 & mask2
         
-        if val == 0:
+        if andmask == 0:
             # Result is 0
-            op = data.op_remove_input(op, 1)
-            op = data.op_set_input(op, op.inputs[1], 0) # Wait, inputs[1] was removed!
-            # No, data.op_remove_input returns a new op where inputs[1] is gone. 
-            # We want to replace inputs[0] with the 0 constant.
+            size = data.nodes[op.output].size_bits if op.output is not None else data.nodes[op.inputs[0]].size_bits
             const_vn = data.new_constant(size, 0)
+            op = data.op_remove_input(op, 1)
             op = data.op_set_input(op, const_vn, 0)
             data.op_set_opcode(op, "COPY")
             return 1
-        elif val == mask:
+        elif andmask == mask1:
+            if not data.is_constant(op.inputs[1]): return 0
             # Result is input(0)
             op = data.op_remove_input(op, 1)
             data.op_set_opcode(op, "COPY")
@@ -382,6 +381,111 @@ class RuleLogicIdentity(Rule):
         op = data.op_remove_input(op, 1)
         op = data.op_set_input(op, const_vn, 0)
         data.op_set_opcode(op, "COPY")
+        return 1
+
+class RuleDoubleLoad(Rule):
+    """Collapse contiguous loads: V = PIECE(LOAD(ptr+4), LOAD(ptr)) => V = LOAD(ptr)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "doubleload")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("PIECE",)
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        piece0 = op.inputs[0] # MSB
+        piece1 = op.inputs[1] # LSB
+        
+        load0 = data.get_def(piece0)
+        load1 = data.get_def(piece1)
+        
+        if not load1 or load1.opcode != "LOAD": return 0
+        
+        offset = 0
+        if load0 and load0.opcode == "SUBPIECE":
+            if not data.is_constant(load0.inputs[1]) or data.get_constant_value(load0.inputs[1]) != 0:
+                return 0
+            vn0 = load0.inputs[0]
+            offset = data.nodes[vn0].size_bits - data.nodes[piece0].size_bits
+            load0 = data.get_def(vn0)
+            
+        if not load0 or load0.opcode != "LOAD": return 0
+        
+        ptr1 = load1.inputs[0]
+        ptr0 = load0.inputs[0]
+        
+        # Check if ptr0 == ptr1 + size(piece1)
+        add_op = data.get_def(ptr0)
+        if not add_op or add_op.opcode != "INT_ADD": return 0
+        
+        if add_op.inputs[0] == ptr1 and data.is_constant(add_op.inputs[1]):
+            const_add = data.get_constant_value(add_op.inputs[1])
+        elif add_op.inputs[1] == ptr1 and data.is_constant(add_op.inputs[0]):
+            const_add = data.get_constant_value(add_op.inputs[0])
+        else:
+            return 0
+            
+        sz1_bytes = data.nodes[piece1].size_bits // 8
+        if const_add != sz1_bytes: return 0
+        
+        # Collapse! Replace PIECE with LOAD from ptr1
+        op = data.op_remove_input(op, 1)
+        op = data.op_set_input(op, ptr1, 0)
+        data.op_set_opcode(op, "LOAD")
+        return 1
+
+class RulePullsubMulti(Rule):
+    """Pull SUBPIECE up through a MULTIEQUAL (Phi):
+       V = SUBPIECE(MULTIEQUAL(A, B), c) => V = MULTIEQUAL(SUBPIECE(A, c), SUBPIECE(B, c))
+    """
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pullsubmulti")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("SUBPIECE",)
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn = op.inputs[0]
+        mult = data.get_def(vn)
+        if not mult or mult.opcode != "MULTIEQUAL": return 0
+        
+        # Check if there are other uses of this MULTIEQUAL. 
+        # For simplicity, if we pull it up, we duplicate the SUBPIECE. 
+        # This is safe and eliminates the wide phi node if it becomes dead.
+        out_size = data.nodes[op.output].size_bits if op.output is not None else 8
+        c_vn = op.inputs[1]
+        
+        new_inputs = []
+        for i, branch_vn in enumerate(mult.inputs):
+            # Create a new SUBPIECE for each branch
+            new_vn = data._new_temporary_node(f"pullsub_{i}", out_size)
+            new_op = PcodeOp(
+                "SUBPIECE",
+                (branch_vn, c_vn),
+                new_vn,
+                address=op.address,
+                mnemonic="SUBPIECE"
+            )
+            data._set_definition(new_op)
+            new_inputs.append(new_vn)
+            
+        # Replace the original SUBPIECE with a MULTIEQUAL of the new truncated inputs
+        op = data.op_remove_input(op, 1) # remove c_vn
+        # Now op has 1 input. We need to replace all inputs with new_inputs
+        new_op_dict = op.__dict__.copy()
+        new_op_dict["inputs"] = tuple(new_inputs)
+        new_op_dict["opcode"] = "MULTIEQUAL"
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(new_op_dict)
+        
+        try:
+            idx = data.ops.index(op)
+            data.ops[idx] = new_op
+        except ValueError:
+            pass
+        
+        data.clear_nzmask_cache()
         return 1
 
 class RuleSub2Add(Rule):

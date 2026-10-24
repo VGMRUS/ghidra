@@ -2589,7 +2589,119 @@ class PcodeLikeGraph:
             )
         )
 
+    def clear_nzmask_cache(self) -> None:
+        if hasattr(self, "_nzmask_cache"):
+            self._nzmask_cache.clear()
+
+    def get_nzmask(self, vn_id: int) -> int:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            return 0
+        if not hasattr(self, "_nzmask_cache"):
+            self._nzmask_cache = {}
+        if vn_id in self._nzmask_cache:
+            return self._nzmask_cache[vn_id]
+        if not hasattr(self, "_nzmask_visited"):
+            self._nzmask_visited = set()
+        if vn_id in self._nzmask_visited:
+            return (1 << self.nodes[vn_id].size_bits) - 1
+        self._nzmask_visited.add(vn_id)
+        mask = self._calc_nzmask(vn_id)
+        self._nzmask_visited.remove(vn_id)
+        self._nzmask_cache[vn_id] = mask
+        return mask
+
+    def _calc_nzmask(self, vn_id: int) -> int:
+        node = self.nodes[vn_id]
+        size = node.size_bits
+        fullmask = (1 << size) - 1
+        
+        if self.is_constant(vn_id):
+            return self.get_constant_value(vn_id) & fullmask
+            
+        op = self.get_def(vn_id)
+        if not op:
+            return fullmask
+            
+        opcode = op.opcode
+        if opcode in (
+            "INT_EQUAL", "INT_NOTEQUAL", "INT_SLESS", "INT_SLESSEQUAL", 
+            "INT_LESS", "INT_LESSEQUAL", "INT_CARRY", "INT_SCARRY", "INT_SBORROW",
+            "BOOL_NEGATE", "BOOL_XOR", "BOOL_AND", "BOOL_OR",
+            "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL", "FLOAT_NAN"
+        ):
+            return 1
+            
+        if opcode in ("COPY", "INT_ZEXT"):
+            return self.get_nzmask(op.inputs[0]) & fullmask
+            
+        if opcode == "INT_SEXT":
+            mask0 = self.get_nzmask(op.inputs[0])
+            sz0 = self.nodes[op.inputs[0]].size_bits
+            signbit = 1 << (sz0 - 1)
+            if mask0 & signbit:
+                return fullmask
+            return mask0 & fullmask
+            
+        if opcode in ("INT_XOR", "INT_OR"):
+            mask0 = self.get_nzmask(op.inputs[0])
+            if mask0 == fullmask:
+                return fullmask
+            mask1 = self.get_nzmask(op.inputs[1])
+            return (mask0 | mask1) & fullmask
+            
+        if opcode == "INT_AND":
+            mask0 = self.get_nzmask(op.inputs[0])
+            if mask0 == 0:
+                return 0
+            mask1 = self.get_nzmask(op.inputs[1])
+            return (mask0 & mask1) & fullmask
+            
+        if opcode == "INT_LEFT":
+            if not self.is_constant(op.inputs[1]):
+                return fullmask
+            sa = self.get_constant_value(op.inputs[1])
+            mask0 = self.get_nzmask(op.inputs[0])
+            return (mask0 << sa) & fullmask
+            
+        if opcode == "INT_RIGHT":
+            if not self.is_constant(op.inputs[1]):
+                return fullmask
+            sa = self.get_constant_value(op.inputs[1])
+            mask0 = self.get_nzmask(op.inputs[0])
+            return (mask0 >> sa) & fullmask
+            
+        if opcode == "INT_SRIGHT":
+            if not self.is_constant(op.inputs[1]):
+                return fullmask
+            sa = self.get_constant_value(op.inputs[1])
+            mask0 = self.get_nzmask(op.inputs[0])
+            sz0 = self.nodes[op.inputs[0]].size_bits
+            signbit = 1 << (sz0 - 1)
+            if mask0 & signbit:
+                return fullmask
+            return (mask0 >> sa) & fullmask
+            
+        if opcode == "PIECE":
+            mask0 = self.get_nzmask(op.inputs[0])
+            mask1 = self.get_nzmask(op.inputs[1])
+            sz1 = self.nodes[op.inputs[1]].size_bits
+            return ((mask0 << sz1) | mask1) & fullmask
+            
+        if opcode == "SUBPIECE":
+            mask0 = self.get_nzmask(op.inputs[0])
+            sa = self.get_constant_value(op.inputs[1]) * 8
+            return (mask0 >> sa) & fullmask
+            
+        if opcode == "MULTIEQUAL":
+            resmask = 0
+            for inp in op.inputs:
+                resmask |= self.get_nzmask(inp)
+            return resmask & fullmask
+            
+        return fullmask
+
     def op_set_input(self, op: PcodeOp, new_in: int, slot: int) -> PcodeOp:
+        self.clear_nzmask_cache()
         new_inputs = list(op.inputs)
         while len(new_inputs) <= slot:
             new_inputs.append(-1)
@@ -2605,6 +2717,7 @@ class PcodeLikeGraph:
         return new_op
 
     def op_remove_input(self, op: PcodeOp, slot: int) -> PcodeOp:
+        self.clear_nzmask_cache()
         new_inputs = list(op.inputs)
         if slot < len(new_inputs):
             new_inputs.pop(slot)
@@ -2619,6 +2732,7 @@ class PcodeLikeGraph:
         return new_op
 
     def op_set_opcode(self, op: PcodeOp, new_opcode: str) -> PcodeOp:
+        self.clear_nzmask_cache()
         new_op = object.__new__(PcodeOp)
         new_op.__dict__.update(op.__dict__)
         new_op.__dict__["opcode"] = new_opcode
@@ -2630,6 +2744,7 @@ class PcodeLikeGraph:
         return new_op
 
     def new_constant(self, size_bits: int, value: int) -> int:
+        self.clear_nzmask_cache()
         name = f"const_{value:#x}"
         return self._new_node(name, size_bits, "constant")
 
