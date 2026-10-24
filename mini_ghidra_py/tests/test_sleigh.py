@@ -880,7 +880,7 @@ class SleighTranslationTests(unittest.TestCase):
 
                 self.assertIn(expected, pseudocode)
                 if name == "roundps-branch-path":
-                    self.assertIn("= 0x4080000040000000;", pseudocode)
+                    self.assertIn("phi(0x4080000040000000, 0x3f400000)", pseudocode)
                     self.assertIn("= 0x3f400000;", pseudocode)
                 self.assertNotIn("unsupported x86 instruction", pseudocode)
                 if name == "roundss-preserve-upper-lanes":

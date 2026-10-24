@@ -20,7 +20,7 @@ class ActionBlockStructure(Action):
         if len(graph.blocks) != 0:
             return 0
         
-        # graph.build_copy(data.get_basic_blocks())
+        graph.build_copy(data.ssa_function.blocks)
         collapse = CollapseStructure(graph)
         collapse.collapse_all()
         self.count = collapse.get_change_count()
