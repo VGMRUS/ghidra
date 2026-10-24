@@ -15,6 +15,48 @@ class FlowBlock:
         self.index: int = 0
 
     @staticmethod
+    def find_common_block(bl1: FlowBlock | None, bl2: FlowBlock | None) -> FlowBlock | None:
+        b1 = bl1
+        b2 = bl2
+        common = None
+        while True:
+            if b2 is None:
+                while b1 is not None:
+                    if b1.mark != 0:
+                        common = b1
+                        break
+                    b1 = b1.immed_dom
+                break
+            if b1 is None:
+                while b2 is not None:
+                    if b2.mark != 0:
+                        common = b2
+                        break
+                    b2 = b2.immed_dom
+                break
+            if b1.mark != 0:
+                common = b1
+                break
+            b1.mark = 1
+            if b2.mark != 0:
+                common = b2
+                break
+            b2.mark = 1
+            b1 = b1.immed_dom
+            b2 = b2.immed_dom
+            
+        b1 = bl1
+        b2 = bl2
+        while b1 is not None and b1.mark != 0:
+            b1.mark = 0
+            b1 = b1.immed_dom
+        while b2 is not None and b2.mark != 0:
+            b2.mark = 0
+            b2 = b2.immed_dom
+            
+        return common
+
+    @staticmethod
     def find_condition(bl1: FlowBlock, edge1: int, bl2: FlowBlock, edge2: int) -> Tuple[Optional[FlowBlock], int]:
         cond = bl1.in_edges[edge1]
         while len(cond.out_edges) != 2:

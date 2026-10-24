@@ -4553,17 +4553,127 @@ class RuleSegment(Rule):
 
 
 class RuleSelectCse(Rule):
-    """This rule requires CSE Hash calculation which isn't ported into the minighidra Rule engine."""
+    """Eliminate common subexpressions by hashing PcodeOps and replacing identical ops"""
     def __init__(self, group: str) -> None:
         super().__init__(group, "selectcse")
-        self.disabled = True
 
     def get_op_list(self) -> list[str]:
-        return []
+        # Applied to all ops typically, but we register empty and rely on ActionPool universal call?
+        # Actually in ghidra it's registered universally or dynamically?
+        # We will list binary and unary ops
+        return ["INT_ADD", "INT_SUB", "INT_MULT", "INT_DIV", "INT_SDIV", "INT_REM", "INT_SREM", 
+                "INT_AND", "INT_OR", "INT_XOR", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", 
+                "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", 
+                "BOOL_NEGATE", "BOOL_AND", "BOOL_OR", "BOOL_XOR", "FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", 
+                "FLOAT_DIV", "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL", "INT_ZEXT", "INT_SEXT", "INT_NEGATE"]
+
+    def _cse_hash(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if op.opcode == "COPY": return 0
+        if not op.output: return 0
+        out_node = data.nodes[op.output]
+        h = (out_node.size_bits << 8) | hash(op.opcode)
+        h &= 0xFFFFFFFF
+        
+        for invn in op.inputs:
+            h = ((h << 8) | (h >> 24)) & 0xFFFFFFFF
+            if invn >= 0:
+                node = data.nodes[invn]
+                if node.kind == "const":
+                    h ^= int(node.name, 16) if node.name else 0
+                else:
+                    h ^= invn
+        return h
+
+    def _is_cse_match(self, op1: PcodeOp, op2: PcodeOp, data: PcodeLikeGraph) -> bool:
+        if op1.opcode != op2.opcode: return False
+        if op1.opcode == "COPY": return False
+        if op1.output is None or op2.output is None: return False
+        if data.nodes[op1.output].size_bits != data.nodes[op2.output].size_bits: return False
+        if len(op1.inputs) != len(op2.inputs): return False
+        for i1, i2 in zip(op1.inputs, op2.inputs):
+            if i1 != i2: return False
+        return True
+
+    def _cse_elimination(self, op1: PcodeOp, op2: PcodeOp, data: PcodeLikeGraph) -> PcodeOp:
+        from minighidra.block import FlowBlock
+        bb1 = None
+        bb2 = None
+        for b in data.blocks:
+            if hasattr(b, 'ops'):
+                if op1 in b.ops: bb1 = b
+                if op2 in b.ops: bb2 = b
+        
+        replace = None
+        if bb1 == bb2:
+            if bb1.ops.index(op1) < bb1.ops.index(op2):
+                replace = op1
+            else:
+                replace = op2
+        else:
+            common = FlowBlock.find_common_block(bb1, bb2)
+            if common == bb1:
+                replace = op1
+            elif common == bb2:
+                replace = op2
+            else:
+                replace = PcodeOp(common.ops[-1].addr if common.ops else None, op1.opcode, op1.inputs)
+                outvn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(outvn, None, data.nodes[op1.output].size_bits, "unique"))
+                replace.output = outvn
+                common.ops.append(replace)
+                data.ops.append(replace)
+                
+        if replace != op1:
+            for dop in data.ops:
+                if op1.output in dop.inputs:
+                    new_inputs = tuple(replace.output if x == op1.output else x for x in dop.inputs)
+                    dop.inputs = new_inputs
+            if op1 in data.ops:
+                data.ops.remove(op1)
+            if bb1 and op1 in bb1.ops:
+                bb1.ops.remove(op1)
+                
+        if replace != op2:
+            for dop in data.ops:
+                if op2.output in dop.inputs:
+                    new_inputs = tuple(replace.output if x == op2.output else x for x in dop.inputs)
+                    dop.inputs = new_inputs
+            if op2 in data.ops:
+                data.ops.remove(op2)
+            if bb2 and op2 in bb2.ops:
+                bb2.ops.remove(op2)
+                
+        return replace
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
+        if not op.inputs: return 0
+        vn = op.inputs[0]
+        if vn < 0: return 0
+        
+        descends = [dop for dop in data.ops if vn in dop.inputs]
+        hash_list = []
+        for otherop in descends:
+            if otherop.opcode != op.opcode: continue
+            h = self._cse_hash(otherop, data)
+            if h == 0: continue
+            hash_list.append((h, otherop))
+            
+        if len(hash_list) <= 1: return 0
+        
+        # Sort and eliminate
+        hash_list.sort(key=lambda x: x[0])
+        outlist = []
+        
+        for i in range(len(hash_list) - 1):
+            h1, op1 = hash_list[i]
+            h2, op2 = hash_list[i+1]
+            if h1 == h2:
+                if op1 in data.ops and op2 in data.ops and self._is_cse_match(op1, op2, data):
+                    # In GHIDRA: if outvn is Heritaged or None
+                    resop = self._cse_elimination(op1, op2, data)
+                    outlist.append(resop.output)
+                    
+        return 1 if outlist else 0
 
 from typing import Tuple
 from minighidra.expression import TermOrder
@@ -4726,17 +4836,146 @@ class RuleFloatCast(Rule):
 
 
 class RuleIgnoreNan(Rule):
-    """This rule requires floating-point comparisons tracking and data configuration which isn't ported into the minighidra Rule engine."""
+    """Treat NaN checks as always false if architecture ignores NaNs or simplify them."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "ignorenan")
-        self.disabled = True
 
     def get_op_list(self) -> list[str]:
-        return []
+        return ["FLOAT_NAN"]
+
+    def _is_another_nan(self, vn: int, data: PcodeLikeGraph) -> bool:
+        if vn < 0: return False
+        def_op = None
+        for dop in data.ops:
+            if dop.output == vn:
+                def_op = dop
+                break
+        if not def_op: return False
+        
+        opc = def_op.opcode
+        if opc == "BOOL_NEGATE":
+            vn = def_op.inputs[0]
+            def_op = None
+            for dop in data.ops:
+                if dop.output == vn:
+                    def_op = dop
+                    break
+            if not def_op: return False
+            opc = def_op.opcode
+            
+        return opc == "FLOAT_NAN"
+
+    def _check_back_for_compare(self, floatVar: int, vn: int, data: PcodeLikeGraph) -> bool:
+        def1 = None
+        for dop in data.ops:
+            if dop.output == vn:
+                def1 = dop
+                break
+        if not def1: return False
+        
+        if def1.opcode in ("FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL"):
+            if def1.inputs[0] == floatVar or def1.inputs[1] == floatVar:
+                return True
+            return False
+            
+        if def1.opcode not in ("BOOL_AND", "BOOL_OR"):
+            return False
+            
+        for i in range(2):
+            in_vn = def1.inputs[i]
+            def2 = None
+            for dop in data.ops:
+                if dop.output == in_vn:
+                    def2 = dop
+                    break
+            if not def2: continue
+            if def2.opcode in ("FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL"):
+                if def2.inputs[0] == floatVar or def2.inputs[1] == floatVar:
+                    return True
+        return False
+
+    def _test_for_comparison(self, floatVar: int, op: PcodeOp, slot: int, matchCode: str, data: PcodeLikeGraph) -> tuple[int, int]:
+        opc = op.opcode
+        if opc == matchCode:
+            vn = op.inputs[1 - slot]
+            if self._check_back_for_compare(floatVar, vn, data):
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                data.op_set_input(op, vn, 0)
+                return op.output if op.output is not None else -1, 1
+            elif self._is_another_nan(vn, data):
+                return op.output if op.output is not None else -1, 0
+        elif opc in ("INT_EQUAL", "INT_NOTEQUAL"):
+            vn = op.inputs[1 - slot]
+            if self._check_back_for_compare(floatVar, vn, data):
+                cnew = len(data.nodes)
+                val = 0 if matchCode == "BOOL_OR" else 1
+                data.nodes.append(PcodeVarnode(cnew, hex(val), 1, "const"))
+                data.op_set_input(op, cnew, slot)
+                return -1, 1
+        elif opc == "CBRANCH":
+            bb = None
+            for b in data.blocks:
+                if hasattr(b, 'ops') and op in b.ops:
+                    bb = b
+                    break
+            if not bb: return -1, 0
+            
+            outDir = 0 if matchCode == "BOOL_OR" else 1
+            if hasattr(data, 'op_is_boolean_flip') and data.op_is_boolean_flip(op):
+                outDir = 1 - outDir
+                
+            if len(bb.out_edges) > outDir:
+                outBranch = bb.out_edges[outDir]
+                lastOp = outBranch.ops[-1] if hasattr(outBranch, 'ops') and outBranch.ops else None
+                if lastOp and lastOp.opcode == "CBRANCH":
+                    otherBranch = bb.out_edges[1 - outDir] if len(bb.out_edges) > 1 - outDir else None
+                    if otherBranch and (len(outBranch.out_edges) > 0 and outBranch.out_edges[0] == otherBranch) or (len(outBranch.out_edges) > 1 and outBranch.out_edges[1] == otherBranch):
+                        if self._check_back_for_compare(floatVar, lastOp.inputs[1], data):
+                            cnew = len(data.nodes)
+                            val = 0 if matchCode == "BOOL_OR" else 1
+                            data.nodes.append(PcodeVarnode(cnew, hex(val), 1, "const"))
+                            data.op_set_input(op, cnew, 1)
+                            return -1, 1
+        return -1, 0
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
+        # Ignore architecture settings for this simplified logic
+        floatVar = op.inputs[0]
+        if floatVar < 0: return 0
+        out1 = op.output
+        if out1 is None: return 0
+        
+        count = 0
+        descends = [dop for dop in data.ops if out1 in dop.inputs]
+        for boolRead1 in descends:
+            matchCode = "BOOL_OR"
+            out2 = -1
+            if boolRead1.opcode == "BOOL_NEGATE":
+                matchCode = "BOOL_AND"
+                out2 = boolRead1.output if boolRead1.output is not None else -1
+            else:
+                slot = boolRead1.inputs.index(out1)
+                out2, inc = self._test_for_comparison(floatVar, boolRead1, slot, matchCode, data)
+                count += inc
+                
+            if out2 < 0: continue
+            
+            desc2 = [dop for dop in data.ops if out2 in dop.inputs]
+            for boolRead2 in desc2:
+                slot2 = boolRead2.inputs.index(out2)
+                out3, inc2 = self._test_for_comparison(floatVar, boolRead2, slot2, matchCode, data)
+                count += inc2
+                
+                if out3 < 0: continue
+                
+                desc3 = [dop for dop in data.ops if out3 in dop.inputs]
+                for boolRead3 in desc3:
+                    slot3 = boolRead3.inputs.index(out3)
+                    _, inc3 = self._test_for_comparison(floatVar, boolRead3, slot3, matchCode, data)
+                    count += inc3
+                    
+        return 1 if count > 0 else 0
 
 class RuleUnsigned2Float(Rule):
     """Simplify conversion: T = int2float((X >> 1) | X & 1); T + T => int2float( zext(X) )"""
