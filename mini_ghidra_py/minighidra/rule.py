@@ -4734,6 +4734,55 @@ class RuleUndistribute(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
+
+class RuleAndStructure(Rule):
+    """This rule requires Type propagation (for pointer types/structs) which isn't currently ported to minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "andstructure")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleBoolZext(Rule):
+    """This rule requires Boolean calculation tracking not present yet."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "boolzext")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleShiftLess(Rule):
+    """This rule handles shift tracking inside conditions but uses architecture bits missing right now."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shiftless")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSignForm2(Rule):
+    """Requires complex sign extraction evaluation logic not built."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signform2")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
