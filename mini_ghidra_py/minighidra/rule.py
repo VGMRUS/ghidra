@@ -235,7 +235,7 @@ class RuleEquality(Rule):
         data.op_set_input(op, cnode, 0)
         return 1
 
-class RuleIntLessEqualRewrite(Rule):
+class RuleIntLessEqual(Rule):
     """Convert LESSEQUAL to LESS: V <= c => V < (c+1)"""
     def __init__(self, group: str) -> None:
         super().__init__(group, "intlessequal")
@@ -4645,17 +4645,6 @@ class RuleCollapseConstants(Rule):
         return 0
 
 
-class RuleIntLessEqual(Rule):
-    """This rule requires replaceLessequal from Funcdata which isn't currently ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "intlessequal")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
 class RuleLoadVarnode(Rule):
@@ -4747,17 +4736,6 @@ class RuleAndStructure(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
-class RuleBoolZext(Rule):
-    """This rule requires Boolean calculation tracking not present yet."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "boolzext")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 class RuleShiftLess(Rule):
     """This rule handles shift tracking inside conditions but uses architecture bits missing right now."""
@@ -4782,6 +4760,172 @@ class RuleSignForm2(Rule):
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
+
+
+class RuleBoolZext(Rule):
+    """Simplify boolean expressions of the form zext(V) * -1"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "boolzext")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        boolVn1 = op.inputs[0]
+        if not data.is_boolean_value(boolVn1): return 0
+        
+        outvn = op.output
+        if outvn is None: return 0
+        
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        if len(descendants) != 1: return 0
+        
+        multop1 = descendants[0]
+        if multop1.opcode != "INT_MULT" or len(multop1.inputs) != 2: return 0
+        
+        cmult1 = data.nodes[multop1.inputs[1]]
+        if cmult1.kind != "const": return 0
+        
+        coeff = int(cmult1.name, 16)
+        sz = data.nodes[multop1.output].size_bits if multop1.output is not None else 0
+        mask = (1 << sz) - 1
+        if coeff != mask: return 0
+        
+        if multop1.output is None: return 0
+        action_desc = [cand for cand in data.ops if multop1.output in cand.inputs]
+        if len(action_desc) != 1: return 0
+        actionop = action_desc[0]
+        
+        opc = actionop.opcode
+        if opc == "INT_ADD":
+            cadd = data.nodes[actionop.inputs[1]]
+            if cadd.kind != "const": return 0
+            if int(cadd.name, 16) == 1:
+                newop = PcodeOp(op.addr, "BOOL_NEGATE", len(data.nodes), (boolVn1,))
+                vn = len(data.nodes)
+                data.nodes.append(PcodeVarnode(vn, None, 1, "unique"))
+                newop.output = vn
+                data.ops.append(newop)
+                
+                data.op_set_input(op, vn, 0)
+                data.op_remove_input(actionop, 1)
+                data.op_set_opcode(actionop, "COPY")
+                data.op_set_input(actionop, op.output, 0)
+                return 1
+            return 0
+            
+        elif opc in ("INT_EQUAL", "INT_NOTEQUAL"):
+            cadd = data.nodes[actionop.inputs[1]]
+            if cadd.kind != "const": return 0
+            val = int(cadd.name, 16)
+            if val == coeff: val = 1
+            elif val != 0: return 0
+            
+            data.op_set_input(actionop, boolVn1, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(val), 1, "const"))
+            data.op_set_input(actionop, cnew, 1)
+            return 1
+            
+        elif opc == "INT_AND":
+            opc = "BOOL_AND"
+        elif opc == "INT_OR":
+            opc = "BOOL_OR"
+        elif opc == "INT_XOR":
+            opc = "BOOL_XOR"
+        else:
+            return 0
+            
+        other_in = actionop.inputs[1] if actionop.inputs[0] == multop1.output else actionop.inputs[0]
+        multop2 = next((cand for cand in data.ops if cand.output == other_in), None)
+        if not multop2 or multop2.opcode != "INT_MULT" or len(multop2.inputs) != 2: return 0
+        
+        cmult2 = data.nodes[multop2.inputs[1]]
+        if cmult2.kind != "const" or int(cmult2.name, 16) != mask: return 0
+        
+        zextop2 = next((cand for cand in data.ops if cand.output == multop2.inputs[0]), None)
+        if not zextop2 or zextop2.opcode != "INT_ZEXT" or len(zextop2.inputs) != 1: return 0
+        
+        boolVn2 = zextop2.inputs[0]
+        if not data.is_boolean_value(boolVn2): return 0
+        
+        newop = PcodeOp(actionop.addr, opc, len(data.nodes), (boolVn1, boolVn2))
+        newres = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newres, None, 1, "unique"))
+        newop.output = newres
+        data.ops.append(newop)
+        
+        newzext = PcodeOp(actionop.addr, "INT_ZEXT", len(data.nodes), (newres,))
+        newzout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newzout, None, sz, "unique"))
+        newzext.output = newzout
+        data.ops.append(newzext)
+        
+        data.op_set_opcode(actionop, "INT_MULT")
+        data.op_set_input(actionop, newzout, 0)
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(coeff), sz, "const"))
+        data.op_set_input(actionop, cnew, 1)
+        return 1
+
+
+class RuleSignForm2(Rule):
+    """Normalize sign extraction: sub(sext(V) * small, c) s>> 31 => V s>> 31"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "signform2")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SRIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        constVn = data.nodes[op.inputs[1]]
+        if constVn.kind != "const": return 0
+        inVn = op.inputs[0]
+        sizeout = data.nodes[inVn].size_bits
+        if int(constVn.name, 16) != sizeout - 1: return 0
+        
+        subOp = next((cand for cand in data.ops if cand.output == inVn), None)
+        if not subOp or subOp.opcode != "SUBPIECE" or len(subOp.inputs) != 2: return 0
+        
+        cnode = data.nodes[subOp.inputs[1]]
+        if cnode.kind != "const": return 0
+        c = int(cnode.name, 16)
+        
+        multOut = subOp.inputs[0]
+        multSize = data.nodes[multOut].size_bits
+        if c * 8 + sizeout != multSize: return 0
+        
+        multOp = next((cand for cand in data.ops if cand.output == multOut), None)
+        if not multOp or multOp.opcode != "INT_MULT" or len(multOp.inputs) != 2: return 0
+        
+        slot = -1
+        sextOp = None
+        for i in range(2):
+            vn = multOp.inputs[i]
+            c_op = next((cand for cand in data.ops if cand.output == vn), None)
+            if c_op and c_op.opcode == "INT_SEXT" and len(c_op.inputs) == 1:
+                slot = i
+                sextOp = c_op
+                break
+        if slot == -1: return 0
+        
+        a = sextOp.inputs[0]
+        if data.nodes[a].size_bits != sizeout: return 0
+        
+        otherVn = multOp.inputs[1 - slot]
+        otherNode = data.nodes[otherVn]
+        if otherNode.kind == "const":
+            if int(otherNode.name, 16) > ((1 << sizeout) - 1): return 0
+            if 2 * sizeout > multSize: return 0
+        else:
+            zextOp = next((cand for cand in data.ops if cand.output == otherVn), None)
+            if not zextOp or zextOp.opcode != "INT_ZEXT" or len(zextOp.inputs) != 1: return 0
+            if data.nodes[zextOp.inputs[0]].size_bits + sizeout > multSize: return 0
+            
+        data.op_set_input(op, a, 0)
+        return 1
 
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
