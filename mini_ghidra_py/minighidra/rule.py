@@ -2251,24 +2251,26 @@ class RuleDumptyHump(Rule):
         vn2 = pieceop.inputs[1]
         sz2 = data.nodes[vn2].size_bits
         
-        if offset < sz2:
-            if offset + outsize > sz2: return 0
+        offset_bits = offset * 8
+        if offset_bits < sz2:
+            if offset_bits + outsize > sz2: return 0
             vn = vn2
+            new_offset = offset
         else:
             vn = vn1
-            offset -= sz2
+            new_offset = offset - (sz2 // 8)
             
         vnode = data.nodes[vn]
         sz = vnode.size_bits
         
-        if offset == 0 and outsize == sz:
+        if new_offset == 0 and outsize == sz:
             data.op_set_opcode(op, "COPY")
             data.op_remove_input(op, 1)
             data.op_set_input(op, vn, 0)
         else:
             data.op_set_input(op, vn, 0)
             cnew = len(data.nodes)
-            data.nodes.append(PcodeVarnode(cnew, hex(offset), cnode.size_bits, "const"))
+            data.nodes.append(PcodeVarnode(cnew, hex(new_offset), cnode.size_bits, "const"))
             data.op_set_input(op, cnew, 1)
         return 1
 
@@ -2331,6 +2333,57 @@ class RuleHumptyOr(Rule):
             data.op_set_input(op, a, 0)
             data.op_set_input(op, newOrOp.output, 1)
             data.op_set_opcode(op, "INT_AND")
+        return 1
+
+
+class RuleHumptyDumpty(Rule):
+    """Simplify concat of adjacent subpieces: concat(sub(V, c+s), sub(V, c)) => sub(V, c) or V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "humptydumpty")
+
+    def get_op_list(self) -> list[str]:
+        return ["PIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn1 = op.inputs[0]
+        sub1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not sub1 or sub1.opcode != "SUBPIECE" or len(sub1.inputs) != 2: return 0
+        
+        vn2 = op.inputs[1]
+        sub2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        if not sub2 or sub2.opcode != "SUBPIECE" or len(sub2.inputs) != 2: return 0
+        
+        root = sub1.inputs[0]
+        if root != sub2.inputs[0]: return 0
+        
+        cnode1 = data.nodes[sub1.inputs[1]]
+        cnode2 = data.nodes[sub2.inputs[1]]
+        if cnode1.kind != "const" or cnode2.kind != "const": return 0
+        
+        pos1 = int(cnode1.name, 16)
+        pos2 = int(cnode2.name, 16)
+        
+        size1 = data.nodes[vn1].size_bits
+        size2 = data.nodes[vn2].size_bits
+        
+        # In PIECE, vn1 is the high part, vn2 is the low part.
+        # Wait, the C++ code says pos1 == pos2 + size2 (bytes)
+        # However, our sizes are in bits. We must divide by 8 for bytes, or adjust if sizes are bits.
+        # Ghidra works in bytes for sizes, our size_bits are bits. So pos1 == pos2 + (size2 // 8).
+        # Actually in minighidra SUBPIECE offset is in bytes (same as Ghidra).
+        if pos1 != pos2 + (size2 // 8): return 0
+        
+        if pos2 == 0 and (size1 + size2 == data.nodes[root].size_bits):
+            data.op_remove_input(op, 1)
+            data.op_set_input(op, root, 0)
+            data.op_set_opcode(op, "COPY")
+        else:
+            data.op_set_input(op, root, 0)
+            cnew = len(data.nodes)
+            data.nodes.append(PcodeVarnode(cnew, hex(pos2), cnode2.size_bits, "const"))
+            data.op_set_input(op, cnew, 1)
+            data.op_set_opcode(op, "SUBPIECE")
         return 1
 
 class ActionPool(Action):
