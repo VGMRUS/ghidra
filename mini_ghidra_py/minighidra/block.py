@@ -26,6 +26,17 @@ class FlowBlock:
     def set_goto_branch(self, i: int) -> None:
         self.out_edge_flags[i] = self.out_edge_flags.get(i, 0) | 2
 
+    def is_loop_dag_out(self, i: int) -> bool:
+        # Simplification: a loop dag edge is one that is not marked as goto
+        # (in full ghidra it also checks back_edge and irreducible)
+        return not self.is_goto_branch(i)
+
+    def is_loop_dag_in(self, i: int) -> bool:
+        # For incoming edge i, check the corresponding out edge of the source
+        in_block = self.in_edges[i]
+        out_idx = in_block.out_edges.index(self)
+        return in_block.is_loop_dag_out(out_idx)
+
 
     
     def dominates(self, subBlock: 'FlowBlock') -> bool:

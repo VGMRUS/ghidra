@@ -2919,6 +2919,8 @@ class RuleScarry(Rule):
         return 0
 
 
+from minighidra.expression import AddExpression
+
 class RuleSborrow(Rule):
     """Simplify signed comparisons using INT_SBORROW"""
     def __init__(self, group: str) -> None:
@@ -2936,7 +2938,66 @@ class RuleSborrow(Rule):
             data.op_set_input(op, cnew, 0)
             data.op_set_opcode(op, "COPY")
             return 1
-        return 0
+            
+        if not op.output: return 0
+        
+        avn_id = op.inputs[0]
+        bvn_id = op.inputs[1]
+        
+        # Check descendents of sborrow output
+        changed = False
+        descends = []
+        for other in data.ops:
+            if op.output in other.inputs:
+                descends.append(other)
+                
+        for compop in descends:
+            if compop.opcode not in ("INT_EQUAL", "INT_NOTEQUAL"):
+                continue
+            
+            slot = compop.inputs.index(op.output)
+            cvn_id = compop.inputs[1 - slot]
+            cvn = data.nodes[cvn_id]
+            
+            signop = None
+            for dop in data.ops:
+                if dop.output == cvn_id:
+                    signop = dop
+                    break
+                    
+            if not signop or signop.opcode != "INT_SLESS":
+                continue
+                
+            in0_const = (data.nodes[signop.inputs[0]].kind == "const" and int(data.nodes[signop.inputs[0]].name, 16) == 0) if signop.inputs[0] >= 0 else False
+            in1_const = (data.nodes[signop.inputs[1]].kind == "const" and int(data.nodes[signop.inputs[1]].name, 16) == 0) if signop.inputs[1] >= 0 else False
+            
+            if not in0_const:
+                if not in1_const: continue
+                zside = 1
+            else:
+                zside = 0
+                
+            xvn_id = signop.inputs[1 - zside]
+            
+            expr1 = AddExpression(data)
+            expr1.gather_two_terms_subtract(avn_id, bvn_id)
+            expr2 = AddExpression(data)
+            expr2.gather_two_terms_root(xvn_id)
+            
+            if not expr1.is_equivalent(expr2):
+                continue
+                
+            if compop.opcode == "INT_NOTEQUAL":
+                data.op_set_opcode(compop, "INT_SLESS")
+                data.op_set_input(compop, avn_id, 1 - zside)
+                data.op_set_input(compop, bvn_id, zside)
+            else:
+                data.op_set_opcode(compop, "INT_SLESSEQUAL")
+                data.op_set_input(compop, avn_id, zside)
+                data.op_set_input(compop, bvn_id, 1 - zside)
+            changed = True
+            
+        return 1 if changed else 0
 
 
 class RuleDivChain(Rule):
@@ -4278,16 +4339,96 @@ class RuleSelectCse(Rule):
         return 0
 
 
+from typing import Tuple
+from minighidra.expression import TermOrder
+
 class RuleCollectTerms(Rule):
-    """This rule requires TermOrder analysis which isn't ported into the minighidra Rule engine."""
+    """Collects and simplifies additive terms in expressions like a*3 + a*2 -> a*5."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "collectterms")
-        self.disabled = True
 
     def get_op_list(self) -> list[str]:
-        return []
+        return ["INT_ADD"]
+
+    def _get_mult_coeff(self, vn_id: int, data: PcodeLikeGraph) -> Tuple[int, int]:
+        """Returns the underlying varnode and its coefficient."""
+        node = data.nodes[vn_id]
+        if node.kind == "const":
+            return vn_id, 1
+            
+        def_op = None
+        for op in data.ops:
+            if op.output == vn_id:
+                def_op = op
+                break
+                
+        if def_op and def_op.opcode == "INT_MULT" and len(def_op.inputs) == 2:
+            in1 = data.nodes[def_op.inputs[1]]
+            if in1.kind == "const":
+                val = int(in1.name, 16) if in1.name else 0
+                return def_op.inputs[0], val
+        return vn_id, 1
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if not op.output: return 0
+        
+        # Check if next op is an ADD
+        lone_descend = None
+        count = 0
+        for other_op in data.ops:
+            if op.output in other_op.inputs:
+                count += 1
+                lone_descend = other_op
+        if count == 1 and lone_descend and lone_descend.opcode == "INT_ADD":
+            return 0
+            
+        term_order = TermOrder(op, data)
+        term_order.collect()
+        term_order.sort_terms()
+        
+        order = term_order.sorter
+        if len(order) < 2:
+            return 0
+            
+        first_node = data.nodes[order[0].varnode]
+        if not (first_node.kind == "const"):
+            for i in range(1, len(order)):
+                vn1_id = order[i-1].varnode
+                vn2_id = order[i].varnode
+                
+                n2 = data.nodes[vn2_id]
+                if n2.kind == "const":
+                    break
+                    
+                base_vn1, coef1 = self._get_mult_coeff(vn1_id, data)
+                base_vn2, coef2 = self._get_mult_coeff(vn2_id, data)
+                
+                if base_vn1 == base_vn2:
+                    if order[i-1].multiplier or order[i].multiplier:
+                        # distributeIntMultAdd logic skipped for now
+                        pass
+                    else:
+                        base_node = data.nodes[base_vn1]
+                        sz = base_node.size_bits
+                        new_coef = (coef1 + coef2) & ((1 << sz) - 1)
+                        
+                        new_cnode = len(data.nodes)
+                        data.nodes.append(PcodeVarnode(new_cnode, hex(new_coef), sz, "const"))
+                        zero_cnode = len(data.nodes)
+                        data.nodes.append(PcodeVarnode(zero_cnode, hex(0), sz, "const"))
+                        
+                        data.op_set_input(order[i-1].op, zero_cnode, order[i-1].slot)
+                        if new_coef == 0:
+                            data.op_set_input(order[i].op, zero_cnode, order[i].slot)
+                        else:
+                            # Create multiplication
+                            nextop = PcodeOp(len(data.ops), "INT_MULT", [base_vn1, new_cnode], None, order[i].op.addr)
+                            vn2 = len(data.nodes)
+                            data.nodes.append(PcodeVarnode(vn2, f"tmp_{vn2}", sz, "temp"))
+                            nextop.output = vn2
+                            data.op_insert_before(nextop, order[i].op)
+                            data.op_set_input(order[i].op, vn2, order[i].slot)
+                        return 1
         return 0
 
 
@@ -4704,349 +4845,30 @@ class RuleCollapseConstants(Rule):
         
         return 1
 
-class RuleCollectTerms(Rule):
-    """This rule requires TermOrder analysis which isn't ported into the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "collectterms")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class RuleEarlyRemoval(Rule):
-    """Remove purely dead op early in rule application."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "earlyremoval")
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if op.opcode in {"CALL", "CALLIND", "CALLOTHER", "STORE", "BRANCH", "CBRANCH", "BRANCHIND", "RETURN", "IMARK"}:
-            return 0
-        if op.output is None: return 0
-        
-        node = data.nodes[op.output]
-        if node.kind not in {"temporary", "unique"}: return 0
-        
-        for cand in data.ops:
-            if cand.opcode == "IMARK": continue
-            if op.output in cand.inputs:
-                return 0
-                
-        data.op_destroy(op)
-        return 1
-
-class RuleFloatCast(Rule):
-    """Simplify FLOAT_FLOAT2FLOAT and FLOAT_TRUNC applied to FLOAT_FLOAT2FLOAT or FLOAT_INT2FLOAT"""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "floatcast")
-
-    def get_op_list(self) -> list[str]:
-        return ["FLOAT_FLOAT2FLOAT", "FLOAT_TRUNC"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 1: return 0
-        vn1 = op.inputs[0]
-        castop = next((cand for cand in data.ops if cand.output == vn1), None)
-        if not castop or len(castop.inputs) != 1: return 0
-        
-        opc2 = castop.opcode
-        if opc2 not in ("FLOAT_FLOAT2FLOAT", "FLOAT_INT2FLOAT"): return 0
-        
-        opc1 = op.opcode
-        vn2 = castop.inputs[0]
-        
-        insize1 = data.nodes[vn1].size_bits
-        insize2 = data.nodes[vn2].size_bits
-        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
-        
-        if opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
-            if insize1 > outsize:
-                data.op_set_input(op, vn2, 0)
-                if outsize == insize2:
-                    data.op_set_opcode(op, "COPY")
-                return 1
-            elif insize2 < insize1:
-                data.op_set_input(op, vn2, 0)
-                return 1
-        elif opc2 == "FLOAT_INT2FLOAT" and opc1 == "FLOAT_FLOAT2FLOAT":
-            data.op_set_input(op, vn2, 0)
-            data.op_set_opcode(op, "FLOAT_INT2FLOAT")
-            return 1
-        elif opc2 == "FLOAT_FLOAT2FLOAT" and opc1 == "FLOAT_TRUNC":
-            data.op_set_input(op, vn2, 0)
-            return 1
-        return 0
 
 
-class RuleIgnoreNan(Rule):
-    """This rule requires floating-point comparisons tracking and data configuration which isn't ported into the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "ignorenan")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class RuleUnsigned2Float(Rule):
-    """Simplify conversion: T = int2float((X >> 1) | X & 1); T + T => int2float( zext(X) )"""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "unsigned2float")
-
-    def get_op_list(self) -> list[str]:
-        return ["FLOAT_INT2FLOAT"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 1: return 0
-        invn = op.inputs[0]
-        orop = next((cand for cand in data.ops if cand.output == invn), None)
-        if not orop or orop.opcode != "INT_OR" or len(orop.inputs) != 2: return 0
-        
-        shiftop = None
-        andop = None
-        for i in range(2):
-            cnd = next((cand for cand in data.ops if cand.output == orop.inputs[i]), None)
-            if cnd and cnd.opcode == "INT_RIGHT":
-                shiftop = cnd
-                andop = next((cand for cand in data.ops if cand.output == orop.inputs[1 - i]), None)
-                break
-                
-        if not shiftop: return 0
-        
-        cshift = data.nodes[shiftop.inputs[1]]
-        if cshift.kind != "const" or int(cshift.name, 16) != 1: return 0
-        
-        basevn = shiftop.inputs[0]
-        if not andop: return 0
-        
-        if andop.opcode == "INT_ZEXT" and len(andop.inputs) == 1:
-            andop = next((cand for cand in data.ops if cand.output == andop.inputs[0]), None)
-            
-        if not andop or andop.opcode != "INT_AND" or len(andop.inputs) != 2: return 0
-        
-        cand_const = data.nodes[andop.inputs[1]]
-        if cand_const.kind != "const" or int(cand_const.name, 16) != 1: return 0
-        
-        vn = andop.inputs[0]
-        if basevn != vn:
-            subop = next((cand for cand in data.ops if cand.output == vn), None)
-            if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return 0
-            csub = data.nodes[subop.inputs[1]]
-            if csub.kind != "const" or int(csub.name, 16) != 0: return 0
-            vn = subop.inputs[0]
-            if basevn != vn: return 0
-            
-        outvn = op.output
-        if outvn is None: return 0
-        
-        descendants = [cand for cand in data.ops if outvn in cand.inputs]
-        for addop in descendants:
-            if addop.opcode != "FLOAT_ADD" or len(addop.inputs) != 2: continue
-            if addop.inputs[0] != outvn or addop.inputs[1] != outvn: continue
-            
-            preferred_zext_size = 8 if data.nodes[basevn].size_bits == 4 * 8 else data.nodes[basevn].size_bits * 2
-            # Simulating TypeOpFloatInt2Float::preferredZextSize approximation
-            
-            zextop = PcodeOp(addop.addr, "INT_ZEXT", len(data.nodes), (basevn,))
-            zextout = len(data.nodes)
-            data.nodes.append(PcodeVarnode(zextout, None, preferred_zext_size, "unique"))
-            zextop.output = zextout
-            data.ops.append(zextop)
-            
-            data.op_set_opcode(addop, "FLOAT_INT2FLOAT")
-            data.op_remove_input(addop, 1)
-            data.op_set_input(addop, zextout, 0)
-            return 1
-            
-        return 0
 
 
-class RuleInt2FloatCollapse(Rule):
-    """This rule requires block structure flow conditions which aren't properly ported into the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "int2floatcollapse")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
-class RuleFuncPtrEncoding(Rule):
-    """This rule relies on funcptr_align from architecture info, which isn't currently surfaced in minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "funcptrencoding")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class RuleLzcountShiftBool(Rule):
-    """Simplify LZCOUNT of boolean results."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "lzcountshiftbool")
-
-    def get_op_list(self) -> list[str]:
-        return ["LZCOUNT"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        outVn = op.output
-        if outVn is None: return 0
-        
-        max_return = 8 * data.nodes[op.inputs[0]].size_bits
-        if bin(max_return).count('1') != 1: return 0
-        
-        descendants = [cand for cand in data.ops if outVn in cand.inputs]
-        for baseOp in descendants:
-            if baseOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
-            
-            vn1 = data.nodes[baseOp.inputs[1]]
-            if vn1.kind != "const": continue
-            
-            shift = int(vn1.name, 16)
-            if (max_return >> shift) == 1:
-                newOp = PcodeOp(baseOp.addr, "INT_EQUAL", len(data.nodes), (op.inputs[0], len(data.nodes)))
-                b = len(data.nodes)
-                data.nodes.append(PcodeVarnode(b, "0x0", data.nodes[op.inputs[0]].size_bits, "const"))
-                newOp.inputs = (op.inputs[0], b)
-                
-                eqResVn = len(data.nodes)
-                data.nodes.append(PcodeVarnode(eqResVn, None, 1, "unique"))
-                newOp.output = eqResVn
-                data.ops.append(newOp)
-                
-                data.op_remove_input(baseOp, 1)
-                
-                if data.nodes[baseOp.output].size_bits == 1:
-                    data.op_set_opcode(baseOp, "COPY")
-                else:
-                    data.op_set_opcode(baseOp, "INT_ZEXT")
-                data.op_set_input(baseOp, eqResVn, 0)
-                return 1
-        return 0
 
 
-class RuleFloatSign(Rule):
-    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "floatsign")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
-class RuleFloatSignCleanup(Rule):
-    """This rule requires TypeOp floatSignManipulation knowledge from architecture which isn't currently ported to the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "floatsigncleanup")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class RuleFloatRange(Rule):
-    """Simplify combinations of float comparisons: (x < y) | (x == y) => x <= y"""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "floatrange")
 
-    def get_op_list(self) -> list[str]:
-        return ["BOOL_AND", "BOOL_OR"]
 
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if len(op.inputs) != 2: return 0
-        vn1, vn2 = op.inputs[0], op.inputs[1]
+
         
         
 
-class RuleTransformCpool(Rule):
-    """This rule requires CPool resolution which isn't currently ported to the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "transformcpool")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class RuleAliasUpdate(Rule):
-    """This rule requires alias collapsing operations not implemented in the minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "aliasupdate")
-        self.disabled = True
 
-    def get_op_list(self) -> list[str]:
-        return []
 
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
-
-class RuleMultiCollapse(Rule):
-    """Collapses MULTIEQUAL operations where all branches produce the same varnode."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "multicollapse")
-
-    def get_op_list(self) -> list[str]:
-        return ["MULTIEQUAL"]
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        if not op.inputs: return 0
-        
-        # We only match absolute identical inputs or loop-backs to the output itself
-        # Functional equality (value equivalence via identical AST expressions) is skipped for now.
-        defcopyr = None
-        for i, in_vn in enumerate(op.inputs):
-            # Skip loop-backs
-            if in_vn == op.output:
-                continue
-            if defcopyr is None:
-                defcopyr = in_vn
-            elif in_vn != defcopyr:
-                return 0
-                
-        if defcopyr is None:
-            return 0
-            
-        data.op_set_opcode(op, "COPY")
-        while len(op.inputs) > 1:
-            data.op_remove_input(op, 1)
-        data.op_set_input(op, defcopyr, 0)
-        return 1
-
-class RuleCollapseConstants(Rule):
-    """This rule requires expression collapse and Constant tracking which isn't currently ported to minighidra Rule engine."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "collapseconstants")
-        self.disabled = True
-
-    def get_op_list(self) -> list[str]:
-        return []
-
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
 
