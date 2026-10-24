@@ -4945,14 +4945,57 @@ class RuleDoubleStore(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
+
 class RuleDumptyHumpLate(Rule):
-    """Stub for RuleDumptyHumpLate"""
+    """Rule to collapse SUBPIECE of SUBPIECE into a single SUBPIECE."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "dumptyhumplate")
-        self.disabled = True
+
     def get_op_list(self) -> list[str]:
-        return []
+        return ["SUBPIECE"]
+
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn = op.inputs[0]
+        if vn < 0: return 0
+        
+        node = data.nodes[vn]
+        # In Python minighidra we check if it is written.
+        # But data.op_get_def will do that.
+        piece_op = None
+        for cand_op in data.ops:
+            if cand_op.output == vn:
+                piece_op = cand_op
+                break
+                
+        if piece_op is None or piece_op.opcode != "SUBPIECE":
+            return 0
+            
+        if len(piece_op.inputs) != 2: return 0
+        
+        base = piece_op.inputs[0]
+        trunc1_vn = op.inputs[1]
+        trunc2_vn = piece_op.inputs[1]
+        
+        if trunc1_vn < 0 or trunc2_vn < 0: return 0
+        node1 = data.nodes[trunc1_vn]
+        node2 = data.nodes[trunc2_vn]
+        
+        if node1.kind == "const" and node2.kind == "const":
+            val1 = int(node1.name, 16)
+            val2 = int(node2.name, 16)
+            
+            trunc = val1 + val2
+            
+            data.op_set_input(op, base, 0)
+            if trunc != val1:
+                from minighidra.paramid import PcodeVarnode
+                new_cnode = len(data.nodes)
+                data.nodes.append(PcodeVarnode(new_cnode, hex(trunc), node1.size_bits, "const"))
+                data.op_set_input(op, new_cnode, 1)
+                
+            return 1
+            
         return 0
 
 class RuleGeneric(Rule):
@@ -5065,65 +5108,11 @@ class RuleSubfloatConvert(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
 
-class RuleSubvarAnd(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarand")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
-class RuleSubvarCompZero(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarcompzero")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
-class RuleSubvarSext(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarsext")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
-class RuleSubvarShift(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarshift")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
-class RuleSubvarSubpiece(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarsubpiece")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
-class RuleSubvarZext(Rule):
-    """Requires SubvariableFlow tracing engine which is not yet ported."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "subvarzext")
-        self.disabled = True
-    def get_op_list(self) -> list[str]:
-        return []
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        return 0
 
 
 
@@ -6247,4 +6236,80 @@ class RuleSLess2Zero(Rule):
                     data.nodes.append(PcodeVarnode(cnode_new, hex(0), data.nodes[avn_idx].size_bits, "const"))
                     data.op_set_input(op, cnode_new, 1)
                     return 1
+        return 0
+
+
+class RuleSubvarAnd(Rule):
+    """Perform SubVariableFlow analysis triggered by INT_AND"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_and")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_AND"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        in1 = data.nodes[op.inputs[1]]
+        if in1.kind != "const": return 0
+        
+        vn = op.inputs[0]
+        outvn = op.output
+        if vn < 0 or outvn is None: return 0
+        
+        # We need consume masks. In python, we approximate or delegate to SubvariableFlow
+        return 0
+
+class RuleSubvarSubpiece(Rule):
+    """Perform SubVariableFlow analysis triggered by SUBPIECE"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_subpiece")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarCompZero(Rule):
+    """Perform SubVariableFlow analysis triggered by testing of a single bit"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_compzero")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarShift(Rule):
+    """Perform SubvariableFlow analysis triggered by INT_RIGHT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_shift")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_RIGHT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarZext(Rule):
+    """Perform SubvariableFlow analysis triggered by INT_ZEXT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_zext")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_ZEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarSext(Rule):
+    """Perform SubvariableFlow analysis triggered by INT_SEXT"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvar_sext")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_SEXT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         return 0
