@@ -4593,6 +4593,19 @@ class RuleFloatRange(Rule):
             data.op_set_input(op, cvn1, 1 - slot1)
         return 1
 
+
+class RuleTransformCpool(Rule):
+    """This rule requires CPool resolution which isn't currently ported to the minighidra Rule engine."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "transformcpool")
+        self.disabled = True
+
+    def get_op_list(self) -> list[str]:
+        return []
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
