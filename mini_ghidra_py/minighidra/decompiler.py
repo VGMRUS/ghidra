@@ -3247,7 +3247,8 @@ class SemanticDecompiler:
                         emitted.append(f"/* {instruction.address:#x} */ {marker}();")
                     continue
                 round_name = self._sleigh_round_userop_name(operation)
-                assert round_name is not None and operation.output is not None
+                if round_name is None or operation.output is None:
+                    return False
                 values = self._read_sleigh_round_userop_values(
                     state, operation, scratch, instruction, round_name
                 )
