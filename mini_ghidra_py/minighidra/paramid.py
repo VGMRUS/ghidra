@@ -2743,6 +2743,106 @@ class PcodeLikeGraph:
             pass
         return new_op
 
+    
+    def op_flip_in_place_test(self, op: PcodeOp, fliplist: list[PcodeOp], allow_op_removal: bool) -> int:
+        if op.opcode == "CBRANCH":
+            vn = op.inputs[1]
+            if sum(1 for cand in self.ops if vn in cand.inputs) != 1: return 2
+            def_op = next((cand for cand in self.ops if cand.output == vn), None)
+            if not def_op: return 2
+            subtest1 = self.op_flip_in_place_test(def_op, fliplist, allow_op_removal)
+            if subtest1 != 2 and getattr(op, "boolean_flip", False):
+                subtest1 = 1 - subtest1
+            return subtest1
+            
+        elif op.opcode in ("INT_EQUAL", "FLOAT_EQUAL"):
+            fliplist.append(op)
+            return 1
+            
+        elif op.opcode == "BOOL_NEGATE":
+            if not allow_op_removal: return 2
+            fliplist.append(op)
+            return 0
+            
+        elif op.opcode in ("INT_NOTEQUAL", "FLOAT_NOTEQUAL"):
+            fliplist.append(op)
+            return 0
+            
+        elif op.opcode in ("INT_SLESS", "INT_LESS"):
+            vn = op.inputs[0]
+            fliplist.append(op)
+            if self.nodes[vn].kind != "const": return 1
+            return 0
+            
+        elif op.opcode in ("INT_SLESSEQUAL", "INT_LESSEQUAL"):
+            vn = op.inputs[1]
+            fliplist.append(op)
+            if self.nodes[vn].kind == "const": return 1
+            return 0
+            
+        elif op.opcode in ("BOOL_OR", "BOOL_AND"):
+            vn0 = op.inputs[0]
+            if sum(1 for cand in self.ops if vn0 in cand.inputs) != 1: return 2
+            def0 = next((cand for cand in self.ops if cand.output == vn0), None)
+            if not def0: return 2
+            subtest1 = self.op_flip_in_place_test(def0, fliplist, allow_op_removal)
+            if subtest1 == 2: return 2
+            
+            vn1 = op.inputs[1]
+            if sum(1 for cand in self.ops if vn1 in cand.inputs) != 1: return 2
+            def1 = next((cand for cand in self.ops if cand.output == vn1), None)
+            if not def1: return 2
+            subtest2 = self.op_flip_in_place_test(def1, fliplist, allow_op_removal)
+            if subtest2 == 2: return 2
+            
+            fliplist.append(op)
+            return subtest1
+            
+        return 2
+
+    def op_flip_in_place_execute(self, fliplist: list[PcodeOp]) -> None:
+        def get_booleanflip(opc):
+            if opc == "INT_EQUAL": return "INT_NOTEQUAL", False
+            if opc == "INT_NOTEQUAL": return "INT_EQUAL", False
+            if opc == "INT_SLESS": return "INT_SLESSEQUAL", True
+            if opc == "INT_LESS": return "INT_LESSEQUAL", True
+            if opc == "INT_SLESSEQUAL": return "INT_SLESS", True
+            if opc == "INT_LESSEQUAL": return "INT_LESS", True
+            if opc == "FLOAT_EQUAL": return "FLOAT_NOTEQUAL", False
+            if opc == "FLOAT_NOTEQUAL": return "FLOAT_EQUAL", False
+            if opc == "FLOAT_LESS": return "FLOAT_LESSEQUAL", True
+            if opc == "FLOAT_LESSEQUAL": return "FLOAT_LESS", True
+            if opc == "BOOL_NEGATE": return "COPY", False
+            if opc in ("BOOL_AND", "BOOL_OR"): return "MAX", False
+            return "MAX", False
+            
+        for op in fliplist:
+            opc, flipyes = get_booleanflip(op.opcode)
+            if opc == "COPY":
+                vn = op.inputs[0]
+                other_ops = [cand for cand in self.ops if op.output in cand.inputs]
+                if len(other_ops) == 1:
+                    other_op = other_ops[0]
+                    slots = [i for i, inp in enumerate(other_op.inputs) if inp == op.output]
+                    if slots:
+                        self.op_set_input(other_op, vn, slots[0])
+                self.op_destroy(op)
+            elif opc == "MAX":
+                if op.opcode == "BOOL_AND":
+                    self.op_set_opcode(op, "BOOL_OR")
+                elif op.opcode == "BOOL_OR":
+                    self.op_set_opcode(op, "BOOL_AND")
+            else:
+                self.op_set_opcode(op, opc)
+                if flipyes:
+                    self.op_swap_input(op, 0, 1)
+
+    
+    def op_swap_input(self, op: PcodeOp, slot1: int, slot2: int) -> None:
+        inputs = list(op.inputs)
+        inputs[slot1], inputs[slot2] = inputs[slot2], inputs[slot1]
+        op.inputs = tuple(inputs)
+
     def is_boolean_value(self, vn_id: int) -> bool:
         node = self.nodes[vn_id]
         if node.kind == "const":

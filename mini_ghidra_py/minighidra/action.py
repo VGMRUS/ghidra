@@ -416,7 +416,7 @@ class ActionDatabase:
             ActionPrototypeTypes,
         )
         from .action_varnode import ActionVarnodeProps, ActionDirectWrite
-        from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
+        from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal, ActionNormalizeBranches
         from .blockaction import ActionBlockStructure, ActionFinalStructure, ActionConditionalConst, ActionSwitchNorm
 
         from .rule import (
@@ -430,6 +430,7 @@ class ActionDatabase:
         # Standard decompilation phases ported so far:
         # 0. SSA Heritage and Cleanup
         universal.add_action(ActionUnreachable("base"))
+        universal.add_action(ActionNormalizeBranches("blockrecovery"))
         universal.add_action(ActionVarnodeProps("base"))
         universal.add_action(ActionHeritage("base"))
         
