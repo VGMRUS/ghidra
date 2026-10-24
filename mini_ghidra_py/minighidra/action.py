@@ -62,7 +62,8 @@ class ActionDatabase:
             ActionPool, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add,
             RulePiece2Zext, RulePiece2Sext, RuleTermOrder, RuleBxor2NotEqual,
             RuleAndOrLump, RuleOrCollapse, RuleAndMask, RuleLogicIdentity,
-            RuleDoubleLoad, RulePullsubMulti
+            RuleDoubleLoad, RulePullsubMulti, RuleLessOne, RuleZextEliminate,
+            RuleSlessToLess
         )
 
         universal = ActionGroup("universal", "universal")
@@ -90,6 +91,9 @@ class ActionDatabase:
         actprop.add_rule(RuleLogicIdentity("analysis"))
         actprop.add_rule(RuleDoubleLoad("analysis"))
         actprop.add_rule(RulePullsubMulti("analysis"))
+        actprop.add_rule(RuleLessOne("analysis"))
+        actprop.add_rule(RuleZextEliminate("analysis"))
+        actprop.add_rule(RuleSlessToLess("analysis"))
         universal.add_action(actprop)
 
         universal.add_action(ActionForceGoto("blockrecovery"))

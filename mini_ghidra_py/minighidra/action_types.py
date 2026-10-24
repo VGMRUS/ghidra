@@ -23,11 +23,55 @@ class ActionDeadCode(Action):
         super().__init__(group, "deadcode")
 
     def apply(self, data: PcodeLikeGraph) -> int:
-        # MiniGhidra prunes unread sinks implicitly in the fallback symbolic renderer,
-        # but a formal dead code action would iteratively remove PcodeOps without 
-        # valid read references or side-effects.
         self.count = 0
-        return 0
+        changed = True
+        
+        # Operations that are preserved even if output is unread
+        # CALL, CALLIND, CALLOTHER, STORE, BRANCH, CBRANCH, BRANCHIND, RETURN
+        side_effect_ops = {
+            "CALL", "CALLIND", "CALLOTHER", "STORE", 
+            "BRANCH", "CBRANCH", "BRANCHIND", "RETURN"
+        }
+        
+        while changed:
+            changed = False
+            
+            # 1. Count uses for all varnodes
+            use_counts = {}
+            for op in data.ops:
+                if op.opcode == "IMARK":
+                    continue
+                for inp in op.inputs:
+                    use_counts[inp] = use_counts.get(inp, 0) + 1
+                    
+            # 2. Iterate and eliminate pure ops with 0 uses
+            for op in list(data.ops):
+                if op.opcode == "IMARK":
+                    continue
+                if op.opcode in side_effect_ops:
+                    continue
+                    
+                # If it's a pure operation, it must have an output. 
+                # If output is not used and not a special global sink, it's dead.
+                if op.output is None:
+                    continue
+                    
+                # Is the output used?
+                if use_counts.get(op.output, 0) == 0:
+                    # In a full decompiler, we'd check if op.output is an externally 
+                    # visible register/memory that must survive. But since minighidra
+                    # converts escaping vars to explicit outputs or leaves them implicitly,
+                    # we only kill temporaries, unique, and SSA variables.
+                    node = data.nodes[op.output]
+                    # We can safely delete if it's a temporary/unique, or if it's not a root output
+                    # For now, let's assume we can kill anything with 0 internal uses EXCEPT 
+                    # specific global registers. But minighidra handles active_output.
+                    if node.kind in {"temporary", "unique"}:
+                        data.op_destroy(op)
+                        changed = True
+                        self.count += 1
+                        
+        return self.count
 
 class ActionInferTypes(Action):
     """Infers missing/ambiguous types for operations in the graph."""

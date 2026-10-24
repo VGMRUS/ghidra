@@ -2743,6 +2743,21 @@ class PcodeLikeGraph:
             pass
         return new_op
 
+    def op_destroy(self, op: PcodeOp) -> None:
+        self.clear_nzmask_cache()
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(op.__dict__)
+        new_op.__dict__["opcode"] = "IMARK" # Dead op
+        new_op.__dict__["inputs"] = ()
+        if op.output is not None:
+            self._definitions.pop(op.output, None)
+        new_op.__dict__["output"] = None
+        try:
+            idx = self.ops.index(op)
+            self.ops[idx] = new_op
+        except ValueError:
+            pass
+
     def new_constant(self, size_bits: int, value: int) -> int:
         self.clear_nzmask_cache()
         name = f"const_{value:#x}"
