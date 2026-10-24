@@ -2604,6 +2604,20 @@ class PcodeLikeGraph:
             pass
         return new_op
 
+    def op_remove_input(self, op: PcodeOp, slot: int) -> PcodeOp:
+        new_inputs = list(op.inputs)
+        if slot < len(new_inputs):
+            new_inputs.pop(slot)
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(op.__dict__)
+        new_op.__dict__["inputs"] = tuple(new_inputs)
+        try:
+            idx = self.ops.index(op)
+            self.ops[idx] = new_op
+        except ValueError:
+            pass
+        return new_op
+
     def op_set_opcode(self, op: PcodeOp, new_opcode: str) -> PcodeOp:
         new_op = object.__new__(PcodeOp)
         new_op.__dict__.update(op.__dict__)

@@ -58,7 +58,11 @@ class ActionDatabase:
         from .action_controlflow import ActionUnreachable, ActionForceGoto, ActionRestrictLocal
         from .blockaction import ActionBlockStructure, ActionFinalStructure, ActionConditionalConst, ActionSwitchNorm
 
-        from .rule import ActionPool, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add
+        from .rule import (
+            ActionPool, RuleTrivialArith, RuleXorCollapse, RuleAddMultCollapse, RuleSub2Add,
+            RulePiece2Zext, RulePiece2Sext, RuleTermOrder, RuleBxor2NotEqual,
+            RuleAndOrLump, RuleOrMask, RuleAndMask, RuleLogicIdentity
+        )
 
         universal = ActionGroup("universal", "universal")
         self.register_action("universal", universal)
@@ -75,6 +79,14 @@ class ActionDatabase:
         actprop.add_rule(RuleXorCollapse("analysis"))
         actprop.add_rule(RuleAddMultCollapse("analysis"))
         actprop.add_rule(RuleSub2Add("analysis"))
+        actprop.add_rule(RulePiece2Zext("analysis"))
+        actprop.add_rule(RulePiece2Sext("analysis"))
+        actprop.add_rule(RuleTermOrder("analysis"))
+        actprop.add_rule(RuleBxor2NotEqual("analysis"))
+        actprop.add_rule(RuleAndOrLump("analysis"))
+        actprop.add_rule(RuleOrMask("analysis"))
+        actprop.add_rule(RuleAndMask("analysis"))
+        actprop.add_rule(RuleLogicIdentity("analysis"))
         universal.add_action(actprop)
 
         universal.add_action(ActionForceGoto("blockrecovery"))
