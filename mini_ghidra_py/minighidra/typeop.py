@@ -80,6 +80,26 @@ class TypeOpStore(TypeOp):
                 return in_types[1].target
         return None
 
+
+class TypeOpMath(TypeOp):
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        # Return the first known type, favoring non-boolean
+        for t in in_types:
+            if t is not None:
+                return t
+        return None
+
+    @staticmethod
+    def pop(op: PcodeOp, out_type: Optional[CType], in_types: list[Optional[CType]], slot: int) -> Optional[CType]:
+        if out_type is not None:
+            return out_type
+        # If output unknown, try the other input
+        other = 1 - slot
+        if other >= 0 and other < len(in_types) and in_types[other] is not None:
+            return in_types[other]
+        return None
+
 class TypeOpCompare(TypeOp):
     @staticmethod
     def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
@@ -99,7 +119,20 @@ TYPE_OPS = {
     "COPY": TypeOpCopy(),
     "MULTIEQUAL": TypeOpMultiEqual(),
     "INT_ADD": TypeOpIntAdd(),
-    "INT_SUB": TypeOpIntAdd(), # Simplified logic for pointer - int
+    "INT_SUB": TypeOpIntAdd(),
+
+    "INT_MULT": TypeOpMath(),
+    "INT_DIV": TypeOpMath(),
+    "INT_SDIV": TypeOpMath(),
+    "INT_REM": TypeOpMath(),
+    "INT_SREM": TypeOpMath(),
+    "INT_AND": TypeOpMath(),
+    "INT_OR": TypeOpMath(),
+    "INT_XOR": TypeOpMath(),
+    "INT_LEFT": TypeOpMath(),
+    "INT_RIGHT": TypeOpMath(),
+    "INT_SRIGHT": TypeOpMath(),
+
     "LOAD": TypeOpLoad(),
     "STORE": TypeOpStore(),
     "INT_EQUAL": TypeOpCompare(),

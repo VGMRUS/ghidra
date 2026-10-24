@@ -4927,6 +4927,257 @@ class RuleSignForm2(Rule):
         data.op_set_input(op, a, 0)
         return 1
 
+
+class RuleBitFieldIn(Rule):
+    """Stub for RuleBitFieldIn"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "bitfieldin")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleBitFieldLoad(Rule):
+    """Stub for RuleBitFieldLoad"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "bitfieldload")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleBitFieldOut(Rule):
+    """Stub for RuleBitFieldOut"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "bitfieldout")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleBitFieldStore(Rule):
+    """Stub for RuleBitFieldStore"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "bitfieldstore")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleDoubleIn(Rule):
+    """Stub for RuleDoubleIn"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "doublein")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleDoubleOut(Rule):
+    """Stub for RuleDoubleOut"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "doubleout")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleDoubleStore(Rule):
+    """Stub for RuleDoubleStore"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "doublestore")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleDumptyHumpLate(Rule):
+    """Stub for RuleDumptyHumpLate"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "dumptyhumplate")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleGeneric(Rule):
+    """Stub for RuleGeneric"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "generic")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleInsertAbsorb(Rule):
+    """Stub for RuleInsertAbsorb"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "insertabsorb")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleOrPredicate(Rule):
+    """Stub for RuleOrPredicate"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "orpredicate")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RulePullAbsorb(Rule):
+    """Stub for RulePullAbsorb"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "pullabsorb")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSplitCopy(Rule):
+    """Stub for RuleSplitCopy"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "splitcopy")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSplitFlow(Rule):
+    """Stub for RuleSplitFlow"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "splitflow")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSplitLoad(Rule):
+    """Stub for RuleSplitLoad"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "splitload")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSplitStore(Rule):
+    """Stub for RuleSplitStore"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "splitstore")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleStringCopy(Rule):
+    """Stub for RuleStringCopy"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "stringcopy")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleStringStore(Rule):
+    """Stub for RuleStringStore"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "stringstore")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubfloatConvert(Rule):
+    """Stub for RuleSubfloatConvert"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subfloatconvert")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarAnd(Rule):
+    """Stub for RuleSubvarAnd"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarand")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarCompZero(Rule):
+    """Stub for RuleSubvarCompZero"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarcompzero")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarSext(Rule):
+    """Stub for RuleSubvarSext"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarsext")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarShift(Rule):
+    """Stub for RuleSubvarShift"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarshift")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarSubpiece(Rule):
+    """Stub for RuleSubvarSubpiece"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarsubpiece")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
+class RuleSubvarZext(Rule):
+    """Stub for RuleSubvarZext"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subvarzext")
+        self.disabled = True
+    def get_op_list(self) -> list[str]:
+        return []
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        return 0
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 

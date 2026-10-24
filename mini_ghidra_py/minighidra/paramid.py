@@ -2593,6 +2593,12 @@ class PcodeLikeGraph:
         if hasattr(self, "_nzmask_cache"):
             self._nzmask_cache.clear()
 
+    
+    def get_consume(self, vn_id: int) -> int:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            return 0
+        return (1 << self.nodes[vn_id].size_bits) - 1
+
     def get_nzmask(self, vn_id: int) -> int:
         if vn_id < 0 or vn_id >= len(self.nodes):
             return 0
