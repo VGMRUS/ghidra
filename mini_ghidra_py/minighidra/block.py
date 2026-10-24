@@ -7,7 +7,21 @@ class FlowBlock:
         self.block_type = block_type
         self.in_edges: list[FlowBlock] = []
         self.out_edges: list[FlowBlock] = []
+        self.out_edge_flags: dict[int, int] = {}
         self.flags = 0
+
+    def is_default_branch(self, i: int) -> bool:
+        return self.out_edge_flags.get(i, 0) & 1 != 0
+
+    def set_default_switch(self, i: int) -> None:
+        self.out_edge_flags[i] = self.out_edge_flags.get(i, 0) | 1
+
+    def is_goto_branch(self, i: int) -> bool:
+        return self.out_edge_flags.get(i, 0) & 2 != 0
+
+    def set_goto_branch(self, i: int) -> None:
+        self.out_edge_flags[i] = self.out_edge_flags.get(i, 0) | 2
+
 
     def get_type(self) -> str:
         return self.block_type
@@ -20,6 +34,15 @@ class FlowBlock:
         target = self.out_edges[index]
         self.out_edges.pop(index)
         target.in_edges.remove(self)
+        
+        # Shift out_edge_flags
+        new_flags = {}
+        for k, v in self.out_edge_flags.items():
+            if k < index:
+                new_flags[k] = v
+            elif k > index:
+                new_flags[k - 1] = v
+        self.out_edge_flags = new_flags
 
 class BlockBasic(FlowBlock):
     def __init__(self, start_addr: int) -> None:

@@ -1687,6 +1687,266 @@ class RuleConcatZext(Rule):
         data.op_set_opcode(op, "INT_ZEXT")
         return 1
 
+
+class RuleMultNegOne(Rule):
+    """Cleanup: Convert INT_2COMP from INT_MULT: V * -1 => -V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "multnegone")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_MULT"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        mask = (1 << cnode.size_bits) - 1
+        if int(cnode.name, 16) != mask: return 0
+        
+        data.op_set_opcode(op, "INT_2COMP")
+        data.op_remove_input(op, 1)
+        return 1
+
+class Rule2Comp2Sub(Rule):
+    """Cleanup: Convert INT_ADD back to INT_SUB: V + -W ==> V - W"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "2comp2sub")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_2COMP"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        
+        outvn = op.output
+        if outvn is None: return 0
+        
+        addop = None
+        count = 0
+        for cand in data.ops:
+            if outvn in cand.inputs:
+                addop = cand
+                count += 1
+                
+        if count != 1 or not addop or addop.opcode != "INT_ADD": return 0
+        if len(addop.inputs) != 2: return 0
+        
+        if addop.inputs[0] == outvn:
+            data.op_set_input(addop, addop.inputs[1], 0)
+            
+        data.op_set_input(addop, op.inputs[0], 1)
+        data.op_set_opcode(addop, "INT_SUB")
+        data.op_destroy(op)
+        return 1
+
+
+class RuleBooleanUndistribute(Rule):
+    """Undo distributed BOOL_AND through INT_NOTEQUAL"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "booleanundistribute")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_EQUAL", "INT_NOTEQUAL"]
+
+    def _is_match(self, leftVn: int, rightVn: int, data: PcodeLikeGraph) -> tuple[bool, bool]:
+        if leftVn == rightVn:
+            return True, False
+            
+        def is_negate_of(v1, v2):
+            op = next((cand for cand in data.ops if cand.output == v1), None)
+            if op and op.opcode == "BOOL_NEGATE" and len(op.inputs) == 1 and op.inputs[0] == v2:
+                return True
+            return False
+            
+        if is_negate_of(leftVn, rightVn) or is_negate_of(rightVn, leftVn):
+            return True, True
+            
+        return False, False
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn0, vn1 = op.inputs[0], op.inputs[1]
+        
+        op0 = next((cand for cand in data.ops if cand.output == vn0), None)
+        if not op0 or op0.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
+        
+        op1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not op1 or op1.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
+        
+        if len(op0.inputs) != 2 or len(op1.inputs) != 2: return 0
+        ins = [op0.inputs[0], op0.inputs[1], op1.inputs[0], op1.inputs[1]]
+        
+        isflipped = [False, False, False, False]
+        centralEqual = (op.opcode == "INT_EQUAL")
+        
+        if op0.opcode == "BOOL_OR":
+            isflipped[0] = not isflipped[0]
+            isflipped[1] = not isflipped[1]
+            centralEqual = not centralEqual
+            
+        if op1.opcode == "BOOL_OR":
+            isflipped[2] = not isflipped[2]
+            isflipped[3] = not isflipped[3]
+            centralEqual = not centralEqual
+            
+        leftSlot = -1
+        rightSlot = -1
+        
+        matched, flip = self._is_match(ins[0], ins[2], data)
+        if matched:
+            leftSlot, rightSlot = 0, 2
+            if flip: isflipped[2] = not isflipped[2]
+        else:
+            matched, flip = self._is_match(ins[0], ins[3], data)
+            if matched:
+                leftSlot, rightSlot = 0, 3
+                if flip: isflipped[3] = not isflipped[3]
+            else:
+                matched, flip = self._is_match(ins[1], ins[2], data)
+                if matched:
+                    leftSlot, rightSlot = 1, 2
+                    if flip: isflipped[2] = not isflipped[2]
+                else:
+                    matched, flip = self._is_match(ins[1], ins[3], data)
+                    if matched:
+                        leftSlot, rightSlot = 1, 3
+                        if flip: isflipped[3] = not isflipped[3]
+                        
+        if leftSlot == -1: return 0
+        if isflipped[leftSlot] != isflipped[rightSlot]: return 0
+        
+        if centralEqual:
+            combineOpc = "BOOL_OR"
+            isflipped[leftSlot] = not isflipped[leftSlot]
+        else:
+            combineOpc = "BOOL_AND"
+            
+        finalA = ins[leftSlot]
+        if isflipped[leftSlot]:
+            neg_op = PcodeOp(op.addr, "BOOL_NEGATE", len(data.nodes), (finalA,))
+            data.nodes.append(PcodeVarnode(neg_op.output, None, 1, "unique"))
+            data.ops.append(neg_op)
+            finalA = neg_op.output
+            
+        if isflipped[1 - leftSlot]: centralEqual = not centralEqual
+        if isflipped[5 - rightSlot]: centralEqual = not centralEqual
+        
+        finalB = ins[1 - leftSlot]
+        finalC = ins[5 - rightSlot]
+        
+        eqOp = PcodeOp(op.addr, "INT_EQUAL" if centralEqual else "INT_NOTEQUAL", len(data.nodes), (finalB, finalC))
+        data.nodes.append(PcodeVarnode(eqOp.output, None, 1, "unique"))
+        data.ops.append(eqOp)
+        
+        data.op_set_opcode(op, combineOpc)
+        data.op_set_input(op, eqOp.output, 1)
+        data.op_set_input(op, finalA, 0)
+        return 1
+
+class RuleBooleanDedup(Rule):
+    """Remove duplicate clauses in boolean expressions"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "booleandedup")
+
+    def get_op_list(self) -> list[str]:
+        return ["BOOL_AND", "BOOL_OR"]
+
+    def _is_match(self, leftVn: int, rightVn: int, data: PcodeLikeGraph) -> tuple[bool, bool]:
+        if leftVn == rightVn:
+            return True, False
+            
+        def is_negate_of(v1, v2):
+            op = next((cand for cand in data.ops if cand.output == v1), None)
+            if op and op.opcode == "BOOL_NEGATE" and len(op.inputs) == 1 and op.inputs[0] == v2:
+                return True
+            return False
+            
+        if is_negate_of(leftVn, rightVn) or is_negate_of(rightVn, leftVn):
+            return True, True
+            
+        return False, False
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn0, vn1 = op.inputs[0], op.inputs[1]
+        
+        op0 = next((cand for cand in data.ops if cand.output == vn0), None)
+        if not op0 or op0.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
+        
+        op1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not op1 or op1.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
+        
+        if len(op0.inputs) != 2 or len(op1.inputs) != 2: return 0
+        ins = [op0.inputs[0], op0.inputs[1], op1.inputs[0], op1.inputs[1]]
+        
+        matched, flip = self._is_match(ins[0], ins[2], data)
+        if matched:
+            leftA, rightA, leftO, rightO = ins[0], ins[2], ins[1], ins[3]
+        else:
+            matched, flip = self._is_match(ins[0], ins[3], data)
+            if matched:
+                leftA, rightA, leftO, rightO = ins[0], ins[3], ins[1], ins[2]
+            else:
+                matched, flip = self._is_match(ins[1], ins[2], data)
+                if matched:
+                    leftA, rightA, leftO, rightO = ins[1], ins[2], ins[0], ins[3]
+                else:
+                    matched, flip = self._is_match(ins[1], ins[3], data)
+                    if matched:
+                        leftA, rightA, leftO, rightO = ins[1], ins[3], ins[0], ins[2]
+                    else:
+                        return 0
+                        
+        centralOpc = op.opcode
+        opc0, opc1 = op0.opcode, op1.opcode
+        
+        if flip:
+            if centralOpc == "BOOL_AND" and opc0 == "BOOL_AND" and opc1 == "BOOL_AND":
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(0), 1, "const"))
+                data.op_set_input(op, cnew, 0)
+                return 1
+            if centralOpc == "BOOL_OR" and opc0 == "BOOL_OR" and opc1 == "BOOL_OR":
+                data.op_set_opcode(op, "COPY")
+                data.op_remove_input(op, 1)
+                cnew = len(data.nodes)
+                data.nodes.append(PcodeVarnode(cnew, hex(1), 1, "const"))
+                data.op_set_input(op, cnew, 0)
+                return 1
+            if centralOpc == "BOOL_OR" and opc0 != opc1:
+                finalA = leftA if opc0 == "BOOL_OR" else rightA
+                finalOpc = "BOOL_OR"
+                bcOpc = "BOOL_OR"
+            else:
+                return 0
+        else:
+            if centralOpc == opc0 and centralOpc == opc1:
+                finalA = leftA
+                finalOpc = centralOpc
+                bcOpc = centralOpc
+            elif centralOpc != opc0 and centralOpc != opc1:
+                finalA = leftA
+                finalOpc = centralOpc
+                bcOpc = centralOpc
+            elif centralOpc == "BOOL_OR" and opc0 != opc1:
+                finalA = leftA
+                finalOpc = "BOOL_OR"
+                bcOpc = "BOOL_AND"
+            else:
+                return 0
+                
+        newop = PcodeOp(op.addr, bcOpc, len(data.nodes), (leftO, rightO))
+        data.nodes.append(PcodeVarnode(newop.output, None, 1, "unique"))
+        data.ops.append(newop)
+        
+        data.op_set_opcode(op, finalOpc)
+        data.op_set_input(op, finalA, 0)
+        data.op_set_input(op, newop.output, 1)
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
