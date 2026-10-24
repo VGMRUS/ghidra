@@ -36,250 +36,40 @@ class ActionGroup(Action):
 
 
 
-class ActionConditionalExe(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "conditionalexe")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionConstantPtr(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "constantptr")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionConstbase(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "constbase")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionCopyMarker(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "copymarker")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionCse(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "cse")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionDeindirect(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "deindirect")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 
 
-class ActionDominantCopy(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "dominantcopy")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionDynamicMapping(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "dynamicmapping")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionExtraPopSetup(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "extrapopsetup")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionFuncLink(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "funclink")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionFuncLinkOutOnly(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "funclinkoutonly")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionHideShadow(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "hideshadow")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionInputPrototype(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "inputprototype")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionInternalStorage(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "internalstorage")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionLaneDivide(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "lanedivide")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class ActionLikelyTrash(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "likelytrash")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionMapGlobals(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "mapglobals")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionMappedLocalSync(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "mappedlocalsync")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionMarkIndirectOnly(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "markindirectonly")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionMergeMultiEntry(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "mergemultientry")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class ActionNodeJoin(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "nodejoin")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionNonzeroMask(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "nonzeromask")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionNormalizeBranches(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "normalizebranches")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionNormalizeSetup(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "normalizesetup")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionOutputPrototype(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "outputprototype")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionParamDouble(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "paramdouble")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionParamShiftStart(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "paramshiftstart")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionParamShiftStop(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "paramshiftstop")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
-
-class ActionPreferComplement(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "prefercomplement")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 
-class ActionRestructureVarnode(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "restructurevarnode")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class ActionReturnSplit(Action):
     """This action splits return blocks to avoid overlapping return conditions."""
@@ -314,77 +104,14 @@ class ActionReturnSplit(Action):
         
         return self.count
 
-class ActionSegmentize(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "segmentize")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionShadowVar(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "shadowvar")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionSpacebase(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "spacebase")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionStackPtrFlow(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "stackptrflow")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionStart(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "start")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionStartCleanUp(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "startcleanup")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionStartTypes(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "starttypes")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionStructureTransform(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "structuretransform")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
-class ActionUnjustifiedParams(Action):
-    """This action is currently stubbed/disabled in the Python port."""
-    def __init__(self, group: str) -> None:
-        super().__init__(group, "unjustifiedparams")
-        self.disabled = True
-    def apply(self, data: PcodeLikeGraph) -> int:
-        return 0
 
 class ActionDatabase:
     """Registry and orchestrator of decompiler actions."""

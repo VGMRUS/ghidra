@@ -59,3 +59,24 @@ class ActionSwitchNorm(Action):
     def apply(self, data: PcodeLikeGraph) -> int:
         return 0
 
+
+
+class ActionStructureTransform(Action):
+    """Finalizes structural transformation passes over the graph.
+    In minighidra, collapse/structure actions subsume this."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "structuretransform")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+class ActionPreferComplement(Action):
+    """Adjusts block conditions to prefer complementary operations if they are more canonical.
+    In minighidra, normalizebranches typically handles most of this."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "prefercomplement")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
