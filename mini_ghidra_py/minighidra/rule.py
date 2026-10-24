@@ -2540,6 +2540,170 @@ class RuleLessNotEqual(Rule):
             return 1
         return 0
 
+
+class RuleNegateNegate(Rule):
+    """Simplify double negate: ~ (~ V) => V"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "negatenegate")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_NEGATE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 1: return 0
+        vn1 = op.inputs[0]
+        neg2 = next((cand for cand in data.ops if cand.output == vn1), None)
+        if not neg2 or neg2.opcode != "INT_NEGATE" or len(neg2.inputs) != 1: return 0
+        
+        vn2 = neg2.inputs[0]
+        data.op_set_input(op, vn2, 0)
+        data.op_set_opcode(op, "COPY")
+        return 1
+
+
+class RuleOrCompare(Rule):
+    """Simplify (V | W) == 0 => (V == 0) && (W == 0)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "orcompare")
+
+    def get_op_list(self) -> list[str]:
+        return ["INT_OR"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        outvn = op.output
+        if outvn is None: return 0
+        
+        has_compares = False
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        for comp_op in descendants:
+            if comp_op.opcode not in ("INT_EQUAL", "INT_NOTEQUAL"): return 0
+            if len(comp_op.inputs) != 2: return 0
+            
+            cnode = data.nodes[comp_op.inputs[1]]
+            if cnode.kind != "const" or int(cnode.name, 16) != 0: return 0
+            has_compares = True
+            
+        if not has_compares: return 0
+        
+        v, w = op.inputs[0], op.inputs[1]
+        
+        for comp_op in descendants:
+            opc = comp_op.opcode
+            
+            zero_v = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zero_v, "0x0", data.nodes[v].size_bits, "const"))
+            eq_v = PcodeOp(comp_op.addr, opc, len(data.nodes), (v, zero_v))
+            data.nodes.append(PcodeVarnode(eq_v.output, None, 1, "unique"))
+            data.ops.append(eq_v)
+            
+            zero_w = len(data.nodes)
+            data.nodes.append(PcodeVarnode(zero_w, "0x0", data.nodes[w].size_bits, "const"))
+            eq_w = PcodeOp(comp_op.addr, opc, len(data.nodes), (w, zero_w))
+            data.nodes.append(PcodeVarnode(eq_w.output, None, 1, "unique"))
+            data.ops.append(eq_w)
+            
+            data.op_set_input(comp_op, eq_v.output, 0)
+            data.op_set_input(comp_op, eq_w.output, 1)
+            data.op_set_opcode(comp_op, "BOOL_AND" if opc == "INT_EQUAL" else "BOOL_OR")
+            
+        return 1
+
+
+class RuleShiftSub(Rule):
+    """Simplify SUBPIECE of INT_LEFT: sub(V << (n*8), c) => sub(V, c - n)"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "shiftsub")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        vn = op.inputs[0]
+        shiftop = next((cand for cand in data.ops if cand.output == vn), None)
+        if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
+        
+        sa = data.nodes[shiftop.inputs[1]]
+        if sa.kind != "const": return 0
+        
+        n = int(sa.name, 16)
+        if (n & 7) != 0: return 0
+        
+        c = int(data.nodes[op.inputs[1]].name, 16)
+        shift_in = shiftop.inputs[0]
+        
+        insize = data.nodes[shift_in].size_bits
+        outsize = data.nodes[op.output].size_bits if op.output is not None else 0
+        
+        c -= (n // 8)
+        if c < 0 or c * 8 + outsize > insize: return 0
+        
+        data.op_set_input(op, shift_in, 0)
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(c), data.nodes[op.inputs[1]].size_bits, "const"))
+        data.op_set_input(op, cnew, 1)
+        return 1
+
+
+class RuleSubRight(Rule):
+    """Convert high SUBPIECE to INT_RIGHT + low SUBPIECE"""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "subright")
+
+    def get_op_list(self) -> list[str]:
+        return ["SUBPIECE"]
+
+    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        if len(op.inputs) != 2: return 0
+        cnode = data.nodes[op.inputs[1]]
+        if cnode.kind != "const": return 0
+        
+        c = int(cnode.name, 16)
+        if c == 0: return 0
+        
+        a = op.inputs[0]
+        outvn = op.output
+        if outvn is None: return 0
+        
+        opc = "INT_RIGHT"
+        d = c * 8
+        
+        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        lone = descendants[0] if len(descendants) == 1 else None
+        
+        if lone:
+            opc2 = lone.opcode
+            if opc2 in ("INT_RIGHT", "INT_SRIGHT") and len(lone.inputs) == 2:
+                scnode = data.nodes[lone.inputs[1]]
+                if scnode.kind == "const":
+                    if data.nodes[outvn].size_bits + c * 8 == data.nodes[a].size_bits:
+                        d += int(scnode.name, 16)
+                        if d >= data.nodes[a].size_bits:
+                            if opc2 == "INT_RIGHT": return 0
+                            d = data.nodes[a].size_bits - 1
+                        
+                        op = lone
+                        data.op_set_opcode(op, "SUBPIECE")
+                        opc = opc2
+        
+        shiftop = PcodeOp(op.addr, opc, len(data.nodes), (a,))
+        newout = len(data.nodes)
+        data.nodes.append(PcodeVarnode(newout, None, data.nodes[a].size_bits, "unique"))
+        shiftop.output = newout
+        
+        cnew = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew, hex(d), 4 * 8, "const"))
+        shiftop.inputs = (a, cnew)
+        data.ops.append(shiftop)
+        
+        data.op_set_input(op, newout, 0)
+        cnew2 = len(data.nodes)
+        data.nodes.append(PcodeVarnode(cnew2, "0x0", 4 * 8, "const"))
+        data.op_set_input(op, cnew2, 1)
+        return 1
+
 class ActionPool(Action):
     """A collection of Rules that are applied iteratively to a function's p-code ops."""
 
