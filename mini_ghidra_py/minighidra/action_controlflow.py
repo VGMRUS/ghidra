@@ -1,5 +1,5 @@
 from __future__ import annotations
-from .paramid import PcodeLikeGraph
+from .paramid import PcodeLikeGraph, PcodeOp
 from .action import Action
 
 
@@ -323,13 +323,31 @@ class ActionConstantPtr(Action):
         return 0
 
 class ActionCopyMarker(Action):
-    """Tracks and propagates markings for variable shadowing/copying."""
+    """Mark copies that only connect pieces of one logical C variable.
+
+    Ghidra delegates the detailed high-variable and join-space checks to its
+    ``Merge`` object.  MiniGhidraPy keeps the same boundary: this action marks
+    operations only after the graph's high-variable assignments are available,
+    and records the reason on both the operation and the graph for downstream
+    source-level consumers.
+    """
+
     def __init__(self, group: str) -> None:
         super().__init__(group, "copymarker")
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        from .merge import Merge
+
+        merge = getattr(data, "merge", None)
+        if merge is None:
+            merge = Merge(data)
+            data.merge = merge  # type: ignore[attr-defined]
+        if len(merge.node_to_high) < len(data.nodes):
+            merge.assign_highs()
+        self.count += merge.mark_pure_padding_copies()
+        self.count += merge.mark_internal_copies()
+        return self.count
 
 
 class ActionDeindirect(Action):
@@ -472,13 +490,82 @@ class ActionNodeJoin(Action):
         return self.count
 
 class ActionShadowVar(Action):
-    """Identifies shadow variables across paths for more advanced aliasing."""
+    """Collapse duplicate MULTIEQUALs into COPY aliases.
+
+    A duplicated phi has the same ordered incoming varnodes as an earlier phi
+    in the same SSA block.  Replacing the later phi with a copy gives both
+    varnodes one source-level identity and avoids duplicate stack/register
+    variable names at joins.
+    """
+
     def __init__(self, group: str) -> None:
         super().__init__(group, "shadowvar")
 
+    @staticmethod
+    def _block_key(op: PcodeOp, data: PcodeLikeGraph) -> tuple[str, int]:
+        if op.block_id is not None:
+            return ("block", op.block_id)
+        if op.address is not None:
+            return ("address", op.address)
+        return ("operation", id(op))
+
+    @staticmethod
+    def _at_block_start(op: PcodeOp, data: PcodeLikeGraph) -> bool:
+        if op.block_id is None or data.ssa_function is None:
+            return True
+        block = data.ssa_function.block_by_id.get(op.block_id)
+        if block is None:
+            return False
+        return op.address is None or op.address == block.instruction_address
+
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        phis_by_block: dict[tuple[str, int], list[tuple[int, PcodeOp]]] = {}
+        first_inputs: dict[tuple[str, int], set[int]] = {}
+        candidates: list[tuple[int, PcodeOp]] = []
+
+        for index, operation in enumerate(data.ops):
+            if operation.opcode != "MULTIEQUAL" or operation.output is None:
+                continue
+            if not self._at_block_start(operation, data):
+                continue
+            if not operation.inputs:
+                continue
+            key = self._block_key(operation, data)
+            first_input = operation.inputs[0]
+            seen = first_inputs.setdefault(key, set())
+            if first_input in seen:
+                candidates.append((index, operation))
+            else:
+                seen.add(first_input)
+            phis_by_block.setdefault(key, []).append((index, operation))
+
+        for index, operation in candidates:
+            key = self._block_key(operation, data)
+            match = next(
+                (
+                    earlier
+                    for earlier_index, earlier in reversed(phis_by_block.get(key, ()))
+                    if earlier_index < index
+                    and earlier.output is not None
+                    and earlier.inputs == operation.inputs
+                ),
+                None,
+            )
+            if match is None or match.output is None:
+                continue
+            data.op_rewrite(
+                operation,
+                opcode="COPY",
+                inputs=(match.output,),
+                input_slots=(0,),
+                input_ranks=(None,),
+                loop_inputs=(),
+                evidence="shadow-phi-copy",
+            )
+            data.shadow_aliases[operation.output] = match.output
+            self.count += 1
+        return self.count
 
 
 class ActionMergeType(Action):

@@ -108,16 +108,34 @@ class ConditionalExecution:
         
     def test_removability(self, op: PcodeOp) -> bool:
         if op.opcode == "MULTIEQUAL":
-            # Parity full check for multiequals in simplified version
-        else:
-            if op.opcode in ("BRANCH", "CBRANCH", "BRANCHIND", "RETURN", "CALL", "CALLIND", "CALLOTHER", "STORE", "LOAD"):
-                # CBRANCH is allowed because it's the one we are eliminating
-                if op.opcode != "CBRANCH": return False
+            # A phi is removable only if every consumer of its result can also
+            # be moved out of the conditional block.
             vn = op.output
-            if vn is not None:
-                for readop in self.data.get_uses(vn):
-                    if not self.test_op_read(vn, readop):
-                        return False
+            if vn is None:
+                return False
+            return all(
+                self.test_op_read(vn, readop)
+                for readop in self.data.get_uses(vn)
+            )
+        if op.opcode in (
+            "BRANCH",
+            "CBRANCH",
+            "BRANCHIND",
+            "RETURN",
+            "CALL",
+            "CALLIND",
+            "CALLOTHER",
+            "STORE",
+            "LOAD",
+        ):
+            # CBRANCH is allowed because it is the condition being eliminated.
+            if op.opcode != "CBRANCH":
+                return False
+        vn = op.output
+        if vn is not None:
+            for readop in self.data.get_uses(vn):
+                if not self.test_op_read(vn, readop):
+                    return False
         return True
 
     def verify(self) -> bool:

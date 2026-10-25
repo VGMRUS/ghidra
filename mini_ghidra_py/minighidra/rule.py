@@ -7142,83 +7142,105 @@ class RuleStringStore(Rule):
         return 0
 
 class RuleSplitLoad(Rule):
-    """Delegate to SplitDatatype to split LOADs of full structs/arrays into fields."""
+    """Split typed aggregate LOADs into component-sized memory accesses."""
+
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "splitload")
+        super().__init__(group, "splitload")
+
     def get_op_list(self) -> list[str]:
         return ["LOAD"]
+
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        from .subflow import SplitDatatype
-        # Full type system resolution skipped in port
-        sd = SplitDatatype(data)
-        if sd.split_load(op, None): return 1
-        return 0
+        from .datatype_split import SplitDatatype
+
+        return int(SplitDatatype(data).split_load(op))
+
 
 class RuleSplitStore(Rule):
-    """Delegate to SplitDatatype to split STOREs of full structs/arrays into fields."""
+    """Split typed aggregate STOREs into component-sized memory writes."""
+
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "splitstore")
+        super().__init__(group, "splitstore")
+
     def get_op_list(self) -> list[str]:
         return ["STORE"]
+
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        from .subflow import SplitDatatype
-        sd = SplitDatatype(data)
-        if sd.split_store(op, None): return 1
-        return 0
+        from .datatype_split import SplitDatatype
+
+        return int(SplitDatatype(data).split_store(op))
+
 
 class RuleSplitCopy(Rule):
-    """Delegate to SplitDatatype to split COPYs of full structs/arrays into fields."""
+    """Split typed aggregate COPYs into field-sized COPYs."""
+
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "splitcopy")
+        super().__init__(group, "splitcopy")
+
     def get_op_list(self) -> list[str]:
         return ["COPY"]
+
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
-        from .subflow import SplitDatatype
-        sd = SplitDatatype(data)
-        if sd.split_copy(op, None, None): return 1
-        return 0
+        from .datatype_split import SplitDatatype
+
+        return int(SplitDatatype(data).split_copy(op))
+
 
 class RuleSplitFlow(Rule):
-    """Delegate to SplitFlow to split data flow paths when SUBPIECE isolates a wide logic type."""
+    """Recover a split logical value when SUBPIECE selects a PIECE's high half."""
+
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "splitflow")
+        super().__init__(group, "splitflow")
+
     def get_op_list(self) -> list[str]:
         return ["SUBPIECE"]
+
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         from .subflow import SplitFlow
-        # Pseudo-implementation mapping to Ghidra's RuleSplitFlow
-        loSize = data.get_constant_value(op.inputs[1]) if data.is_constant(op.inputs[1]) else 0
-        if loSize == 0: return 0
-        vn = op.inputs[0]
-        
-        # Check size constraints
-        if data.nodes[op.output].size_bits + loSize * 8 != data.nodes[vn].size_bits: return 0
-        
-        concatOp = None
-        multiOp = data.get_def(vn)
-        if not multiOp: return 0
-        
-        while multiOp.opcode == "INDIRECT":
-            tmpvn = multiOp.inputs[0]
-            multiOp = data.get_def(tmpvn)
-            if not multiOp: return 0
-            
-        if multiOp.opcode == "PIECE":
-            if data.get_def(vn) != multiOp:
-                concatOp = multiOp
-        elif multiOp.opcode == "MULTIEQUAL":
-            for invn in multiOp.inputs:
-                tmpOp = data.get_def(invn)
-                if tmpOp and tmpOp.opcode == "PIECE":
-                    concatOp = tmpOp
-                    break
-                    
-        if not concatOp: return 0
-        if data.nodes[concatOp.inputs[1]].size_bits != loSize * 8: return 0
-        
-        sf = SplitFlow(data, vn, loSize)
-        # sf.worklist needs initialization in Python port
-        return 0
+
+        if len(op.inputs) != 2 or op.output is None:
+            return 0
+        offset_id = op.inputs[1]
+        if not data.is_constant(offset_id):
+            return 0
+        low_size = data.get_constant_value(offset_id)
+        if low_size <= 0:
+            return 0
+        wide_id = op.inputs[0]
+        if data.nodes[op.output].size_bits + low_size * 8 != data.nodes[wide_id].size_bits:
+            return 0
+        definition = data.get_def(wide_id)
+        seen: set[int] = set()
+        while definition is not None and definition.opcode == "INDIRECT":
+            if not definition.inputs:
+                return 0
+            source_id = definition.inputs[0]
+            if source_id in seen:
+                return 0
+            seen.add(source_id)
+            definition = data.get_def(source_id)
+        concat = None
+        if definition is not None and definition.opcode == "PIECE":
+            concat = definition
+        elif definition is not None and definition.opcode == "MULTIEQUAL":
+            concat = next(
+                (
+                    candidate
+                    for input_id in definition.inputs
+                    if (candidate := data.get_def(input_id)) is not None
+                    and candidate.opcode == "PIECE"
+                ),
+                None,
+            )
+        if concat is None or len(concat.inputs) != 2:
+            return 0
+        if data.nodes[concat.inputs[1]].size_bits != low_size * 8:
+            return 0
+        splitter = SplitFlow(data, wide_id, low_size)
+        if not splitter.do_trace():
+            return 0
+        splitter.apply()
+        return 1
 
 class RuleGeneric(Rule):
     """A user configurable rule (e.g. read from an XML file/SLEIGH)."""

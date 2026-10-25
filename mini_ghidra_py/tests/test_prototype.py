@@ -707,7 +707,7 @@ class IntegratedPrototypeTests(unittest.TestCase):
             )
             indirect_pseudocode = indirect.pseudocode(indirect.functions[0x170000])
             self.assertIn(
-                "FUN_17000B(*((struct ThreeBytes *)(&home_slot_4)))",
+                "FUN_17000B(*((struct ThreeBytes *)&home_slot_4))",
                 indirect_pseudocode,
             )
 
