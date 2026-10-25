@@ -4021,10 +4021,18 @@ class RuleConditionalMove(Rule):
         node = data.nodes[vn_id]
         if node.size_bits == 1:
             return True
-        # Check if it was explicitly extended or from boolean op, omitted for brevity
-        # Assume size 1 is the main requirement
+            
+        def_op = data.get_def(vn_id)
+        if def_op:
+            if def_op.opcode in ("INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_SLESS", "INT_LESSEQUAL", "INT_SLESSEQUAL", "BOOL_NEGATE", "BOOL_AND", "BOOL_OR", "BOOL_XOR", "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL", "FLOAT_NAN", "FLOAT_NAN"):
+                return True
+            if def_op.opcode == "COPY":
+                in_vn = def_op.inputs[0]
+                if data.is_constant(in_vn):
+                    val = data.get_constant_value(in_vn)
+                    if (val & ~1) == 0:
+                        return True
         return False
-
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         from minighidra.block import FlowBlock
         
@@ -6948,7 +6956,7 @@ class RuleSubvarAnd(Rule):
                 
         if cmask == 0: return 0
         
-        # if op.getOut()->hasNoDescend() check omitted for simplicity
+        if len(data.get_uses(outvn)) == 0: return 0
         
         subflow = SubvariableFlow(data, vn, cmask, False, False, False)
         if not subflow.do_trace(): return 0
