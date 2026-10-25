@@ -7253,7 +7253,7 @@ class RuleSubfloatConvert(Rule):
             subflow = SubfloatFlow(data, invn, outsize)
             if not subflow.do_trace(): return 0
             
-        # apply subfloat logic skipped for simplicity
+        subflow.apply()
         return 1
 
 class RuleBitFieldIn(Rule):
