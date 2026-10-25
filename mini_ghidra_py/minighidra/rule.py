@@ -6202,10 +6202,14 @@ class RuleLogicIdentity(Rule):
 class RuleDoubleLoad(Rule):
     """Collapse contiguous loads: V = PIECE(LOAD(ptr+4), LOAD(ptr)) => V = LOAD(ptr)"""
     def __init__(self, group: str) -> None:
-        super().__init__(group, "doubleload")
+        super().__init__(group, 0, "doubleload")
 
     def get_op_list(self) -> tuple[str, ...]:
         return ("PIECE",)
+
+    @classmethod
+    def no_write_conflict(cls, op1: Any, op2: Any, spc: Any, indirects: list[Any] | None) -> Any:
+        return None
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
