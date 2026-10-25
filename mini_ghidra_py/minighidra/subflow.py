@@ -325,6 +325,64 @@ class LaneDivide:
             return False
             
         return True
+class SplitFlow:
+    """
+    Helper for splitting data flow based on high/low precision splits.
+    This simulates SplitFlow tracking logic which is used heavily to recover wide variables 
+    that were artificially split by a compiler.
+    """
+    def __init__(self, data: PcodeLikeGraph, root: int, low_size: int):
+        self.data = data
+        self.root = root
+        self.low_size = low_size
+        self.worklist = []
+        self.varmap = {}
+        
+    def do_trace(self) -> bool:
+        if not self.worklist: return False
+        retval = True
+        while self.worklist:
+            if not self.process_next_work():
+                retval = False
+                break
+        return retval
+
+    def process_next_work(self) -> bool:
+        rvn = self.worklist.pop(-1)
+        if not self.trace_backward(rvn): return False
+        return self.trace_forward(rvn)
+        
+    def trace_forward(self, rvn: Any) -> bool:
+        vn = rvn.vn if hasattr(rvn, 'vn') else -1
+        if vn < 0: return False
+        for op in self.data.get_uses(vn):
+            opc = op.opcode
+            if opc in ("COPY", "MULTIEQUAL", "INDIRECT", "INT_AND", "INT_OR", "INT_XOR"):
+                pass # omitted full op trace logic for SplitFlow placeholder
+            elif opc == "SUBPIECE":
+                pass
+            elif opc == "INT_LEFT":
+                pass
+            elif opc == "INT_RIGHT":
+                pass
+            else:
+                return False
+        return True
+        
+    def trace_backward(self, rvn: Any) -> bool:
+        op = self.data.get_def(rvn.vn) if hasattr(rvn, 'vn') else None
+        if not op: return True
+        opc = op.opcode
+        if opc in ("COPY", "MULTIEQUAL", "INT_AND", "INT_OR", "INT_XOR", "INDIRECT"):
+            pass
+        elif opc == "PIECE":
+            pass
+        elif opc == "INT_ZEXT":
+            pass
+        else:
+            return False
+        return True
+
 class SplitDatatype:
     """
     Helper engine to rewrite operations handling full structured types (like structs or arrays)
@@ -339,12 +397,42 @@ class SplitDatatype:
         self.data_type_pieces = []
 
     def split_copy(self, copy_op: PcodeOp, in_type: Any, out_type: Any) -> bool:
+        # Pseudo-implementation mapping to Ghidra's SplitDatatype::splitCopy
+        in_vn = copy_op.inputs[0]
+        out_vn = copy_op.output
+        if in_vn < 0 or out_vn is None: return False
+        
+        # Omitted: test_copy_constraints, test_datatype_compatibility
+        # If valid, replaces COPY(large_struct) with multiple COPY(field)
         return False
         
     def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
+        self.is_load_store = True
+        out_vn = load_op.output
+        if out_vn is None: return False
+        
+        # Look for lone descend copy
+        uses = self.data.get_uses(out_vn)
+        copy_op = None
+        if len(uses) == 1 and uses[0].opcode == "COPY":
+            copy_op = uses[0]
+            out_vn = copy_op.output
+            
+        # Omitted: compatibility check and building pointers for split LOADs
         return False
         
     def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
+        self.is_load_store = True
+        in_vn = store_op.inputs[2] if len(store_op.inputs) > 2 else -1
+        if in_vn < 0: return False
+        
+        load_op = None
+        def_op = self.data.get_def(in_vn)
+        uses = self.data.get_uses(in_vn)
+        if def_op and def_op.opcode == "LOAD" and len(uses) == 1:
+            load_op = def_op
+            
+        # Omitted: compatibility check and replacing STORE(struct) with multiple STORE(fields)
         return False
 class SubfloatFlow:
     """
