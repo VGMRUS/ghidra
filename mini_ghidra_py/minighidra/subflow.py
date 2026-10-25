@@ -455,20 +455,20 @@ class LaneDivide:
             in_vars = self.set_replacement(in_vn, num_lanes, skip_lanes)
             if not in_vars: return False
         elif opc == "PIECE":
-            # Omitted: buildPiece checks
-            return False
+            # Omitted exact lane/byte checks for buildPiece
+            in0_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in0_vars: return False
+            in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
+            if not in1_vars: return False
         elif opc == "LOAD":
-            # Omitted: buildLoad checks
-            return False
+            if len(op.inputs) < 2: return False
+            ptr_vn = op.inputs[1]
+            if ptr_vn < 0 and not self.data.is_constant(ptr_vn): return False
         elif opc == "INT_ZEXT":
-            # Omitted: buildZext checks
-            return False
-        elif opc == "INT_RIGHT":
-            # Omitted: buildRightShift checks
-            return False
-        elif opc == "INT_LEFT":
-            # Omitted: buildLeftShift checks
-            return False
+            # Just verify lane sizes match ZEXT constraints
+            if self.data.nodes[op.inputs[0]].size_bits > self.data.nodes[rvn.vn].size_bits: return False
+        elif opc in ("INT_RIGHT", "INT_LEFT"):
+            if not self.data.is_constant(op.inputs[1]): return False
         else:
             return False
             
@@ -550,8 +550,38 @@ class SplitDatatype:
         out_vn = copy_op.output
         if in_vn < 0 or out_vn is None: return False
         
-        # Omitted: test_copy_constraints, test_datatype_compatibility
         # If valid, replaces COPY(large_struct) with multiple COPY(field)
+        if in_vn >= 0 and self.data.nodes[in_vn].is_input: return False
+        # Omitted exact data type struct splitting for brevity, structural placeholder:
+        return False
+        
+    def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
+        self.is_load_store = True
+        out_vn = load_op.output
+        if out_vn is None: return False
+        
+        # Look for lone descend copy
+        uses = self.data.get_uses(out_vn)
+        copy_op = None
+        if len(uses) == 1 and uses[0].opcode == "COPY":
+            copy_op = uses[0]
+            out_vn = copy_op.output
+            
+        # Omitted structural layout extraction for LOAD(struct)
+        return False
+        
+    def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
+        self.is_load_store = True
+        in_vn = store_op.inputs[2] if len(store_op.inputs) > 2 else -1
+        if in_vn < 0: return False
+        
+        load_op = None
+        def_op = self.data.get_def(in_vn)
+        uses = self.data.get_uses(in_vn)
+        if def_op and def_op.opcode == "LOAD" and len(uses) == 1:
+            load_op = def_op
+            
+        # Omitted structural field split for STORE(struct)
         return False
         
     def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
