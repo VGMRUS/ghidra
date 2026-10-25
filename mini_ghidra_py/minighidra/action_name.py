@@ -36,6 +36,10 @@ class ActionRestructureVarnode(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
+        # Pseudo-implementation mapping to Ghidra's syncVarnodesWithSymbols
+        if hasattr(data, 'sync_varnodes_with_symbols'):
+            if data.sync_varnodes_with_symbols(False, True):
+                self.count += 1
         return 0
 
 class ActionMappedLocalSync(Action):
@@ -45,8 +49,10 @@ class ActionMappedLocalSync(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
+        if hasattr(data, 'sync_varnodes_with_symbols'):
+            if data.sync_varnodes_with_symbols(True, True):
+                self.count += 1
         return 0
-
 
 class ActionMapGlobals(Action):
     """Maps global variables based on references discovered during analysis."""
@@ -55,8 +61,10 @@ class ActionMapGlobals(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
+        if hasattr(data, 'map_globals'):
+            if data.map_globals():
+                self.count += 1
         return 0
-
 class ActionSpacebase(Action):
     """Establishes spacebase references (like stack or register tracking)."""
     def __init__(self, group: str) -> None:
