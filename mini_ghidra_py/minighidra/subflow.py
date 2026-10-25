@@ -1,3 +1,4 @@
+from minighidra.transform import TransformManager, TransformVar
 from __future__ import annotations
 from typing import Any
 from .paramid import PcodeLikeGraph, PcodeOp
@@ -585,24 +586,167 @@ class SplitDatatype:
         return False
         
 
-class SubfloatFlow:
+class SubfloatFlow(TransformManager):
     """
     Class for tracing changes of precision in floating point variables.
     It follows the flow of a logical lower precision value stored in higher precision locations
     and rewrites the data-flow in terms of the lower precision, eliminating conversions.
     """
     def __init__(self, data: PcodeLikeGraph, root: int, prec: int):
-        self.data = data
-        self.root = root
+        super().__init__(data)
         self.precision = prec
+        self.root = root
         self.terminator_count = 0
         self.worklist = []
+        # format and float conversion skipped in minighidra
+        self.set_replacement(root)
+
+    def preserve_address(self, vn: int, bit_size: int, lsb_offset: int) -> bool:
+        if vn < 0: return False
+        return self.data.nodes[vn].is_input
 
     def max_precision(self, vn: int) -> int:
-        return self.precision
+        if vn < 0 or getattr(self.data.nodes[vn], 'is_input', False):
+            return self.data.nodes[vn].size_bits // 8 if vn >= 0 else 0
+        op = self.data.get_def(vn)
+        if not op: return self.data.nodes[vn].size_bits // 8
+        
+        opc = op.opcode
+        if opc in ("MULTIEQUAL", "FLOAT_NEG", "FLOAT_ABS", "FLOAT_SQRT", 
+                   "FLOAT_CEIL", "FLOAT_FLOOR", "FLOAT_ROUND", "COPY"):
+            return self.data.nodes[vn].size_bits // 8
+        elif opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV"):
+            return 0 # Delay
+        
+        return self.data.nodes[vn].size_bits // 8
 
-    def exceeds_precision(self, op: PcodeOp) -> bool:
-        return False
+    def exceeds_precision(self, op: Any) -> bool:
+        if len(op.inputs) < 2: return False
+        val1 = self.max_precision(op.inputs[0])
+        val2 = self.max_precision(op.inputs[1])
+        min_val = min(val1, val2)
+        return min_val > self.precision
+
+    def set_replacement(self, vn: int) -> TransformVar | None:
+        node = self.data.nodes[vn]
+        if hasattr(node, "mark") and node.mark:
+            return self.get_piece(vn, self.precision * 8, 0)
+            
+        if node.kind == "const":
+            # Just truncating constant for parity stub
+            return self.new_constant(self.precision, 0, int(node.name, 16))
+            
+        if vn < 0: return None
+        
+        # address tied check omitted
+        
+        node.mark = True
+        rvn = self.new_piece(vn, self.precision * 8, 0)
+        self.worklist.append(rvn)
+        return rvn
+
+    def trace_forward(self, rvn: TransformVar) -> bool:
+        vn = rvn.vn
+        uses = self.data.get_uses(vn)
+        for op in uses:
+            out_vn = op.output
+            if out_vn is not None and getattr(self.data.nodes[out_vn], "mark", False):
+                continue
+                
+            opc = op.opcode
+            if opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV"):
+                if self.exceeds_precision(op): return False
+                
+            if opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV", "MULTIEQUAL",
+                       "FLOAT_NEG", "FLOAT_ABS", "FLOAT_SQRT", "FLOAT_CEIL", "FLOAT_FLOOR",
+                       "FLOAT_ROUND", "COPY"):
+                out_rvn = self.set_replacement(out_vn)
+                if not out_rvn: return False
+                rop = self.new_op_replace(len(op.inputs), opc, op)
+                self.op_set_output(rop, out_rvn)
+                for i, invn in enumerate(op.inputs):
+                    if invn == vn:
+                        self.op_set_input(rop, rvn, i)
+                    else:
+                        in_rvn = self.set_replacement(invn)
+                        if not in_rvn: return False
+                        self.op_set_input(rop, in_rvn, i)
+                        
+            elif opc in ("FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL"):
+                if self.exceeds_precision(op): return False
+                rop = self.new_op_replace(2, opc, op)
+                self.op_set_output(rop, self.get_preexisting_varnode(out_vn))
+                for i, invn in enumerate(op.inputs):
+                    if invn == vn:
+                        self.op_set_input(rop, rvn, i)
+                    else:
+                        in_rvn = self.set_replacement(invn)
+                        if not in_rvn: return False
+                        self.op_set_input(rop, in_rvn, i)
+                self.terminator_count += 1
+                
+            elif opc == "FLOAT_FLOAT2FLOAT":
+                out_size = self.data.nodes[out_vn].size_bits // 8
+                if out_size == self.precision:
+                    rop = self.new_op_replace(1, "COPY", op)
+                    self.op_set_output(rop, self.get_preexisting_varnode(out_vn))
+                    self.op_set_input(rop, rvn, 0)
+                    self.terminator_count += 1
+                else:
+                    rop = self.new_op_replace(1, "FLOAT_FLOAT2FLOAT", op)
+                    self.op_set_output(rop, self.get_preexisting_varnode(out_vn))
+                    self.op_set_input(rop, rvn, 0)
+                    self.terminator_count += 1
+            else:
+                return False
+        return True
+
+    def trace_backward(self, rvn: TransformVar) -> bool:
+        op = self.data.get_def(rvn.vn)
+        if not op: return True
+        
+        opc = op.opcode
+        if opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV"):
+            if self.exceeds_precision(op): return False
+            
+        if opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV", "COPY",
+                   "FLOAT_CEIL", "FLOAT_FLOOR", "FLOAT_ROUND", "FLOAT_NEG", "FLOAT_ABS",
+                   "FLOAT_SQRT", "MULTIEQUAL"):
+            # Handled in trace_forward
+            pass
+        elif opc == "FLOAT_FLOAT2FLOAT":
+            in_vn = op.inputs[0]
+            in_size = self.data.nodes[in_vn].size_bits // 8
+            if in_size == self.precision:
+                rop = self.new_op_replace(1, "COPY", op)
+                self.op_set_output(rop, rvn)
+                self.op_set_input(rop, self.get_preexisting_varnode(in_vn), 0)
+            else:
+                rop = self.new_op_replace(1, "FLOAT_FLOAT2FLOAT", op)
+                self.op_set_output(rop, rvn)
+                self.op_set_input(rop, self.get_preexisting_varnode(in_vn), 0)
+        else:
+            return False
+            
+        return True
+
+    def process_next_work(self) -> bool:
+        rvn = self.worklist.pop()
+        if not self.trace_backward(rvn): return False
+        return self.trace_forward(rvn)
 
     def do_trace(self) -> bool:
-        return False
+        self.terminator_count = 0
+        retval = True
+        while self.worklist:
+            if not self.process_next_work():
+                retval = False
+                break
+                
+        for node in self.data.nodes.values():
+            if hasattr(node, "mark"):
+                delattr(node, "mark")
+                
+        if not retval: return False
+        if self.terminator_count == 0: return False
+        return True

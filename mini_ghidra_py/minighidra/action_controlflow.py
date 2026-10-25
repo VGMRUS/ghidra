@@ -365,6 +365,18 @@ class ActionLaneDivide(Action):
     def __init__(self, group: str) -> None:
         super().__init__(group, "lanedivide")
 
+    def process_varnode(self, data: PcodeLikeGraph, vn: int, mode: int) -> bool:
+        from minighidra.subflow import LaneDivide, LaneDescription
+        # Default behavior for mode 2
+        if mode == 2:
+            desc = LaneDescription(data.nodes[vn].size_bits // 8, 4)
+            lane_div = LaneDivide(data, vn, desc, True)
+            if lane_div.do_trace():
+                lane_div.apply()
+                self.count += 1
+                return True
+        return False
+
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
         return 0
