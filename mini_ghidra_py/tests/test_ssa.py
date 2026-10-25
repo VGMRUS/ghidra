@@ -11,6 +11,7 @@ from minighidra import (
     SSAHeritage,
     SSAReturnSite,
 )
+from minighidra.c_ast import CEmitter, CTranslationUnit
 from minighidra.decompiler import SemanticDecompiler
 
 
@@ -289,17 +290,64 @@ class SSAHeritageTests(unittest.TestCase):
             )
         )
 
+    def test_direct_pcode_renderer_walks_machine_add_to_abi_names(self) -> None:
+        raw = bytes.fromhex("89 f8 01 f0 c3")  # mov eax, edi; add eax, esi; ret
+        analyzer, function = self._analyze(raw, "x86_64", 0x430000)
+        decompiler = SemanticDecompiler(analyzer)
+        decompiler.decompile_ast(function)
+        operation = next(
+            item
+            for item in decompiler.ssa_function.operations
+            if item.instruction_address == function.address + 2
+            and item.opcode == "INT_ADD"
+        )
+
+        expression = decompiler.emit_pcode_operation(function, operation.index)
+        self.assertIn("param_1", expression)
+        self.assertIn("param_2", expression)
+        self.assertIn("+", expression)
+        listing = decompiler.emit_pcode_listing(function)
+        self.assertEqual(
+            len(listing.splitlines()),
+            sum(len(item.ops) for item in decompiler.sleigh_instructions),
+        )
+        self.assertIn("INT_ADD", listing)
+        self.assertIn("edi", listing)
+        self.assertIn("esi", listing)
+
     def test_semantic_decompiler_exposes_the_same_validated_ssa_result(self) -> None:
         raw = bytes.fromhex("b8 2a 00 00 00 c3")
         analyzer, function = self._analyze(raw, "x86_64")
         decompiler = SemanticDecompiler(analyzer)
 
-        pseudocode = decompiler.decompile(function)
+        unit = decompiler.decompile_ast(function)
+        self.assertIsInstance(unit, CTranslationUnit)
+        pseudocode = CEmitter().emit(unit)
 
         self.assertIn("return 0x2a;", pseudocode)
         self.assertIsNotNone(decompiler.ssa_function)
         self.assertTrue(decompiler.ssa_function.valid)
         self.assertTrue(decompiler.ssa_function.complete)
+        constant_copy = next(
+            operation
+            for operation in decompiler.ssa_function.operations
+            if operation.opcode == "COPY"
+            and operation.inputs
+            and operation.inputs[0].constant == 42
+        )
+        self.assertEqual(
+            decompiler.emit_pcode_value(function, constant_copy.output_value), "42"
+        )
+        self.assertEqual(
+            decompiler.emit_pcode_operation(function, constant_copy.index), "42"
+        )
+        self.assertEqual(
+            decompiler.emit_pcode_operand(function, constant_copy.index, 0), "42"
+        )
+        self.assertIn(
+            "pcode-constant",
+            decompiler.emit_pcode_value_html(function, constant_copy.output_value),
+        )
 
 
 if __name__ == "__main__":

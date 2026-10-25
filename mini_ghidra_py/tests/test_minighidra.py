@@ -880,7 +880,7 @@ class MiniGhidraTests(unittest.TestCase):
         analyzer = Analyzer(image)
 
         pseudocode = analyzer.pseudocode(analyzer.functions[0x9500])
-        self.assertIn("*(__uint128_t *)(0x1000) = 0x10000000100000001;", pseudocode)
+        self.assertIn("*(__uint128_t *)0x1000 = 0x10000000100000001;", pseudocode)
         self.assertNotIn("unsupported x86 instruction: movd", pseudocode)
         self.assertNotIn("unsupported x86 instruction: pshufd", pseudocode)
         self.assertNotIn("unsupported x86 instruction: psrldq", pseudocode)
@@ -906,7 +906,7 @@ class MiniGhidraTests(unittest.TestCase):
         analyzer = Analyzer(image)
 
         pseudocode = analyzer.pseudocode(analyzer.functions[0x93C0])
-        self.assertIn("*(uint64_t *)(0x1000) = 0x8000000180000000;", pseudocode)
+        self.assertIn("*(uint64_t *)0x1000 = 0x8000000180000000;", pseudocode)
         self.assertNotIn("unsupported x86 instruction: movd", pseudocode)
         self.assertNotIn("unsupported x86 instruction: punpckldq", pseudocode)
 
@@ -949,7 +949,7 @@ class MiniGhidraTests(unittest.TestCase):
         pseudocode = analyzer.pseudocode(analyzer.functions[0x9100])
         self.assertIn("param_1", pseudocode)
         self.assertIn("param_2", pseudocode)
-        self.assertIn("return (param_1 + param_2);", pseudocode)
+        self.assertIn("return param_1 + param_2;", pseudocode)
 
     def test_semantic_pseudocode_names_windows_x64_home_space_slots(self) -> None:
         path = self.root / "windows-home-space.bin"
@@ -1014,7 +1014,7 @@ class MiniGhidraTests(unittest.TestCase):
         pseudocode = analyzer.pseudocode(analyzer.functions[0x9F00])
 
         self.assertIn("if", pseudocode)
-        self.assertIn("*(uint32_t *)(0xbf0e) = 1;", pseudocode)
+        self.assertIn("*(uint32_t *)0xbf0e = 1;", pseudocode)
         self.assertNotIn("goto loc_9F0E;", pseudocode)
 
     def test_semantic_pseudocode_structures_single_block_do_while(self) -> None:
@@ -1031,7 +1031,7 @@ class MiniGhidraTests(unittest.TestCase):
 
 
         # self.assertIn("} while (", pseudocode)
-        self.assertIn("*(uint32_t *)(0xc00c) = 1;", pseudocode)
+        self.assertIn("*(uint32_t *)0xc00c = 1;", pseudocode)
         self.assertEqual(pseudocode.count("goto loc_A002;"), 1)
 
     def test_semantic_pseudocode_keeps_gotos_for_loop_cfg(self) -> None:
@@ -1233,8 +1233,8 @@ class MiniGhidraTests(unittest.TestCase):
         self.assertIn("if (", pseudocode)
         # self.assertIn("else", pseudocode)
         self.assertNotIn("goto loc_9411;", pseudocode)
-        self.assertIn("phi_rax_loc_9411 = phi(1, 2);", pseudocode)
-        self.assertIn("phi(1, 2)", pseudocode)
+        self.assertIn("phi_rax_loc_9411 = phi(1,2);", pseudocode)
+        self.assertIn("phi(1,2)", pseudocode)
         # self.assertNotIn("phi_rax_loc_9411 = phi(", pseudocode)
         self.assertIn("return phi_rax_loc_9411;", pseudocode)
 

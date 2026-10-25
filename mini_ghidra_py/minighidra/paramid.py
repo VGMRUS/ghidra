@@ -83,6 +83,15 @@ class PcodeOp:
     mnemonic: str | None = None
     input_ranks: tuple[ParamRank | None, ...] = ()
     loop_inputs: tuple[bool, ...] = ()
+    input_slots: tuple[int, ...] = ()
+    block_id: int | None = None
+    non_printing: bool = False
+    non_printing_reason: str = ""
+
+    @property
+    def addr(self) -> int | None:
+        """Compatibility spelling used by Ghidra-inspired action passes."""
+        return self.address
 
 
 @dataclass(frozen=True, slots=True)
@@ -1852,6 +1861,17 @@ class PcodeLikeGraph:
         self._output_values: dict[str, set[int]] = defaultdict(set)
         self._output_widths: dict[str, int] = defaultdict(int)
         self._output_sink_operations: dict[str, set[int]] = defaultdict(set)
+        self.node_types: dict[int, Any] = {}
+        self.node_names: dict[int, str] = {}
+        self._node_parameter_names: dict[int, frozenset[str]] = {}
+        self.node_pieces: dict[int, Any] = {}
+        self.padding_nodes: set[int] = set()
+        self.shadow_aliases: dict[int, int] = {}
+        self.non_printing_operations: set[int] = set()
+        self.non_printing_reasons: dict[int, str] = {}
+        self.type_database: Any = None
+        self.parameter_types: dict[str, Any] = {}
+        self.big_endian = False
         self.call_specs: list[Any] = []
         self.merged_model: Any = None
         self.active_output: Any = None
@@ -1970,6 +1990,7 @@ class PcodeLikeGraph:
                     "input" if source_names else value.kind,
                 )
             )
+            graph._node_parameter_names[value.identifier] = frozenset(source_names)
 
         for item in ssa_function.blocks:
             if item.reachable:
@@ -1992,6 +2013,7 @@ class PcodeLikeGraph:
             is_round_userop = round_source_bytes is not None
             inputs: list[int] = []
             input_ranks: list[ParamRank | None] = []
+            input_slots: list[int] = []
             for input_index, operand in enumerate(operation.inputs):
                 if operand.kind in {"constant", "address", "memory"}:
                     continue
@@ -2024,6 +2046,7 @@ class PcodeLikeGraph:
                 )
                 inputs.extend(input_values)
                 input_ranks.extend(rank for _ in input_values)
+                input_slots.extend(input_index for _ in input_values)
             graph._set_definition(
                 PcodeOp(
                     operation.opcode,
@@ -2039,6 +2062,8 @@ class PcodeLikeGraph:
                         or any(rank is not None for rank in input_ranks)
                         else ()
                     ),
+                    input_slots=tuple(input_slots),
+                    block_id=operation.block_id,
                 )
             )
             if is_round_userop and len(operation.inputs) > 2:
@@ -2130,6 +2155,7 @@ class PcodeLikeGraph:
                             is_loop_input(value.block_id, predecessor)
                             for predecessor, _incoming in value.incoming
                         ),
+                        block_id=value.block_id,
                     )
                 )
             elif value.kind == "slice" and value.source is not None:
@@ -2706,48 +2732,147 @@ class PcodeLikeGraph:
             
         return fullmask
 
-    def op_set_input(self, op: PcodeOp, new_in: int, slot: int) -> PcodeOp:
+    def _operation_index(self, operation: PcodeOp) -> int | None:
+        for index, candidate in enumerate(self.ops):
+            if candidate is operation:
+                return index
+        if operation.output is not None:
+            index = self._definitions.get(operation.output)
+            if index is not None and index < len(self.ops):
+                return index
+        for index, candidate in enumerate(self.ops):
+            if candidate == operation:
+                return index
+        return None
+
+    def _replace_operation(self, operation: PcodeOp, **changes: Any) -> PcodeOp:
+        index = self._operation_index(operation)
+        if index is None:
+            return operation
+        old = self.ops[index]
+        updated = replace(old, **changes)
+        self.ops[index] = updated
+        if old.output is not None and old.output != updated.output:
+            self._definitions.pop(old.output, None)
+        if updated.output is not None:
+            self._definitions[updated.output] = index
         self.clear_nzmask_cache()
-        new_inputs = list(op.inputs)
+        return updated
+
+    def op_set_input(self, op: PcodeOp, new_in: int, slot: int) -> PcodeOp:
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        new_inputs = list(current.inputs)
         while len(new_inputs) <= slot:
             new_inputs.append(-1)
         new_inputs[slot] = new_in
-        new_op = object.__new__(PcodeOp)
-        new_op.__dict__.update(op.__dict__)
-        new_op.__dict__["inputs"] = tuple(new_inputs)
-        try:
-            idx = self.ops.index(op)
-            self.ops[idx] = new_op
-        except ValueError:
-            pass
-        return new_op
+        return self._replace_operation(current, inputs=tuple(new_inputs))
+
+    def op_set_inputs(self, op: PcodeOp, inputs: Iterable[int]) -> PcodeOp:
+        """Replace the complete input vector while preserving operation metadata."""
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        return self._replace_operation(current, inputs=tuple(inputs))
 
     def op_remove_input(self, op: PcodeOp, slot: int) -> PcodeOp:
-        self.clear_nzmask_cache()
-        new_inputs = list(op.inputs)
-        if slot < len(new_inputs):
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        new_inputs = list(current.inputs)
+        if 0 <= slot < len(new_inputs):
             new_inputs.pop(slot)
-        new_op = object.__new__(PcodeOp)
-        new_op.__dict__.update(op.__dict__)
-        new_op.__dict__["inputs"] = tuple(new_inputs)
-        try:
-            idx = self.ops.index(op)
-            self.ops[idx] = new_op
-        except ValueError:
-            pass
-        return new_op
+        new_slots = list(current.input_slots)
+        if 0 <= slot < len(new_slots):
+            new_slots.pop(slot)
+        new_ranks = list(current.input_ranks)
+        if 0 <= slot < len(new_ranks):
+            new_ranks.pop(slot)
+        new_loop_inputs = list(current.loop_inputs)
+        if 0 <= slot < len(new_loop_inputs):
+            new_loop_inputs.pop(slot)
+        return self._replace_operation(
+            current,
+            inputs=tuple(new_inputs),
+            input_slots=tuple(new_slots),
+            input_ranks=tuple(new_ranks),
+            loop_inputs=tuple(new_loop_inputs),
+        )
 
     def op_set_opcode(self, op: PcodeOp, new_opcode: str) -> PcodeOp:
-        self.clear_nzmask_cache()
-        new_op = object.__new__(PcodeOp)
-        new_op.__dict__.update(op.__dict__)
-        new_op.__dict__["opcode"] = new_opcode
-        try:
-            idx = self.ops.index(op)
-            self.ops[idx] = new_op
-        except ValueError:
-            pass
-        return new_op
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        return self._replace_operation(current, opcode=new_opcode)
+
+    def op_rewrite(self, op: PcodeOp, **changes: Any) -> PcodeOp:
+        """Replace selected fields of a p-code op, retaining its SSA definition."""
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        return self._replace_operation(current, **changes)
+
+    def op_mark_non_printing(self, op: PcodeOp, reason: str) -> PcodeOp:
+        """Mark a data-flow op as an implementation detail for C emission."""
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        updated = self._replace_operation(
+            current, non_printing=True, non_printing_reason=reason
+        )
+        if index is not None:
+            self.non_printing_operations.add(index)
+            self.non_printing_reasons[index] = reason
+        return updated
+
+    def new_unique(self, size_bits: int, label: str = "split") -> int:
+        """Allocate a unique temporary node measured in bits."""
+        return self._new_temporary_node(label, size_bits)
+
+    def append_operation(self, operation: PcodeOp) -> int:
+        """Append an operation and register its output definition, if any."""
+        if operation.output is not None:
+            return self._set_definition(operation)
+        return self._append_operation(operation)
+
+    def set_node_type(self, vn_id: int, ctype: Any) -> None:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            raise IndexError(f"Varnode fuera de rango: {vn_id}")
+        self.node_types[vn_id] = ctype
+
+    def get_node_name(self, vn_id: int) -> str | None:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            return None
+        if vn_id in self.node_names:
+            return self.node_names[vn_id]
+        current = vn_id
+        seen: set[int] = set()
+        while current in self.shadow_aliases and current not in seen:
+            seen.add(current)
+            current = self.shadow_aliases[current]
+        return self.node_names.get(current, self.nodes[current].name)
+
+    def get_node_type(self, vn_id: int) -> Any | None:
+        if vn_id < 0 or vn_id >= len(self.nodes):
+            return None
+        ctype = self.node_types.get(vn_id)
+        if ctype is not None:
+            return ctype
+        seen: set[int] = set()
+        current = vn_id
+        while current in self.shadow_aliases and current not in seen:
+            seen.add(current)
+            current = self.shadow_aliases[current]
+        ctype = self.node_types.get(current)
+        if ctype is not None:
+            return ctype
+        type_database = self.type_database
+        if type_database is None:
+            return None
+        for name in sorted(self._node_parameter_names.get(current, ())):
+            spec = self.parameter_types.get(name)
+            if spec is None:
+                continue
+            try:
+                return type_database.resolve(spec)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
 
     
     def op_flip_in_place_test(self, op: PcodeOp, fliplist: list[PcodeOp], allow_op_removal: bool) -> int:
@@ -2845,9 +2970,17 @@ class PcodeLikeGraph:
 
     
     def op_swap_input(self, op: PcodeOp, slot1: int, slot2: int) -> None:
-        inputs = list(op.inputs)
+        index = self._operation_index(op)
+        current = self.ops[index] if index is not None else op
+        inputs = list(current.inputs)
         inputs[slot1], inputs[slot2] = inputs[slot2], inputs[slot1]
-        op.inputs = tuple(inputs)
+        changes: dict[str, Any] = {"inputs": tuple(inputs)}
+        for field_name in ("input_slots", "input_ranks", "loop_inputs"):
+            values = list(getattr(current, field_name))
+            if max(slot1, slot2) < len(values):
+                values[slot1], values[slot2] = values[slot2], values[slot1]
+                changes[field_name] = tuple(values)
+        self._replace_operation(current, **changes)
 
     def is_boolean_value(self, vn_id: int) -> bool:
         node = self.nodes[vn_id]
@@ -2862,15 +2995,20 @@ class PcodeLikeGraph:
 
     def op_destroy(self, op: PcodeOp) -> None:
         self.clear_nzmask_cache()
-        # PcodeOp uses slots via dataclass
-        new_op = PcodeOp(opcode="IMARK", inputs=(), output=None, address=op.address)
-        if op.output is not None:
-            self._definitions.pop(op.output, None)
-        try:
-            idx = self.ops.index(op)
-            self.ops[idx] = new_op
-        except ValueError:
-            pass
+        index = self._operation_index(op)
+        if index is None:
+            return
+        current = self.ops[index]
+        if (
+            current.output is not None
+            and self._definitions.get(current.output) == index
+        ):
+            self._definitions.pop(current.output, None)
+        self.non_printing_operations.discard(index)
+        self.non_printing_reasons.pop(index, None)
+        self.ops[index] = PcodeOp(
+            opcode="IMARK", inputs=(), output=None, address=current.address
+        )
 
     def new_constant(self, size_bits: int, value: int) -> int:
         self.clear_nzmask_cache()
@@ -2883,21 +3021,34 @@ class PcodeLikeGraph:
             return self.ops[def_idx]
         return None
 
+    def get_uses(self, vn_id: int) -> list[PcodeOp]:
+        """Return live operations that consume ``vn_id`` (once per operation)."""
+        if vn_id < 0:
+            return []
+        return [
+            operation
+            for operation in self.ops
+            if operation.opcode != "IMARK" and vn_id in operation.inputs
+        ]
+
     def is_constant(self, vn_id: int) -> bool:
         if vn_id < 0 or vn_id >= len(self.nodes):
             return False
-        return self.nodes[vn_id].kind == "constant"
+        return self.nodes[vn_id].kind in {"constant", "const"}
 
     def get_constant_value(self, vn_id: int) -> int:
         if not self.is_constant(vn_id):
             return 0
         name = self.nodes[vn_id].name
         if name.startswith("const_"):
+            name = name[6:]
+        try:
+            return int(name, 0)
+        except ValueError:
             try:
-                return int(name[6:], 16)
+                return int(name, 16)
             except ValueError:
-                pass
-        return 0
+                return 0
 
     def measure(self, name: str, max_depth: int = 10) -> ParamMeasurement:
         """Measure an input by Ghidra's forward ``walkforward`` rank rules."""
@@ -3580,7 +3731,3 @@ def _parameter_order(name: str) -> tuple[int, int, str]:
 def _safe_opcode(value: str) -> str:
     """Make user/register names safe and deterministic in diagnostic opcodes."""
     return re.sub(r"[^A-Z0-9_]", "_", value.upper())
-
-    def get_uses(self, vn_id: int) -> list[PcodeOp]:
-        """Return all PcodeOps that use the given varnode id."""
-        return [op for op in self.ops if vn_id in op.inputs]

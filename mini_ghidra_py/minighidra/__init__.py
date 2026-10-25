@@ -15,6 +15,8 @@ from .action import (
 )
 from .analysis import Analyzer
 from .decompiler import SemanticDecompiler
+from .datatype_split import SplitDatatype, SplitPiece
+from .merge import Merge, VariablePiece
 from .function_starts import FunctionStartCandidate
 from .image import BinaryImage, LoadError
 from .model import Function, FunctionParameter, FunctionSignature
@@ -52,6 +54,16 @@ from .paramlist import (
 )
 from .project import ProjectState
 from .prototype import PrototypeLayout, PrototypeResolver
+from .printlanguage import (
+    OpToken,
+    OpTokenKind,
+    PcodeExpression,
+    PcodeSymbolResolver,
+    PcodeTokenMetadata,
+    PrintLanguageRpn,
+    PrintToken,
+    RpnTokenStack,
+)
 from .sleigh import SleighInstruction, SleighPcodeOp, SleighTranslator, SleighVarnode
 from .ssa import (
     MEMORY_LOCATION,
@@ -68,6 +80,7 @@ from .ssa import (
 from .typesys import (
     CField,
     CType,
+    CTypeComponent,
     JoinRecord,
     StorageLocation,
     TypeDatabase,
@@ -81,6 +94,7 @@ __all__ = [
     "BinaryImage",
     "CField",
     "CType",
+    "CTypeComponent",
     "CallSpecs",
     "Action",
     "ActionActiveParam",
@@ -95,7 +109,13 @@ __all__ = [
     "InstructionDataFlow",
     "JoinRecord",
     "LoadError",
+    "Merge",
     "NoReturnCatalog",
+    "OpToken",
+    "OpTokenKind",
+    "PcodeExpression",
+    "PcodeSymbolResolver",
+    "PcodeTokenMetadata",
     "ParamActive",
     "ParamDirection",
     "ParamEntry",
@@ -117,7 +137,10 @@ __all__ = [
     "PcodeLikeGraph",
     "Primitive",
     "PrimitiveExtractor",
+    "PrintLanguageRpn",
+    "PrintToken",
     "ProjectState",
+    "RpnTokenStack",
     "ProtoModelMerged",
     "PrototypeLayout",
     "PrototypeModel",
@@ -133,6 +156,8 @@ __all__ = [
     "SSAValue",
     "ScoreProtoModel",
     "SemanticDecompiler",
+    "SplitDatatype",
+    "SplitPiece",
     "SleighInstruction",
     "SleighPcodeOp",
     "SleighTranslator",
@@ -140,6 +165,7 @@ __all__ = [
     "StorageLocation",
     "TrialMapResult",
     "TypeDatabase",
+    "VariablePiece",
     "TypeKind",
     "calling_convention_by_name",
     "calling_convention_for",
