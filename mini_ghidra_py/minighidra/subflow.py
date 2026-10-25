@@ -199,8 +199,146 @@ class SubvariableFlow:
         return False
 
     def do_replacement(self) -> None:
-        pass
+        # Do up front processing of the call return patches
+        for patch in list(self.patchlist):
+            if patch.type != PatchRecord.PUSH_PATCH:
+                break
+            push_op = patch.patch_op
+            new_vn = self.get_replace_varnode(patch.in1)
+            old_vn = push_op.output
+            self.data.op_set_output(push_op, new_vn)
 
+            # Create placeholder defining op for old Varnode, until dead code cleans it up
+            new_zext = PcodeOp()
+            new_zext.opcode = "INT_ZEXT"
+            new_zext.inputs = (new_vn,)
+            new_zext.output = old_vn
+            new_zext.address = push_op.address
+            self.data._append_operation(new_zext)
+
+        # Define all the outputs first
+        for rop in self.oplist:
+            new_op = PcodeOp()
+            new_op.opcode = rop.opcode
+            new_op.inputs = (-1,) * rop.numparams
+            new_op.address = rop.op.address if rop.op else None
+            rop.replacement = new_op
+            
+            rout = rop.output
+            if rout is not None:
+                new_op.output = self.get_replace_varnode(rout)
+                self.data._append_operation(new_op)
+            else:
+                self.data._append_operation(new_op)
+
+        # Set all the inputs
+        for rop in self.oplist:
+            new_op = rop.replacement
+            if new_op is None: continue
+            for i, in_rvn in enumerate(rop.inputs):
+                if in_rvn is not None:
+                    new_op = self.data.op_set_input(new_op, self.get_replace_varnode(in_rvn), i)
+            # Update the op in oplist
+            rop.replacement = new_op
+
+        # These are operations that carry flow from the small variable into an existing variable
+        for patch in self.patchlist:
+            if patch.type == PatchRecord.PUSH_PATCH: continue
+            pull_op = patch.patch_op
+            
+            if patch.type == PatchRecord.COPY_PATCH:
+                inputs = list(pull_op.inputs)
+                if len(inputs) > 1:
+                    inputs = [inputs[0]]
+                inputs[0] = self.get_replace_varnode(patch.in1)
+                
+                # Update pull_op directly if possible or through op_set_input
+                new_op = self.data.op_set_opcode(pull_op, "COPY")
+                for i in range(len(pull_op.inputs)-1, 0, -1):
+                    new_op = self.data.op_remove_input(new_op, i)
+                new_op = self.data.op_set_input(new_op, inputs[0], 0)
+                
+            elif patch.type == PatchRecord.COMPARE_PATCH:
+                new_op = self.data.op_set_input(pull_op, self.get_replace_varnode(patch.in1), 0)
+                new_op = self.data.op_set_input(new_op, self.get_replace_varnode(patch.in2), 1)
+                
+            elif patch.type == PatchRecord.PARAMETER_PATCH:
+                new_op = self.data.op_set_input(pull_op, self.get_replace_varnode(patch.in1), patch.slot)
+                
+            elif patch.type == PatchRecord.EXTENSION_PATCH:
+                sa = patch.slot
+                in_vn = self.get_replace_varnode(patch.in1)
+                out_size = self.data.nodes[pull_op.output].size_bits if pull_op.output else self.flowsize * 8
+                in_size = self.data.nodes[in_vn].size_bits
+                
+                if sa == 0:
+                    opc = "COPY" if in_size == out_size else "INT_ZEXT"
+                    new_op = self.data.op_set_opcode(pull_op, opc)
+                    new_op = self.data.op_set_input(new_op, in_vn, 0)
+                else:
+                    if in_size != out_size:
+                        zext_op = PcodeOp()
+                        zext_op.opcode = "INT_ZEXT"
+                        zext_op.inputs = (in_vn,)
+                        zext_op.address = pull_op.address
+                        zext_out = self.data._new_temporary_node("zext", out_size)
+                        zext_op.output = zext_out
+                        self.data._append_operation(zext_op)
+                        in_vn = zext_out
+                        
+                    new_op = self.data.op_set_opcode(pull_op, "INT_LEFT")
+                    new_op = self.data.op_set_input(new_op, in_vn, 0)
+                    new_op = self.data.op_set_input(new_op, self.data.new_constant(4*8, sa), 1)
+                    
+            elif patch.type == PatchRecord.INT2FLOAT_PATCH:
+                zext_op = PcodeOp()
+                zext_op.opcode = "INT_ZEXT"
+                in_vn = self.get_replace_varnode(patch.in1)
+                zext_op.inputs = (in_vn,)
+                zext_op.address = pull_op.address
+                
+                # Assume float target size is out_size
+                out_size = self.data.nodes[pull_op.inputs[0]].size_bits
+                zext_out = self.data._new_temporary_node("zext_float", out_size)
+                zext_op.output = zext_out
+                self.data._append_operation(zext_op)
+                
+                new_op = self.data.op_set_input(pull_op, zext_out, 0)
+
+    def get_replace_varnode(self, rvn: ReplaceVarnode) -> int:
+        if rvn.replacement is not None:
+            return rvn.replacement
+        
+        if rvn.vn < 0:
+            if rvn.def_op is None:
+                return self.data.new_constant(self.flowsize * 8, rvn.val)
+            rvn.replacement = self.data._new_temporary_node("subvar", self.flowsize * 8)
+            return rvn.replacement
+            
+        if self.data.is_constant(rvn.vn):
+            return self.data.new_constant(self.flowsize * 8, rvn.val)
+            
+        if self.use_same_address(rvn):
+            # For simplicity, we just use a new temporary with same semantics
+            rvn.replacement = self.data._new_temporary_node("subvar", self.flowsize * 8)
+        else:
+            rvn.replacement = self.data._new_temporary_node("subvar", self.flowsize * 8)
+            
+        return rvn.replacement
+
+    def use_same_address(self, rvn: ReplaceVarnode) -> bool:
+        if rvn.mask & 1 == 0:
+            return False
+        if self.bitsize >= 8:
+            return True
+        if self.aggressive:
+            return True
+        bitmask = (1 << self.bitsize) - 1
+        consume = self.data.get_consume(rvn.vn)
+        mask = consume | bitmask
+        if mask == rvn.mask:
+            return True
+        return False
 
 class LaneDescription:
     def __init__(self, num_lanes: int):

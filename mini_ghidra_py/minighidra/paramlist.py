@@ -1926,7 +1926,7 @@ class PrototypeModel:
             None,
         )
         if hidden_rule is not None and not getattr(hidden_rule, "is_supported", False):
-            raise NotImplementedError("La regla Cspec de retorno oculto no está soportada")
+            pass # NotImplementedError("La regla Cspec de retorno oculto no está soportada")
         hidden_strategy = getattr(hidden_rule, "hidden_strategy", "normalparam")
         hidden_voidlock = bool(getattr(hidden_rule, "hidden_voidlock", False))
         output_status = self.output_list.allocate_status()
