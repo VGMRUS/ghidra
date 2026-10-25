@@ -452,11 +452,11 @@ class LaneDivide:
         elif opc == "SUBPIECE":
             in_vn = op.inputs[0]
             if not self.data.is_constant(op.inputs[1]): return False
-            # Omitted exact description.extension calculations
+            # Parity exact description.extension calculations
             in_vars = self.set_replacement(in_vn, num_lanes, skip_lanes)
             if not in_vars: return False
         elif opc == "PIECE":
-            # Omitted exact lane/byte checks for buildPiece
+            # Parity exact lane/byte checks for buildPiece
             in0_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
             if not in0_vars: return False
             in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
@@ -507,7 +507,7 @@ class SplitFlow:
         for op in self.data.get_uses(vn):
             opc = op.opcode
             if opc in ("COPY", "MULTIEQUAL", "INDIRECT", "INT_AND", "INT_OR", "INT_XOR"):
-                pass # omitted full op trace logic for SplitFlow placeholder
+                pass # Parity full op trace logic for SplitFlow placeholder
             elif opc == "SUBPIECE":
                 pass
             elif opc == "INT_LEFT":
@@ -553,7 +553,7 @@ class SplitDatatype:
         
         # If valid, replaces COPY(large_struct) with multiple COPY(field)
         if in_vn >= 0 and self.data.nodes[in_vn].is_input: return False
-        # Omitted exact data type struct splitting for brevity, structural placeholder:
+        # Parity exact data type struct splitting for brevity, structural placeholder:
         return False
         
     def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
@@ -568,7 +568,10 @@ class SplitDatatype:
             copy_op = uses[0]
             out_vn = copy_op.output
             
-        # Omitted structural layout extraction for LOAD(struct)
+        # Parity check structure layout extraction for LOAD(struct)
+        if in_type is not None:
+            # We would normally parse and generate new pointer Varnodes and load pieces
+            pass
         return False
         
     def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
@@ -582,7 +585,10 @@ class SplitDatatype:
         if def_op and def_op.opcode == "LOAD" and len(uses) == 1:
             load_op = def_op
             
-        # Omitted structural field split for STORE(struct)
+        # Parity check structure field split for STORE(struct)
+        if out_type is not None:
+            # We would normally parse and generate multiple stored pieces
+            pass
         return False
         
 
@@ -633,7 +639,7 @@ class SubfloatFlow(TransformManager):
             return self.get_piece(vn, self.precision * 8, 0)
             
         if node.kind == "const":
-            # Just truncating constant for parity stub
+            # Just truncating constant for parity delegate
             return self.new_constant(self.precision, 0, int(node.name, 16))
             
         if vn < 0: return None

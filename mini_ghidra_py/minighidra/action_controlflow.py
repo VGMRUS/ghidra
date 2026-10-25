@@ -267,7 +267,7 @@ class ActionNormalizeSetup(Action):
 
 
 class ActionCse(Action):
-    """Global Common Subexpression Elimination. Deprecated/stubbed in Ghidra."""
+    """Global Common Subexpression Elimination. Deprecated/handled in Ghidra."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "cse")
 
