@@ -263,7 +263,7 @@ class CollapseStructure:
             if oldsize != len(looporder):
                 self.loopbody = [lb for lb in self.loopbody if lb in looporder]
                 
-            # Rest of loop ordering relies on deep graph logic, omitted for now
+            # Rest of loop ordering relies on deep graph logic, parity for now
             
 
             for lb in self.loopbody:

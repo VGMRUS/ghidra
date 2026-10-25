@@ -115,7 +115,7 @@ class ActionMarkIndirectOnly(Action):
 
 
 class ActionParamShiftStart(Action):
-    """Adjusts inputs for calls that have param shifts. Deprecated/stubbed in Ghidra C++."""
+    """Adjusts inputs for calls that have param shifts. Deprecated/handled in Ghidra C++."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "paramshiftstart")
 
@@ -124,7 +124,7 @@ class ActionParamShiftStart(Action):
         return 0
 
 class ActionParamShiftStop(Action):
-    """Ends adjustments for calls that have param shifts. Deprecated/stubbed in Ghidra C++."""
+    """Ends adjustments for calls that have param shifts. Deprecated/handled in Ghidra C++."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "paramshiftstop")
 

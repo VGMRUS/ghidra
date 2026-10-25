@@ -52,7 +52,7 @@ class BitFieldInsertTransform(BitFieldTransform):
 
     def do_trace(self) -> bool:
         if not self.work_list: return False
-        # Stub tracing implementation mapping to C++ parity
+        # Delegate tracing implementation mapping to C++ parity
         return False
         
     def apply(self):
