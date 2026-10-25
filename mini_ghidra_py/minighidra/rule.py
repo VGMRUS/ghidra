@@ -114,11 +114,7 @@ class RuleShiftBitops(Rule):
         if constvn.kind != "const": return 0
         
         vn = op.inputs[0]
-        bitop = None
-        for cand in data.ops:
-            if cand.output == vn:
-                bitop = cand
-                break
+        bitop = data.get_def(vn)
         if not bitop: return 0
         
         sa = 0
@@ -189,11 +185,7 @@ class RuleRightShiftAnd(Rule):
         if const_node.kind != "const": return 0
         
         in_vn = op.inputs[0]
-        and_op = None
-        for cand in data.ops:
-            if cand.output == in_vn:
-                and_op = cand
-                break
+        and_op = data.get_def(in_vn)
         if not and_op or and_op.opcode != "INT_AND": return 0
         
         if len(and_op.inputs) != 2: return 0
@@ -285,11 +277,7 @@ class RuleHighOrderAnd(Rule):
         if cnode.kind != "const": return 0
         
         in0 = op.inputs[0]
-        addop = None
-        for cand in data.ops:
-            if cand.output == in0:
-                addop = cand
-                break
+        addop = data.get_def(in0)
                 
         if not addop or addop.opcode != "INT_ADD": return 0
         if len(addop.inputs) != 2: return 0
@@ -332,11 +320,7 @@ class RuleHighOrderAnd(Rule):
                 if (mask2 & val) != mask2: continue
                 
                 nonzerovn = addop.inputs[1-i]
-                addop2 = None
-                for cand in data.ops:
-                    if cand.output == nonzerovn:
-                        addop2 = cand
-                        break
+                addop2 = data.get_def(nonzerovn)
                 if not addop2 or addop2.opcode != "INT_ADD": continue
                 
                 count_descends_nz = 0
@@ -377,11 +361,7 @@ class RuleZextCommute(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         zextvn = op.inputs[0]
-        zextop = None
-        for cand in data.ops:
-            if cand.output == zextvn:
-                zextop = cand
-                break
+        zextop = data.get_def(zextvn)
                 
         if not zextop or zextop.opcode != "INT_ZEXT": return 0
         if len(zextop.inputs) != 1: return 0
@@ -414,11 +394,7 @@ class RuleZextShiftZext(Rule):
         if len(op.inputs) != 1: return 0
         invn = op.inputs[0]
         
-        shiftop = None
-        for cand in data.ops:
-            if cand.output == invn:
-                shiftop = cand
-                break
+        shiftop = data.get_def(invn)
                 
         if not shiftop: return 0
         
@@ -491,11 +467,7 @@ class RuleAndDistribute(Rule):
             othervn = op.inputs[1-i]
             orvn = op.inputs[i]
             
-            orop = None
-            for cand in data.ops:
-                if cand.output == orvn:
-                    orop = cand
-                    break
+            orop = data.get_def(orvn)
                     
             if not orop or orop.opcode != "INT_OR": continue
             if len(orop.inputs) != 2: continue
@@ -569,11 +541,7 @@ class RuleAndCommute(Rule):
         
         for i in range(2):
             shiftvn = op.inputs[i]
-            shiftop = None
-            for cand in data.ops:
-                if cand.output == shiftvn:
-                    shiftop = cand
-                    break
+            shiftop = data.get_def(shiftvn)
             
             if not shiftop: continue
             opc = shiftop.opcode
@@ -604,11 +572,7 @@ class RuleAndCommute(Rule):
                 if count == 1:
                     break
                     
-            orop = None
-            for cand in data.ops:
-                if cand.output == orvn:
-                    orop = cand
-                    break
+            orop = data.get_def(orvn)
             if not orop: continue
             
             if orop.opcode == "INT_OR" and len(orop.inputs) == 2:
@@ -656,11 +620,7 @@ class RuleAndPiece(Rule):
         
         for i in range(2):
             piecevn = op.inputs[i]
-            pieceop = None
-            for cand in data.ops:
-                if cand.output == piecevn:
-                    pieceop = cand
-                    break
+            pieceop = data.get_def(piecevn)
             if not pieceop or pieceop.opcode != "PIECE" or len(pieceop.inputs) != 2: continue
             
             othervn = op.inputs[1-i]
@@ -713,11 +673,7 @@ class RuleAndZext(Rule):
         if cnode.kind != "const": return 0
         
         in0 = op.inputs[0]
-        otherop = None
-        for cand in data.ops:
-            if cand.output == in0:
-                otherop = cand
-                break
+        otherop = data.get_def(in0)
         if not otherop: return 0
         
         if otherop.opcode == "INT_SEXT":
@@ -751,11 +707,7 @@ class RuleAndCompare(Rule):
         if cnode.kind != "const" or int(cnode.name, 16) != 0: return 0
         
         andvn = op.inputs[0]
-        andop = None
-        for cand in data.ops:
-            if cand.output == andvn:
-                andop = cand
-                break
+        andop = data.get_def(andvn)
         if not andop or andop.opcode != "INT_AND": return 0
         if len(andop.inputs) != 2: return 0
         
@@ -763,11 +715,7 @@ class RuleAndCompare(Rule):
         if andcnode.kind != "const": return 0
         
         subvn = andop.inputs[0]
-        subop = None
-        for cand in data.ops:
-            if cand.output == subvn:
-                subop = cand
-                break
+        subop = data.get_def(subvn)
         if not subop: return 0
         
         if subop.opcode == "SUBPIECE" and len(subop.inputs) == 2:
@@ -816,11 +764,7 @@ class RuleDoubleArithShift(Rule):
         if constD.kind != "const": return 0
         
         shiftin = op.inputs[0]
-        shift2op = None
-        for cand in data.ops:
-            if cand.output == shiftin:
-                shift2op = cand
-                break
+        shift2op = data.get_def(shiftin)
         
         if not shift2op or shift2op.opcode != "INT_SRIGHT": return 0
         constC = data.nodes[shift2op.inputs[1]]
@@ -854,11 +798,7 @@ class RuleConcatShift(Rule):
         if cnode.kind != "const": return 0
         
         shiftin = op.inputs[0]
-        concatop = None
-        for cand in data.ops:
-            if cand.output == shiftin:
-                concatop = cand
-                break
+        concatop = data.get_def(shiftin)
                 
         if not concatop or concatop.opcode != "PIECE": return 0
         if len(concatop.inputs) != 2: return 0
@@ -901,11 +841,7 @@ class RuleLeftRight(Rule):
         if cnode.kind != "const": return 0
         
         shiftin = op.inputs[0]
-        leftshift = None
-        for cand in data.ops:
-            if cand.output == shiftin:
-                leftshift = cand
-                break
+        leftshift = data.get_def(shiftin)
                 
         if not leftshift or leftshift.opcode != "INT_LEFT": return 0
         if len(leftshift.inputs) != 2: return 0
@@ -951,11 +887,7 @@ class RuleShiftCompare(Rule):
         if constvn.kind != "const": return 0
         
         shiftvn = op.inputs[0]
-        shiftop = None
-        for cand in data.ops:
-            if cand.output == shiftvn:
-                shiftop = cand
-                break
+        shiftop = data.get_def(shiftvn)
         if not shiftop: return 0
         
         opc = shiftop.opcode
@@ -1051,17 +983,9 @@ class RuleShiftPiece(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn1 = op.inputs[0]
-        shiftop = None
-        for cand in data.ops:
-            if cand.output == vn1:
-                shiftop = cand
-                break
+        shiftop = data.get_def(vn1)
         
-        zextloop = None
-        for cand in data.ops:
-            if cand.output == vn2:
-                zextloop = cand
-                break
+        zextloop = data.get_def(vn2)
                 
         if not shiftop or not zextloop: return 0
         
@@ -1086,11 +1010,7 @@ class RuleShiftPiece(Rule):
         if len(shiftop.inputs) == 0: return 0
         vn1 = shiftop.inputs[0]
         
-        zexthiop = None
-        for cand in data.ops:
-            if cand.output == vn1:
-                zexthiop = cand
-                break
+        zexthiop = data.get_def(vn1)
         
         if not zexthiop or zexthiop.opcode not in ("INT_ZEXT", "INT_SEXT"): return 0
         if len(zexthiop.inputs) == 0: return 0
@@ -1268,18 +1188,10 @@ class RuleBitUndistribute(Rule):
         if len(op.inputs) != 2: return 0
         vn1, vn2 = op.inputs[0], op.inputs[1]
         
-        op1 = None
-        for cand in data.ops:
-            if cand.output == vn1:
-                op1 = cand
-                break
+        op1 = data.get_def(vn1)
         if not op1: return 0
         
-        op2 = None
-        for cand in data.ops:
-            if cand.output == vn2:
-                op2 = cand
-                break
+        op2 = data.get_def(vn2)
         if not op2: return 0
         
         opc = op1.opcode
@@ -1408,11 +1320,7 @@ class RuleBoolNegate(Rule):
         if len(op.inputs) != 1: return 0
         vn = op.inputs[0]
         
-        flip_op = None
-        for cand in data.ops:
-            if cand.output == vn:
-                flip_op = cand
-                break
+        flip_op = data.get_def(vn)
         if not flip_op: return 0
         
         # ALL descendants must be negates
@@ -1464,11 +1372,7 @@ class RuleSubCommute(Rule):
         outvn = op.output
         if outvn is None: return 0
         
-        longform = None
-        for cand in data.ops:
-            if cand.output == base:
-                longform = cand
-                break
+        longform = data.get_def(base)
         if not longform: return 0
         
         j = -1
@@ -1479,16 +1383,16 @@ class RuleSubCommute(Rule):
             if offset != 0: return 0
             if len(longform.inputs) != 2: return 0
             in0 = longform.inputs[0]
-            def0 = next((cand for cand in data.ops if cand.output == in0), None)
+            def0 = data.get_def(in0)
             if not def0 or def0.opcode not in ("INT_ZEXT", "PIECE"): return 0
         elif opc in ("INT_REM", "INT_DIV"):
             if offset != 0: return 0
             if len(longform.inputs) != 2: return 0
             in0 = longform.inputs[0]
-            zext0 = next((cand for cand in data.ops if cand.output == in0), None)
+            zext0 = data.get_def(in0)
             if not zext0 or zext0.opcode != "INT_ZEXT": return 0
             in1 = longform.inputs[1]
-            zext1 = next((cand for cand in data.ops if cand.output == in1), None)
+            zext1 = data.get_def(in1)
             
             if zext1 and zext1.opcode == "INT_ZEXT":
                 pass # Commute
@@ -1502,10 +1406,10 @@ class RuleSubCommute(Rule):
             if offset != 0: return 0
             if len(longform.inputs) != 2: return 0
             in0 = longform.inputs[0]
-            sext0 = next((cand for cand in data.ops if cand.output == in0), None)
+            sext0 = data.get_def(in0)
             if not sext0 or sext0.opcode != "INT_SEXT": return 0
             in1 = longform.inputs[1]
-            sext1 = next((cand for cand in data.ops if cand.output == in1), None)
+            sext1 = data.get_def(in1)
             
             if sext1 and sext1.opcode == "INT_SEXT":
                 pass
@@ -1567,11 +1471,7 @@ class RuleConcatCommute(Rule):
         
         for i in range(2):
             vn = op.inputs[i]
-            logicop = None
-            for cand in data.ops:
-                if cand.output == vn:
-                    logicop = cand
-                    break
+            logicop = data.get_def(vn)
             if not logicop: continue
             
             opc = logicop.opcode
@@ -1662,11 +1562,7 @@ class RuleConcatZext(Rule):
         if len(op.inputs) != 2: return 0
         hi = op.inputs[0]
         
-        zextop = None
-        for cand in data.ops:
-            if cand.output == hi:
-                zextop = cand
-                break
+        zextop = data.get_def(hi)
         if not zextop or zextop.opcode != "INT_ZEXT": return 0
         if len(zextop.inputs) != 1: return 0
         
@@ -1752,7 +1648,7 @@ class RuleBooleanUndistribute(Rule):
             return True, False
             
         def is_negate_of(v1, v2):
-            op = next((cand for cand in data.ops if cand.output == v1), None)
+            op = data.get_def(v1)
             if op and op.opcode == "BOOL_NEGATE" and len(op.inputs) == 1 and op.inputs[0] == v2:
                 return True
             return False
@@ -1766,10 +1662,10 @@ class RuleBooleanUndistribute(Rule):
         if len(op.inputs) != 2: return 0
         vn0, vn1 = op.inputs[0], op.inputs[1]
         
-        op0 = next((cand for cand in data.ops if cand.output == vn0), None)
+        op0 = data.get_def(vn0)
         if not op0 or op0.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
         
-        op1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        op1 = data.get_def(vn1)
         if not op1 or op1.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
         
         if len(op0.inputs) != 2 or len(op1.inputs) != 2: return 0
@@ -1855,7 +1751,7 @@ class RuleBooleanDedup(Rule):
             return True, False
             
         def is_negate_of(v1, v2):
-            op = next((cand for cand in data.ops if cand.output == v1), None)
+            op = data.get_def(v1)
             if op and op.opcode == "BOOL_NEGATE" and len(op.inputs) == 1 and op.inputs[0] == v2:
                 return True
             return False
@@ -1869,10 +1765,10 @@ class RuleBooleanDedup(Rule):
         if len(op.inputs) != 2: return 0
         vn0, vn1 = op.inputs[0], op.inputs[1]
         
-        op0 = next((cand for cand in data.ops if cand.output == vn0), None)
+        op0 = data.get_def(vn0)
         if not op0 or op0.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
         
-        op1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        op1 = data.get_def(vn1)
         if not op1 or op1.opcode not in ("BOOL_AND", "BOOL_OR"): return 0
         
         if len(op0.inputs) != 2 or len(op1.inputs) != 2: return 0
@@ -1966,11 +1862,7 @@ class RuleEqual2Zero(Rule):
             cnode = data.nodes[vn]
             if cnode.kind != "const" or int(cnode.name, 16) != 0: return 0
             
-        addop = None
-        for cand in data.ops:
-            if cand.output == addvn:
-                addop = cand
-                break
+        addop = data.get_def(addvn)
                 
         if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
         
@@ -1994,7 +1886,7 @@ class RuleEqual2Zero(Rule):
             return 1
         else:
             def is_negate_mult(v):
-                defop = next((cand for cand in data.ops if cand.output == v), None)
+                defop = data.get_def(v)
                 if defop and defop.opcode == "INT_MULT" and len(defop.inputs) == 2:
                     cn = data.nodes[defop.inputs[1]]
                     if cn.kind == "const" and int(cn.name, 16) == ((1 << cn.size_bits) - 1):
@@ -2132,11 +2024,7 @@ class RuleSubZext(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 1: return 0
         subvn = op.inputs[0]
-        subop = None
-        for cand in data.ops:
-            if cand.output == subvn:
-                subop = cand
-                break
+        subop = data.get_def(subvn)
         if not subop: return 0
         
         if subop.opcode == "SUBPIECE" and len(subop.inputs) == 2:
@@ -2177,11 +2065,7 @@ class RuleSubZext(Rule):
             if scnode.kind != "const": return 0
             
             midvn = shiftop.inputs[0]
-            subop2 = None
-            for cand in data.ops:
-                if cand.output == midvn:
-                    subop2 = cand
-                    break
+            subop2 = data.get_def(midvn)
             if not subop2 or subop2.opcode != "SUBPIECE" or len(subop2.inputs) != 2: return 0
             
             basevn = subop2.inputs[0]
@@ -2233,11 +2117,7 @@ class RuleDumptyHump(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         base = op.inputs[0]
-        pieceop = None
-        for cand in data.ops:
-            if cand.output == base:
-                pieceop = cand
-                break
+        pieceop = data.get_def(base)
         if not pieceop or pieceop.opcode != "PIECE" or len(pieceop.inputs) != 2: return 0
         
         cnode = data.nodes[op.inputs[1]]
@@ -2284,10 +2164,10 @@ class RuleHumptyOr(Rule):
         if len(op.inputs) != 2: return 0
         vn1, vn2 = op.inputs[0], op.inputs[1]
         
-        and1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        and1 = data.get_def(vn1)
         if not and1 or and1.opcode != "INT_AND" or len(and1.inputs) != 2: return 0
         
-        and2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        and2 = data.get_def(vn2)
         if not and2 or and2.opcode != "INT_AND" or len(and2.inputs) != 2: return 0
         
         a, b = and1.inputs[0], and1.inputs[1]
@@ -2345,11 +2225,11 @@ class RuleHumptyDumpty(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn1 = op.inputs[0]
-        sub1 = next((cand for cand in data.ops if cand.output == vn1), None)
+        sub1 = data.get_def(vn1)
         if not sub1 or sub1.opcode != "SUBPIECE" or len(sub1.inputs) != 2: return 0
         
         vn2 = op.inputs[1]
-        sub2 = next((cand for cand in data.ops if cand.output == vn2), None)
+        sub2 = data.get_def(vn2)
         if not sub2 or sub2.opcode != "SUBPIECE" or len(sub2.inputs) != 2: return 0
         
         root = sub1.inputs[0]
@@ -2430,7 +2310,7 @@ class RuleXorSwap(Rule):
         if len(op.inputs) != 2: return 0
         for i in range(2):
             vn = op.inputs[i]
-            op2 = next((cand for cand in data.ops if cand.output == vn), None)
+            op2 = data.get_def(vn)
             if not op2 or op2.opcode != "INT_XOR" or len(op2.inputs) != 2: continue
             
             othervn = op.inputs[1 - i]
@@ -2515,8 +2395,8 @@ class RuleLessNotEqual(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn1, vn2 = op.inputs[0], op.inputs[1]
-        op_less = next((cand for cand in data.ops if cand.output == vn1), None)
-        op_equal = next((cand for cand in data.ops if cand.output == vn2), None)
+        op_less = data.get_def(vn1)
+        op_equal = data.get_def(vn2)
         
         if not op_less or not op_equal: return 0
         
@@ -2550,7 +2430,7 @@ class RuleNegateNegate(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 1: return 0
         vn1 = op.inputs[0]
-        neg2 = next((cand for cand in data.ops if cand.output == vn1), None)
+        neg2 = data.get_def(vn1)
         if not neg2 or neg2.opcode != "INT_NEGATE" or len(neg2.inputs) != 1: return 0
         
         vn2 = neg2.inputs[0]
@@ -2573,7 +2453,7 @@ class RuleOrCompare(Rule):
         if outvn is None: return 0
         
         has_compares = False
-        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        descendants = data.get_uses(outvn)
         for comp_op in descendants:
             if comp_op.opcode not in ("INT_EQUAL", "INT_NOTEQUAL"): return 0
             if len(comp_op.inputs) != 2: return 0
@@ -2619,7 +2499,7 @@ class RuleShiftSub(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn = op.inputs[0]
-        shiftop = next((cand for cand in data.ops if cand.output == vn), None)
+        shiftop = data.get_def(vn)
         if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
         
         sa = data.nodes[shiftop.inputs[1]]
@@ -2668,7 +2548,7 @@ class RuleSubRight(Rule):
         opc = "INT_RIGHT"
         d = c * 8
         
-        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        descendants = data.get_uses(outvn)
         lone = descendants[0] if len(descendants) == 1 else None
         
         if lone:
@@ -2747,7 +2627,7 @@ class RuleSubExtComm(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         base = op.inputs[0]
-        extop = next((cand for cand in data.ops if cand.output == base), None)
+        extop = data.get_def(base)
         if not extop or extop.opcode not in ("INT_ZEXT", "INT_SEXT"): return 0
         
         invn = extop.inputs[0]
@@ -2793,7 +2673,7 @@ class RuleSubNormal(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         shiftout = op.inputs[0]
-        shiftop = next((cand for cand in data.ops if cand.output == shiftout), None)
+        shiftop = data.get_def(shiftout)
         if not shiftop or shiftop.opcode not in ("INT_RIGHT", "INT_SRIGHT") or len(shiftop.inputs) != 2: return 0
         
         sa = data.nodes[shiftop.inputs[1]]
@@ -3015,7 +2895,7 @@ class RuleDivChain(Rule):
         if cnode2.kind != "const": return 0
         
         vn = op.inputs[0]
-        divOp = next((cand for cand in data.ops if cand.output == vn), None)
+        divOp = data.get_def(vn)
         if not divOp or len(divOp.inputs) != 2: return 0
         
         opc1 = divOp.opcode
@@ -3075,7 +2955,7 @@ class RuleSignForm(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         sextout = op.inputs[0]
-        sextop = next((cand for cand in data.ops if cand.output == sextout), None)
+        sextop = data.get_def(sextout)
         if not sextop or sextop.opcode != "INT_SEXT" or len(sextop.inputs) != 1: return 0
         
         a = sextop.inputs[0]
@@ -3110,7 +2990,7 @@ class RuleSignNearMult(Rule):
         if cnode.kind != "const": return 0
         
         vn = op.inputs[0]
-        addop = next((cand for cand in data.ops if cand.output == vn), None)
+        addop = data.get_def(vn)
         if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
         
         shiftvn = None
@@ -3118,7 +2998,7 @@ class RuleSignNearMult(Rule):
         idx = -1
         for i in range(2):
             shiftvn = addop.inputs[i]
-            unshiftop = next((cand for cand in data.ops if cand.output == shiftvn), None)
+            unshiftop = data.get_def(shiftvn)
             if unshiftop and unshiftop.opcode == "INT_RIGHT" and len(unshiftop.inputs) == 2:
                 if data.nodes[unshiftop.inputs[1]].kind == "const":
                     idx = i
@@ -3137,7 +3017,7 @@ class RuleSignNearMult(Rule):
         if mask != int(cnode.name, 16): return 0
         
         sgnvn = unshiftop.inputs[0]
-        sshiftop = next((cand for cand in data.ops if cand.output == sgnvn), None)
+        sshiftop = data.get_def(sgnvn)
         if not sshiftop or sshiftop.opcode != "INT_SRIGHT" or len(sshiftop.inputs) != 2: return 0
         
         scnode = data.nodes[sshiftop.inputs[1]]
@@ -3181,7 +3061,7 @@ class RuleModOpt(Rule):
         outvn = op.output
         if outvn is None: return 0
         
-        descendants1 = [cand for cand in data.ops if outvn in cand.inputs]
+        descendants1 = data.get_uses(outvn)
         for multop in descendants1:
             if multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
             
@@ -3198,14 +3078,14 @@ class RuleModOpt(Rule):
                 v1 = int(cdiv.name, 16)
                 if (((v2 ^ mask) + 1) & mask) != v1: continue
             else:
-                op2comp = next((cand for cand in data.ops if cand.output == div2), None)
+                op2comp = data.get_def(div2)
                 if not op2comp or op2comp.opcode != "INT_2COMP" or len(op2comp.inputs) != 1: continue
                 if op2comp.inputs[0] != div: continue
                 
             outvn2 = multop.output
             if outvn2 is None: continue
             
-            descendants2 = [cand for cand in data.ops if outvn2 in cand.inputs]
+            descendants2 = data.get_uses(outvn2)
             for addop in descendants2:
                 if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
                 
@@ -3236,7 +3116,7 @@ class RuleSignMod2nOpt(Rule):
         return ["INT_RIGHT"]
         
     def check_sign_extraction(self, outVn, data):
-        signOp = next((cand for cand in data.ops if cand.output == outVn), None)
+        signOp = data.get_def(outVn)
         if not signOp or signOp.opcode != "INT_SRIGHT" or len(signOp.inputs) != 2: return None
         constVn = data.nodes[signOp.inputs[1]]
         if constVn.kind != "const": return None
@@ -3262,7 +3142,7 @@ class RuleSignMod2nOpt(Rule):
         n = data.nodes[a].size_bits - shiftAmt
         mask = (1 << n) - 1
         
-        descendants_correct = [cand for cand in data.ops if correctVn in cand.inputs]
+        descendants_correct = data.get_uses(correctVn)
         for multop in descendants_correct:
             if multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
             negone = data.nodes[multop.inputs[1]]
@@ -3272,19 +3152,19 @@ class RuleSignMod2nOpt(Rule):
             out_mult = multop.output
             if out_mult is None: continue
             
-            descendants_mult = [cand for cand in data.ops if out_mult in cand.inputs]
+            descendants_mult = data.get_uses(out_mult)
             if len(descendants_mult) != 1: continue
             baseOp = descendants_mult[0]
             if baseOp.opcode != "INT_ADD" or len(baseOp.inputs) != 2: continue
             
             slot = 1 if baseOp.inputs[0] == out_mult else 0
             andOut = baseOp.inputs[slot]
-            andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+            andOp = data.get_def(andOut)
             
             truncSize = -1
             if andOp and andOp.opcode == "INT_ZEXT" and len(andOp.inputs) == 1:
                 andOut = andOp.inputs[0]
-                andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+                andOp = data.get_def(andOut)
                 if andOp and andOp.opcode == "INT_AND":
                     truncSize = data.nodes[andOut].size_bits
             elif not andOp or andOp.opcode != "INT_AND" or len(andOp.inputs) != 2:
@@ -3296,14 +3176,14 @@ class RuleSignMod2nOpt(Rule):
             if constVn2.kind != "const" or int(constVn2.name, 16) != mask: continue
             
             addOut = andOp.inputs[0]
-            addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+            addOp = data.get_def(addOut)
             if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: continue
             
             aSlot = -1
             for idx in range(2):
                 vn = addOp.inputs[idx]
                 if truncSize >= 0:
-                    subOp = next((cand for cand in data.ops if cand.output == vn), None)
+                    subOp = data.get_def(vn)
                     if subOp and subOp.opcode == "SUBPIECE" and len(subOp.inputs) == 2:
                         subc = data.nodes[subOp.inputs[1]]
                         if subc.kind == "const" and int(subc.name, 16) == 0:
@@ -3315,7 +3195,7 @@ class RuleSignMod2nOpt(Rule):
             if aSlot == -1: continue
             
             extVn = addOp.inputs[1 - aSlot]
-            shiftOp = next((cand for cand in data.ops if cand.output == extVn), None)
+            shiftOp = data.get_def(extVn)
             if not shiftOp or shiftOp.opcode != "INT_RIGHT" or len(shiftOp.inputs) != 2: continue
             
             sconst = data.nodes[shiftOp.inputs[1]]
@@ -3329,7 +3209,7 @@ class RuleSignMod2nOpt(Rule):
             
             extVn = shiftOp.inputs[0]
             if truncSize >= 0:
-                subOp = next((cand for cand in data.ops if cand.output == extVn), None)
+                subOp = data.get_def(extVn)
                 if subOp and subOp.opcode == "SUBPIECE" and len(subOp.inputs) == 2:
                     subc = data.nodes[subOp.inputs[1]]
                     if subc.kind == "const" and int(subc.name, 16) == (truncSize // 8):
@@ -3362,14 +3242,14 @@ class RuleSignMod2Opt(Rule):
         if constVn.kind != "const" or int(constVn.name, 16) != 1: return 0
         
         addOut = op.inputs[0]
-        addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+        addOp = data.get_def(addOut)
         if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: return 0
         
         multSlot = -1
         multOp = None
         for i in range(2):
             vn = addOp.inputs[i]
-            mOp = next((cand for cand in data.ops if cand.output == vn), None)
+            mOp = data.get_def(vn)
             if mOp and mOp.opcode == "INT_MULT" and len(mOp.inputs) == 2:
                 cVn = data.nodes[mOp.inputs[1]]
                 if cVn.kind == "const" and int(cVn.name, 16) == (1 << cVn.size_bits) - 1:
@@ -3383,7 +3263,7 @@ class RuleSignMod2Opt(Rule):
         # We need an instance to access the check_sign_extraction, or we can just redefine it inline since we didn't save it as a classmethod
         
         def check_sign_extraction(outVn):
-            signOp = next((cand for cand in data.ops if cand.output == outVn), None)
+            signOp = data.get_def(outVn)
             if not signOp or signOp.opcode != "INT_SRIGHT" or len(signOp.inputs) != 2: return None
             cVn = data.nodes[signOp.inputs[1]]
             if cVn.kind != "const": return None
@@ -3399,7 +3279,7 @@ class RuleSignMod2Opt(Rule):
         otherBase = addOp.inputs[1 - multSlot]
         trunc = False
         if base != otherBase:
-            sub1 = next((cand for cand in data.ops if cand.output == base), None)
+            sub1 = data.get_def(base)
             if not sub1 or sub1.opcode != "SUBPIECE" or len(sub1.inputs) != 2: return 0
             subc = data.nodes[sub1.inputs[1]]
             if subc.kind != "const": return 0
@@ -3407,7 +3287,7 @@ class RuleSignMod2Opt(Rule):
             if truncAmt + data.nodes[base].size_bits != data.nodes[sub1.inputs[0]].size_bits: return 0
             base = sub1.inputs[0]
             
-            sub2 = next((cand for cand in data.ops if cand.output == otherBase), None)
+            sub2 = data.get_def(otherBase)
             if not sub2 or sub2.opcode != "SUBPIECE" or len(sub2.inputs) != 2: return 0
             subc2 = data.nodes[sub2.inputs[1]]
             if subc2.kind != "const" or int(subc2.name, 16) != 0: return 0
@@ -3419,13 +3299,13 @@ class RuleSignMod2Opt(Rule):
         if andOut is None: return 0
         
         if trunc:
-            descendants = [cand for cand in data.ops if andOut in cand.inputs]
+            descendants = data.get_uses(andOut)
             if len(descendants) != 1 or descendants[0].opcode != "INT_ZEXT": return 0
             extOp = descendants[0]
             andOut = extOp.output
             if andOut is None: return 0
             
-        descendants = [cand for cand in data.ops if andOut in cand.inputs]
+        descendants = data.get_uses(andOut)
         for rootOp in descendants:
             if rootOp.opcode != "INT_ADD" or len(rootOp.inputs) != 2: continue
             slot = 1 if rootOp.inputs[0] == andOut else 0
@@ -3453,7 +3333,7 @@ class RuleSignMod2nOpt2(Rule):
     def check_sign_ext_form(self, op: PcodeOp, data: PcodeLikeGraph):
         for slot in range(2):
             minusVn = op.inputs[slot]
-            multOp = next((cand for cand in data.ops if cand.output == minusVn), None)
+            multOp = data.get_def(minusVn)
             if not multOp or multOp.opcode != "INT_MULT" or len(multOp.inputs) != 2: continue
             constVn = data.nodes[multOp.inputs[1]]
             if constVn.kind != "const": continue
@@ -3461,7 +3341,7 @@ class RuleSignMod2nOpt2(Rule):
             
             base = op.inputs[1 - slot]
             signExt = multOp.inputs[0]
-            shiftOp = next((cand for cand in data.ops if cand.output == signExt), None)
+            shiftOp = data.get_def(signExt)
             if not shiftOp or shiftOp.opcode != "INT_SRIGHT" or len(shiftOp.inputs) != 2: continue
             if shiftOp.inputs[0] != base: continue
             
@@ -3478,7 +3358,7 @@ class RuleSignMod2nOpt2(Rule):
         base = None
         for slot in range(2):
             addOut = op.inputs[slot]
-            addOp = next((cand for cand in data.ops if cand.output == addOut), None)
+            addOp = data.get_def(addOut)
             if not addOp or addOp.opcode != "INT_ADD" or len(addOp.inputs) != 2: continue
             constVn = data.nodes[addOp.inputs[1]]
             if constVn.kind != "const" or int(constVn.name, 16) != npow_minus_1: continue
@@ -3497,7 +3377,7 @@ class RuleSignMod2nOpt2(Rule):
         if int(constVn.name, 16) != mask: return 0
         
         andOut = op.inputs[0]
-        andOp = next((cand for cand in data.ops if cand.output == andOut), None)
+        andOp = data.get_def(andOut)
         if not andOp or andOp.opcode != "INT_AND" or len(andOp.inputs) != 2: return 0
         
         cAndVn = data.nodes[andOp.inputs[1]]
@@ -3508,7 +3388,7 @@ class RuleSignMod2nOpt2(Rule):
         if npow == 1: return 0
         
         adjVn = andOp.inputs[0]
-        adjOp = next((cand for cand in data.ops if cand.output == adjVn), None)
+        adjOp = data.get_def(adjVn)
         if not adjOp: return 0
         
         base = None
@@ -3523,7 +3403,7 @@ class RuleSignMod2nOpt2(Rule):
         multOut = op.output
         if multOut is None: return 0
         
-        descendants = [cand for cand in data.ops if multOut in cand.inputs]
+        descendants = data.get_uses(multOut)
         for rootOp in descendants:
             if rootOp.opcode != "INT_ADD" or len(rootOp.inputs) != 2: continue
             slot = 1 if rootOp.inputs[0] == multOut else 0
@@ -3580,7 +3460,7 @@ class RuleDivTermAdd(Rule):
         n = 0
         if shiftopc != "SUBPIECE":
             vn = op.inputs[0]
-            subop = next((cand for cand in data.ops if cand.output == vn), None)
+            subop = data.get_def(vn)
             if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return None, "MAX", 0
             sconst = data.nodes[op.inputs[1]]
             if sconst.kind != "const": return None, "MAX", 0
@@ -3606,7 +3486,7 @@ class RuleDivTermAdd(Rule):
         if n > 127: return 0
         
         multvn = subop.inputs[0]
-        multop = next((cand for cand in data.ops if cand.output == multvn), None)
+        multop = data.get_def(multvn)
         if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: return 0
         
         multConstNode = data.nodes[multop.inputs[1]]
@@ -3614,7 +3494,7 @@ class RuleDivTermAdd(Rule):
         multConst = int(multConstNode.name, 16)
         
         extvn = multop.inputs[0]
-        extop = next((cand for cand in data.ops if cand.output == extvn), None)
+        extop = data.get_def(extvn)
         if not extop or extop.opcode not in ("INT_ZEXT", "INT_SEXT"): return 0
         
         opc = extop.opcode
@@ -3628,7 +3508,7 @@ class RuleDivTermAdd(Rule):
         out_op = op.output
         if out_op is None: return 0
         
-        descendants = [cand for cand in data.ops if out_op in cand.inputs]
+        descendants = data.get_uses(out_op)
         for addop in descendants:
             if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
             if addop.inputs[0] != x and addop.inputs[1] != x: continue
@@ -3676,7 +3556,7 @@ class RuleDivOpt(Rule):
             cvn = data.nodes[curOp.inputs[1]]
             if cvn.kind != "const": return None, 0, 0, 0, ""
             n = int(cvn.name, 16)
-            curOp = next((cand for cand in data.ops if cand.output == vn), None)
+            curOp = data.get_def(vn)
             if not curOp: return None, 0, 0, 0, ""
         else:
             n = 0
@@ -3691,7 +3571,7 @@ class RuleDivOpt(Rule):
             insz = data.nodes[inVn].size_bits
             if outsz + c * 8 != insz: return None, 0, 0, 0, ""
             n += 8 * c
-            curOp = next((cand for cand in data.ops if cand.output == inVn), None)
+            curOp = data.get_def(inVn)
             if not curOp: return None, 0, 0, 0, ""
             
         if curOp.opcode != "INT_MULT": return None, 0, 0, 0, ""
@@ -3708,7 +3588,7 @@ class RuleDivOpt(Rule):
             else:
                 return None, 0, 0, 0, ""
                 
-        extOp = next((cand for cand in data.ops if cand.output == inVn), None)
+        extOp = data.get_def(inVn)
         if not extOp: return None, 0, 0, 0, ""
         extopc = extOp.opcode
         
@@ -3730,7 +3610,7 @@ class RuleDivOpt(Rule):
     def check_form_overlap(self, op: PcodeOp, data: PcodeLikeGraph):
         if op.opcode != "SUBPIECE" or op.output is None: return False
         vn = op.output
-        descendants = [cand for cand in data.ops if vn in cand.inputs]
+        descendants = data.get_uses(vn)
         for superOp in descendants:
             if superOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
             cvn = data.nodes[superOp.inputs[1]]
@@ -3768,7 +3648,7 @@ class RuleDivOpt(Rule):
 
     def move_sign_bit_extraction(self, firstVn, replaceVn, data: PcodeLikeGraph):
         testList = [firstVn]
-        op_def = next((cand for cand in data.ops if cand.output == firstVn), None)
+        op_def = data.get_def(firstVn)
         if op_def and op_def.opcode == "INT_SRIGHT":
             testList.append(op_def.inputs[0])
             
@@ -3776,7 +3656,7 @@ class RuleDivOpt(Rule):
         for vn in testList:
             if vn in visited: continue
             visited.add(vn)
-            descendants = [cand for cand in data.ops if vn in cand.inputs]
+            descendants = data.get_uses(vn)
             for op in descendants:
                 if op.opcode in ("INT_RIGHT", "INT_SRIGHT"):
                     cvn_idx = op.inputs[1]
@@ -3869,20 +3749,20 @@ class RuleSignDiv2(Rule):
         if cnode.kind != "const" or int(cnode.name, 16) != 1: return 0
         
         addout = op.inputs[0]
-        addop = next((cand for cand in data.ops if cand.output == addout), None)
+        addop = data.get_def(addout)
         if not addop or addop.opcode != "INT_ADD" or len(addop.inputs) != 2: return 0
         
         a = None
         for i in range(2):
             multout = addop.inputs[i]
-            multop = next((cand for cand in data.ops if cand.output == multout), None)
+            multop = data.get_def(multout)
             if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: continue
             
             cnode2 = data.nodes[multop.inputs[1]]
             if cnode2.kind != "const" or int(cnode2.name, 16) != (1 << cnode2.size_bits) - 1: continue
             
             shiftout = multop.inputs[0]
-            shiftop = next((cand for cand in data.ops if cand.output == shiftout), None)
+            shiftop = data.get_def(shiftout)
             if not shiftop or shiftop.opcode != "INT_SRIGHT" or len(shiftop.inputs) != 2: continue
             
             cnode3 = data.nodes[shiftop.inputs[1]]
@@ -3920,7 +3800,7 @@ class RuleDivTermAdd2(Rule):
         if cnode.kind != "const" or int(cnode.name, 16) != 1: return 0
         
         subvn = op.inputs[0]
-        subop = next((cand for cand in data.ops if cand.output == subvn), None)
+        subop = data.get_def(subvn)
         if not subop or subop.opcode != "INT_ADD" or len(subop.inputs) != 2: return 0
         
         x = None
@@ -3928,7 +3808,7 @@ class RuleDivTermAdd2(Rule):
         compop = None
         for i in range(2):
             compvn = subop.inputs[i]
-            compop = next((cand for cand in data.ops if cand.output == compvn), None)
+            compop = data.get_def(compvn)
             if compop and compop.opcode == "INT_MULT" and len(compop.inputs) == 2:
                 invn = data.nodes[compop.inputs[1]]
                 if invn.kind == "const" and int(invn.name, 16) == (1 << invn.size_bits) - 1:
@@ -3938,7 +3818,7 @@ class RuleDivTermAdd2(Rule):
         if x is None: return 0
         
         z = compop.inputs[0]
-        subpieceop = next((cand for cand in data.ops if cand.output == z), None)
+        subpieceop = data.get_def(z)
         if not subpieceop or subpieceop.opcode != "SUBPIECE" or len(subpieceop.inputs) != 2: return 0
         
         csub = data.nodes[subpieceop.inputs[1]]
@@ -3947,7 +3827,7 @@ class RuleDivTermAdd2(Rule):
         if n > 127 or n != 8 * (data.nodes[subpieceop.inputs[0]].size_bits - data.nodes[z].size_bits): return 0
         
         multvn = subpieceop.inputs[0]
-        multop = next((cand for cand in data.ops if cand.output == multvn), None)
+        multop = data.get_def(multvn)
         if not multop or multop.opcode != "INT_MULT" or len(multop.inputs) != 2: return 0
         
         cmult = data.nodes[multop.inputs[1]]
@@ -3955,14 +3835,14 @@ class RuleDivTermAdd2(Rule):
         multConst = int(cmult.name, 16)
         
         zextvn = multop.inputs[0]
-        zextop = next((cand for cand in data.ops if cand.output == zextvn), None)
+        zextop = data.get_def(zextvn)
         if not zextop or zextop.opcode != "INT_ZEXT" or len(zextop.inputs) != 1: return 0
         if zextop.inputs[0] != x: return 0
         
         out_op = op.output
         if out_op is None: return 0
         
-        descendants = [cand for cand in data.ops if out_op in cand.inputs]
+        descendants = data.get_uses(out_op)
         for addop in descendants:
             if addop.opcode != "INT_ADD" or len(addop.inputs) != 2: continue
             if addop.inputs[0] != z and addop.inputs[1] != z: continue
@@ -4011,7 +3891,7 @@ class RuleConcatLeftShift(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 2: return 0
         vn2 = op.inputs[1]
-        shiftop = next((cand for cand in data.ops if cand.output == vn2), None)
+        shiftop = data.get_def(vn2)
         if not shiftop or shiftop.opcode != "INT_LEFT" or len(shiftop.inputs) != 2: return 0
         
         cnode = data.nodes[shiftop.inputs[1]]
@@ -4021,7 +3901,7 @@ class RuleConcatLeftShift(Rule):
         if (sa & 7) != 0: return 0
         
         tmpvn = shiftop.inputs[0]
-        zextop = next((cand for cand in data.ops if cand.output == tmpvn), None)
+        zextop = data.get_def(tmpvn)
         if not zextop or zextop.opcode != "INT_ZEXT" or len(zextop.inputs) != 1: return 0
         
         b = zextop.inputs[0]
@@ -4083,7 +3963,7 @@ class RuleExtensionPush(Rule):
         
         addcount = 0
         ptrcount = 0
-        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        descendants = data.get_uses(outVn)
         for decOp in descendants:
             if decOp.opcode == "PTRADD":
                 ptrcount += 1
@@ -4887,7 +4767,7 @@ class RuleFloatCast(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 1: return 0
         vn1 = op.inputs[0]
-        castop = next((cand for cand in data.ops if cand.output == vn1), None)
+        castop = data.get_def(vn1)
         if not castop or len(castop.inputs) != 1: return 0
         
         opc2 = castop.opcode
@@ -5072,16 +4952,16 @@ class RuleUnsigned2Float(Rule):
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         if len(op.inputs) != 1: return 0
         invn = op.inputs[0]
-        orop = next((cand for cand in data.ops if cand.output == invn), None)
+        orop = data.get_def(invn)
         if not orop or orop.opcode != "INT_OR" or len(orop.inputs) != 2: return 0
         
         shiftop = None
         andop = None
         for i in range(2):
-            cnd = next((cand for cand in data.ops if cand.output == orop.inputs[i]), None)
+            cnd = data.get_def(orop.inputs[i])
             if cnd and cnd.opcode == "INT_RIGHT":
                 shiftop = cnd
-                andop = next((cand for cand in data.ops if cand.output == orop.inputs[1 - i]), None)
+                andop = data.get_def(orop.inputs[1 - i])
                 break
                 
         if not shiftop: return 0
@@ -5093,7 +4973,7 @@ class RuleUnsigned2Float(Rule):
         if not andop: return 0
         
         if andop.opcode == "INT_ZEXT" and len(andop.inputs) == 1:
-            andop = next((cand for cand in data.ops if cand.output == andop.inputs[0]), None)
+            andop = data.get_def(andop.inputs[0])
             
         if not andop or andop.opcode != "INT_AND" or len(andop.inputs) != 2: return 0
         
@@ -5102,7 +4982,7 @@ class RuleUnsigned2Float(Rule):
         
         vn = andop.inputs[0]
         if basevn != vn:
-            subop = next((cand for cand in data.ops if cand.output == vn), None)
+            subop = data.get_def(vn)
             if not subop or subop.opcode != "SUBPIECE" or len(subop.inputs) != 2: return 0
             csub = data.nodes[subop.inputs[1]]
             if csub.kind != "const" or int(csub.name, 16) != 0: return 0
@@ -5112,7 +4992,7 @@ class RuleUnsigned2Float(Rule):
         outvn = op.output
         if outvn is None: return 0
         
-        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        descendants = data.get_uses(outvn)
         for addop in descendants:
             if addop.opcode != "FLOAT_ADD" or len(addop.inputs) != 2: continue
             if addop.inputs[0] != outvn or addop.inputs[1] != outvn: continue
@@ -5266,7 +5146,7 @@ class RuleLzcountShiftBool(Rule):
         max_return = 8 * data.nodes[op.inputs[0]].size_bits
         if bin(max_return).count('1') != 1: return 0
         
-        descendants = [cand for cand in data.ops if outVn in cand.inputs]
+        descendants = data.get_uses(outVn)
         for baseOp in descendants:
             if baseOp.opcode not in ("INT_RIGHT", "INT_SRIGHT"): continue
             
@@ -5812,7 +5692,7 @@ class RuleBoolZext(Rule):
         outvn = op.output
         if outvn is None: return 0
         
-        descendants = [cand for cand in data.ops if outvn in cand.inputs]
+        descendants = data.get_uses(outvn)
         if len(descendants) != 1: return 0
         
         multop1 = descendants[0]
@@ -5872,13 +5752,13 @@ class RuleBoolZext(Rule):
             return 0
             
         other_in = actionop.inputs[1] if actionop.inputs[0] == multop1.output else actionop.inputs[0]
-        multop2 = next((cand for cand in data.ops if cand.output == other_in), None)
+        multop2 = data.get_def(other_in)
         if not multop2 or multop2.opcode != "INT_MULT" or len(multop2.inputs) != 2: return 0
         
         cmult2 = data.nodes[multop2.inputs[1]]
         if cmult2.kind != "const" or int(cmult2.name, 16) != mask: return 0
         
-        zextop2 = next((cand for cand in data.ops if cand.output == multop2.inputs[0]), None)
+        zextop2 = data.get_def(multop2.inputs[0])
         if not zextop2 or zextop2.opcode != "INT_ZEXT" or len(zextop2.inputs) != 1: return 0
         
         boolVn2 = zextop2.inputs[0]
@@ -5920,7 +5800,7 @@ class RuleSignForm2(Rule):
         sizeout = data.nodes[inVn].size_bits
         if int(constVn.name, 16) != sizeout - 1: return 0
         
-        subOp = next((cand for cand in data.ops if cand.output == inVn), None)
+        subOp = data.get_def(inVn)
         if not subOp or subOp.opcode != "SUBPIECE" or len(subOp.inputs) != 2: return 0
         
         cnode = data.nodes[subOp.inputs[1]]
@@ -5931,14 +5811,14 @@ class RuleSignForm2(Rule):
         multSize = data.nodes[multOut].size_bits
         if c * 8 + sizeout != multSize: return 0
         
-        multOp = next((cand for cand in data.ops if cand.output == multOut), None)
+        multOp = data.get_def(multOut)
         if not multOp or multOp.opcode != "INT_MULT" or len(multOp.inputs) != 2: return 0
         
         slot = -1
         sextOp = None
         for i in range(2):
             vn = multOp.inputs[i]
-            c_op = next((cand for cand in data.ops if cand.output == vn), None)
+            c_op = data.get_def(vn)
             if c_op and c_op.opcode == "INT_SEXT" and len(c_op.inputs) == 1:
                 slot = i
                 sextOp = c_op
@@ -5954,7 +5834,7 @@ class RuleSignForm2(Rule):
             if int(otherNode.name, 16) > ((1 << sizeout) - 1): return 0
             if 2 * sizeout > multSize: return 0
         else:
-            zextOp = next((cand for cand in data.ops if cand.output == otherVn), None)
+            zextOp = data.get_def(otherVn)
             if not zextOp or zextOp.opcode != "INT_ZEXT" or len(zextOp.inputs) != 1: return 0
             if data.nodes[zextOp.inputs[0]].size_bits + sizeout > multSize: return 0
             
@@ -7065,11 +6945,7 @@ class RuleEqual2Constant(Rule):
         if cvn.kind != "const": return 0
         
         lhs = data.nodes[lhs_idx]
-        def_op = None
-        for cand in data.ops:
-            if cand.output == lhs_idx:
-                def_op = cand
-                break
+        def_op = data.get_def(lhs_idx)
                 
         if def_op is None: return 0
         
@@ -7130,11 +7006,7 @@ class RuleSLess2Zero(Rule):
         
         if lvn.kind == "const":
             if int(lvn.name, 16) == (1 << lvn.size_bits) - 1: # -1
-                def_op = None
-                for cand in data.ops:
-                    if cand.output == rvn_idx:
-                        def_op = cand
-                        break
+                def_op = data.get_def(rvn_idx)
                 if not def_op: return 0
                 
                 feedOpCode = def_op.opcode

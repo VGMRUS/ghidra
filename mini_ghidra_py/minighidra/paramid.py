@@ -3580,3 +3580,7 @@ def _parameter_order(name: str) -> tuple[int, int, str]:
 def _safe_opcode(value: str) -> str:
     """Make user/register names safe and deterministic in diagnostic opcodes."""
     return re.sub(r"[^A-Z0-9_]", "_", value.upper())
+
+    def get_uses(self, vn_id: int) -> list[PcodeOp]:
+        """Return all PcodeOps that use the given varnode id."""
+        return [op for op in self.ops if vn_id in op.inputs]
