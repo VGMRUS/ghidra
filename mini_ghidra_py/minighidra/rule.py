@@ -7257,39 +7257,54 @@ class RuleSubfloatConvert(Rule):
         return 1
 
 class RuleBitFieldIn(Rule):
-    """Stub for RuleBitFieldIn (handles propagation of bitfields to consumers)"""
+    """Stub for RuleBitFieldIn (handles propagation of bitfields to consumers)
+    Placeholder in minighidra."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "bitfield_in")
-    def get_op_list(self) -> list[str]:
-        return ["INT_AND"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        super().__init__(group, 0, "bitfieldin")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("COPY", "INT_EQUAL", "INT_NOTEQUAL", "INT_SLESS", "INT_SLESSEQUAL",
+                "INT_LESS", "INT_LESSEQUAL", "INT_ZEXT", "INT_SEXT", "INT_ADD",
+                "INT_NEGATE", "INT_AND", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT",
+                "INT_MULT", "SUBPIECE")
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 
 class RuleBitFieldLoad(Rule):
-    """Stub for RuleBitFieldLoad (handles extraction of bitfields from loads)"""
+    """Stub for RuleBitFieldLoad (handles extraction of bitfields from loads)
+    Placeholder in minighidra."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "bitfield_load")
-    def get_op_list(self) -> list[str]:
-        return ["LOAD"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        super().__init__(group, 0, "bitfieldload")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("LOAD",)
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 
 class RuleBitFieldOut(Rule):
-    """Stub for RuleBitFieldOut (handles writing structures with bitfields)"""
+    """Stub for RuleBitFieldOut (handles writing structures with bitfields)
+    Placeholder in minighidra."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "bitfield_out")
-    def get_op_list(self) -> list[str]:
-        return ["INT_LEFT", "INT_RIGHT", "INT_SRIGHT"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        super().__init__(group, 0, "bitfieldout")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("STORE", "COPY", "INT_ADD", "INT_AND", "INT_OR", "INT_XOR")
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 
 class RuleBitFieldStore(Rule):
-    """Stub for RuleBitFieldStore (handles inserting into bitfields for stores)"""
+    """Stub for RuleBitFieldStore (handles inserting into bitfields for stores)
+    Placeholder in minighidra."""
     def __init__(self, group: str) -> None:
-        super().__init__(group, 0, "bitfield_store")
-    def get_op_list(self) -> list[str]:
-        return ["STORE"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+        super().__init__(group, 0, "bitfieldstore")
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("STORE",)
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 class RuleInsertAbsorb(Rule):
     """Delegate to absorb subpieces/right-shifts nested in an INSERT. 
