@@ -22,20 +22,10 @@ class TermOrder:
         self.terms: List[AdditiveEdge] = []
         self.sorter: List[AdditiveEdge] = []
 
-    def _get_def(self, vn_id: int) -> Optional[PcodeOp]:
-        for op in self.data.ops:
-            if op.output == vn_id:
-                return op
-        return None
 
     def _lone_descend(self, vn_id: int) -> Optional[PcodeOp]:
-        count = 0
-        lone_op = None
-        for op in self.data.ops:
-            if vn_id in op.inputs:
-                count += 1
-                lone_op = op
-        return lone_op if count == 1 else None
+        uses = self.data.get_uses(vn_id)
+        return uses[0] if len(uses) == 1 else None
 
     def collect(self) -> None:
         opstack = [self.root]
@@ -49,7 +39,7 @@ class TermOrder:
                 if vn_id < 0:
                     continue
                 node = self.data.nodes[vn_id]
-                subop = self._get_def(vn_id)
+                subop = self.data.get_def(vn_id)
                 
                 # If not defined by another op, or has more than one use
                 if not subop or self._lone_descend(vn_id) is None:
@@ -60,7 +50,7 @@ class TermOrder:
                     if subop.opcode == "INT_MULT" and len(subop.inputs) == 2:
                         mult_in1 = self.data.nodes[subop.inputs[1]] if subop.inputs[1] >= 0 else None
                         if mult_in1 and mult_in1.kind == "const":
-                            addop = self._get_def(subop.inputs[0])
+                            addop = self.data.get_def(subop.inputs[0])
                             if addop and addop.opcode == "INT_ADD":
                                 if self._lone_descend(addop.output) is not None:
                                     opstack.append(addop)
@@ -99,11 +89,6 @@ class AddExpression:
         self.constval: int = 0
         self.terms: List[AddTerm] = []
 
-    def _get_def(self, vn_id: int) -> Optional[PcodeOp]:
-        for op in self.data.ops:
-            if op.output == vn_id:
-                return op
-        return None
 
     def add(self, vn: int, coeff: int) -> None:
         if len(self.terms) < 2:
@@ -118,7 +103,7 @@ class AddExpression:
             self.constval = (self.constval + coeff * val) & ((1 << sz) - 1)
             return
 
-        def_op = self._get_def(vn_id)
+        def_op = self.data.get_def(vn_id)
         if def_op:
             if def_op.opcode == "INT_ADD":
                 in1 = def_op.inputs[1]
