@@ -584,34 +584,7 @@ class SplitDatatype:
         # Omitted structural field split for STORE(struct)
         return False
         
-    def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
-        self.is_load_store = True
-        out_vn = load_op.output
-        if out_vn is None: return False
-        
-        # Look for lone descend copy
-        uses = self.data.get_uses(out_vn)
-        copy_op = None
-        if len(uses) == 1 and uses[0].opcode == "COPY":
-            copy_op = uses[0]
-            out_vn = copy_op.output
-            
-        # Omitted: compatibility check and building pointers for split LOADs
-        return False
-        
-    def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
-        self.is_load_store = True
-        in_vn = store_op.inputs[2] if len(store_op.inputs) > 2 else -1
-        if in_vn < 0: return False
-        
-        load_op = None
-        def_op = self.data.get_def(in_vn)
-        uses = self.data.get_uses(in_vn)
-        if def_op and def_op.opcode == "LOAD" and len(uses) == 1:
-            load_op = def_op
-            
-        # Omitted: compatibility check and replacing STORE(struct) with multiple STORE(fields)
-        return False
+
 class SubfloatFlow:
     """
     Class for tracing changes of precision in floating point variables.
