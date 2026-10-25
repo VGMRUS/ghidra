@@ -1339,6 +1339,77 @@ class Analyzer:
 
         return SemanticDecompiler(self).decompile(function)
 
+    def print_function(
+        self,
+        function: int | Function,
+        *,
+        markup: bool = False,
+        document: bool = True,
+        max_line_size: int = 100,
+        indent_increment: int = 2,
+        flat: bool = False,
+        comment_style: str = "c",
+        integer_format: str = "best",
+        casts: bool = True,
+        convention: bool | None = None,
+        brace: str | None = None,
+        labels: str = "goto",
+    ) -> str:
+        """Emit a whole function through the ported Ghidra printing engine.
+
+        The decompiler backend still runs on its expression AST; this method
+        feeds the recovered prototype, symbols, types, statements and
+        control-flow structure to :class:`~minighidra.printc.PrintC`, which
+        emits tokens through :class:`~minighidra.emit.EmitPrettyPrint` (Oppen
+        pretty printing) and, with ``markup=True``, through
+        :class:`~minighidra.emit.EmitMarkup` (Ghidra's ``<clang_document>``
+        XML with ``<function>``, ``<funcproto>``, ``<statement>``, ``<op>``,
+        ``<variable>`` and ``<datatype>`` tokens).
+        """
+        import io
+
+        from .decompiler import SemanticDecompiler
+        from .emit import BraceStyle
+        from .printc import PrintC
+        from .printdoc import build_printable_function
+
+        target = (
+            self.functions.get(function) if isinstance(function, int) else function
+        )
+        if target is None:
+            raise KeyError(f"No existe función en {function:#x}")
+
+        artifacts = SemanticDecompiler(self).decompile_artifacts(target)
+        printable = build_printable_function(artifacts)
+
+        printer = PrintC(self)
+        stream = io.StringIO()
+        printer.set_output_stream(stream)
+        printer.set_markup(markup)
+        printer.set_max_line_size(max_line_size)
+        printer.set_indent_increment(indent_increment)
+        printer.set_comment_style(comment_style)
+        printer.set_integer_format(integer_format)
+        printer.set_no_cast_printing(not casts)
+        if convention is not None:
+            printer.set_convention(convention)
+        if brace is not None:
+            style = BraceStyle[brace]
+            printer.set_brace_format_function(style)
+            printer.set_brace_format_if_else(style)
+            printer.set_brace_format_loop(style)
+            printer.set_brace_format_switch(style)
+        printer.set_flat(flat)
+        printer.set_label_mode(labels)
+        printer.attach_document(printable)
+        if document:
+            document_id = printer.emit.begin_document()
+        printer.doc_function(printable)
+        if document:
+            printer.emit.end_document(document_id)
+        printer.emit.flush()
+        return stream.getvalue()
+
     def ssa(self, function: int | Function) -> SSAFunction:
         """Return the p-code SSA/heritage graph for a recovered function."""
         from .sleigh import SleighTranslator
