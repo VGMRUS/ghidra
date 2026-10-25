@@ -43,6 +43,7 @@ from .clangdoc import (
     build_clang_tree,
     to_lines,
 )
+from .datatype_split import SplitDatatype, SplitPiece
 from .decompiler import DecompileArtifacts, SemanticDecompiler
 from .emit import (
     BraceStyle,
@@ -54,6 +55,7 @@ from .emit import (
     TokenSplit,
     XmlEncoder,
 )
+from .merge import Merge, VariablePiece
 from .function_starts import FunctionStartCandidate
 from .image import BinaryImage, LoadError
 from .marshal import (
@@ -135,6 +137,15 @@ from .printlanguage import (
 )
 from .project import ProjectState
 from .prototype import PrototypeLayout, PrototypeResolver
+from .printlanguage_rpn import (
+    OpTokenKind,
+    PcodeExpression,
+    PcodeSymbolResolver,
+    PcodeTokenMetadata,
+    PrintLanguageRpn,
+    PrintToken,
+    RpnTokenStack,
+)
 from .sleigh import SleighInstruction, SleighPcodeOp, SleighTranslator, SleighVarnode
 from .ssa import (
     MEMORY_LOCATION,
@@ -151,6 +162,7 @@ from .ssa import (
 from .typesys import (
     CField,
     CType,
+    CTypeComponent,
     JoinRecord,
     StorageLocation,
     TypeDatabase,
@@ -170,6 +182,7 @@ __all__ = [
     "BraceStyle",
     "CField",
     "CType",
+    "CTypeComponent",
     "CallSpecs",
     "CallingConvention",
     "ClangBitFieldToken",
@@ -217,13 +230,18 @@ __all__ = [
     "LoadError",
     "MEMORY_LOCATION",
     "MarshalError",
+    "Merge",
     "Modifier",
     "NoReturnCatalog",
     "OpCode",
     "OpToken",
+    "OpTokenKind",
     "PackedDecode",
     "PackedEncoder",
     "PackedFormat",
+    "PcodeExpression",
+    "PcodeSymbolResolver",
+    "PcodeTokenMetadata",
     "ParamActive",
     "ParamDirection",
     "ParamEntry",
@@ -250,12 +268,15 @@ __all__ = [
     "PrintExpr",
     "PrintLanguage",
     "PrintLanguageCapability",
+    "PrintLanguageRpn",
     "PrintStatement",
     "PrintSymbol",
     "PrintTerminator",
+    "PrintToken",
     "PrintType",
     "PrintableFunction",
     "ProjectState",
+    "RpnTokenStack",
     "ProtoModelMerged",
     "PrototypeLayout",
     "PrototypeModel",
@@ -271,6 +292,8 @@ __all__ = [
     "SSAValue",
     "ScoreProtoModel",
     "SemanticDecompiler",
+    "SplitDatatype",
+    "SplitPiece",
     "SleighInstruction",
     "SleighPcodeOp",
     "SleighTranslator",
@@ -281,6 +304,7 @@ __all__ = [
     "TokenSplit",
     "TrialMapResult",
     "TypeDatabase",
+    "VariablePiece",
     "TypeKind",
     "TypeMetatype",
     "TypeResolver",

@@ -28,6 +28,7 @@ class TypeKind(str, Enum):
     VECTOR = "vector"
     TYPEDEF = "typedef"
     FUNCTION = "function"
+    PARTIAL_STRUCT = "partial_struct"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,17 @@ class CField:
     name: str
     type: CType
     offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class CTypeComponent:
+    """One addressable leaf (or padding hole) in a composite C datatype."""
+
+    type: CType
+    offset: int
+    size: int
+    path: tuple[str, ...] = ()
+    is_hole: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +62,8 @@ class CType:
     packed: bool = False
     parameters: tuple[CType, ...] = ()
     variadic: bool = False
+    parent: CType | None = None
+    offset: int = 0
 
     @property
     def align_size(self) -> int | None:
@@ -63,7 +77,12 @@ class CType:
 
     @property
     def is_aggregate(self) -> bool:
-        return self.kind in {TypeKind.STRUCT, TypeKind.UNION, TypeKind.ARRAY}
+        return self.kind in {
+            TypeKind.STRUCT,
+            TypeKind.UNION,
+            TypeKind.ARRAY,
+            TypeKind.PARTIAL_STRUCT,
+        }
 
     @property
     def is_scalar(self) -> bool:
@@ -615,6 +634,245 @@ class TypeDatabase:
             packed=packed,
         )
         return self.add(ctype, bare_name)
+
+    def partial(self, parent: str | CType, size: int, offset: int = 0) -> CType:
+        """Create a Ghidra-like partial composite view over a struct or array.
+
+        ``Datatype`` values in Ghidra can describe a bounded slice of a larger
+        structure.  Keeping the parent and byte offset explicit lets the
+        splitter reason about a LOAD/STORE through a pointer-to-field without
+        inventing a second, disconnected layout model.
+        """
+        base = self.resolve(parent)
+        if base.kind == TypeKind.PARTIAL_STRUCT:
+            offset += base.offset
+            base = base.parent or base.target  # type: ignore[assignment]
+            if base is None:
+                raise ValueError("El tipo parcial no conserva su tipo padre")
+        base = base.unwrapped()
+        if base.kind not in {TypeKind.STRUCT, TypeKind.ARRAY} or base.size is None:
+            raise ValueError("Una vista parcial requiere un struct/array completo")
+        if size <= 0 or offset < 0 or offset + size > base.size:
+            raise ValueError("El intervalo parcial queda fuera del tipo compuesto")
+        return CType(
+            f"{base.name}/*+0x{offset:x}:{size}*/",
+            TypeKind.PARTIAL_STRUCT,
+            size,
+            base.alignment,
+            target=base,
+            parent=base,
+            offset=offset,
+        )
+
+    def undefined(self, size: int) -> CType:
+        """Return an anonymous byte-sized type for a composite padding hole."""
+        if size <= 0:
+            raise ValueError("Un tipo undefined debe tener tamaño positivo")
+        return CType(f"undefined{size}", TypeKind.UNKNOWN, size, 1)
+
+    def get_value_datatype(
+        self, pointer_type: str | CType, size: int, *, offset: int = 0
+    ) -> CType | None:
+        """Map a typed pointer and access width to the accessed ``Datatype``.
+
+        This is the Python counterpart of ``SplitDatatype::getValueDatatype``:
+        composite accesses become bounded partial views, and repeated scalar
+        accesses become arrays when the requested width is an exact multiple
+        of the scalar's aligned size.
+        """
+        if size <= 0:
+            return None
+        try:
+            pointer = self.resolve(pointer_type)
+        except (KeyError, TypeError):
+            return None
+        if pointer.kind != TypeKind.POINTER or pointer.target is None:
+            return None
+        target = pointer.target
+        if target.kind == TypeKind.PARTIAL_STRUCT:
+            offset += target.offset
+            target = target.parent or target.target  # type: ignore[assignment]
+            if target is None:
+                return None
+        target = target.unwrapped()
+        if target.size is None:
+            return None
+        aligned_size = target.align_size or target.size
+        if target.kind in {
+            TypeKind.BOOL,
+            TypeKind.INTEGER,
+            TypeKind.FLOAT,
+            TypeKind.POINTER,
+            TypeKind.ENUM,
+        } and size > aligned_size and aligned_size > 0 and size % aligned_size == 0:
+            return self.array(target, size // aligned_size)
+        if target.kind in {TypeKind.STRUCT, TypeKind.ARRAY}:
+            if offset < 0 or offset + size > target.size:
+                return None
+            if offset == 0 and size == target.size:
+                return target
+            return self.partial(target, size, offset)
+        return None
+
+    def get_component(
+        self, spec: str | CType, offset: int, *, hole_limit: int = 8
+    ) -> CTypeComponent | None:
+        """Find the deepest leaf type or padding hole beginning at ``offset``."""
+        if hole_limit <= 0:
+            raise ValueError("hole_limit debe ser positivo")
+        ctype = self.resolve(spec)
+        view_offset = 0
+        view_size = ctype.size
+        if ctype.kind == TypeKind.PARTIAL_STRUCT:
+            view_offset = ctype.offset
+            view_size = ctype.size
+            ctype = ctype.parent or ctype.target  # type: ignore[assignment]
+            if ctype is None:
+                return None
+        ctype = ctype.unwrapped()
+        if (
+            ctype.size is None
+            or offset < 0
+            or view_size is None
+            or offset >= view_size
+        ):
+            return None
+
+        absolute_offset = view_offset + offset
+        current_start = 0
+        current = ctype
+        path: list[str] = []
+        while True:
+            base = current.unwrapped()
+            local_offset = absolute_offset - current_start
+            if base.size is None or local_offset < 0 or local_offset >= base.size:
+                return None
+            if base.kind == TypeKind.STRUCT:
+                matching = [
+                    field
+                    for field in base.fields
+                    if field.offset <= local_offset
+                    < field.offset + (field.type.size or 0)
+                ]
+                if matching:
+                    field = min(
+                        matching,
+                        key=lambda item: (item.type.size or 0, item.offset, item.name),
+                    )
+                    current_start += field.offset
+                    current = field.type
+                    path.append(field.name)
+                    continue
+                next_offsets = [
+                    field.offset
+                    for field in base.fields
+                    if field.offset > local_offset
+                ]
+                boundary = min(next_offsets, default=base.size)
+                hole_size = min(hole_limit, max(1, boundary - local_offset))
+                return CTypeComponent(
+                    self.undefined(hole_size),
+                    absolute_offset - view_offset,
+                    hole_size,
+                    tuple(path),
+                    True,
+                )
+            if base.kind == TypeKind.UNION:
+                matching = [
+                    field
+                    for field in base.fields
+                    if local_offset < (field.type.size or 0)
+                ]
+                if not matching:
+                    hole_size = min(hole_limit, base.size - local_offset)
+                    return CTypeComponent(
+                        self.undefined(hole_size),
+                        absolute_offset - view_offset,
+                        hole_size,
+                        tuple(path),
+                        True,
+                    )
+                field = min(
+                    matching,
+                    key=lambda item: (item.type.size or 0, item.name),
+                )
+                current = field.type
+                path.append(field.name)
+                continue
+            if base.kind == TypeKind.ARRAY and base.target is not None:
+                element = base.target
+                stride = element.align_size or element.size
+                if stride is None or stride <= 0:
+                    return None
+                index, element_offset = divmod(local_offset, stride)
+                if base.count is not None and index >= base.count:
+                    return None
+                if element.size is None or element_offset >= element.size:
+                    hole_size = min(hole_limit, stride - element_offset)
+                    return CTypeComponent(
+                        self.undefined(hole_size),
+                        absolute_offset - view_offset,
+                        hole_size,
+                        tuple(path + [str(index)]),
+                        True,
+                    )
+                current_start += index * stride
+                current = element
+                path.append(str(index))
+                continue
+            component_size = base.size
+            component_offset = current_start - view_offset
+            if component_size <= 0:
+                return None
+            return CTypeComponent(
+                current,
+                component_offset,
+                component_size,
+                tuple(path),
+                False,
+            )
+
+    def components(
+        self,
+        spec: str | CType,
+        *,
+        size: int | None = None,
+        offset: int = 0,
+        hole_limit: int = 8,
+    ) -> tuple[CTypeComponent, ...]:
+        """Flatten a datatype interval into ordered leaf/padding components."""
+        ctype = self.resolve(spec)
+        available = ctype.size
+        if ctype.kind == TypeKind.PARTIAL_STRUCT:
+            available = ctype.size
+        requested = available - offset if size is None and available is not None else size
+        if requested is None or requested <= 0 or offset < 0:
+            return ()
+        if available is not None and offset + requested > available:
+            raise ValueError("El intervalo excede el tamaño del tipo")
+        result: list[CTypeComponent] = []
+        cursor = 0
+        while cursor < requested:
+            component = self.get_component(
+                ctype, offset + cursor, hole_limit=hole_limit
+            )
+            if component is None:
+                return ()
+            span = min(component.size, requested - cursor)
+            component_type = component.type
+            if span != component.size:
+                component_type = self.undefined(span)
+            result.append(
+                CTypeComponent(
+                    component_type,
+                    cursor,
+                    span,
+                    component.path,
+                    component.is_hole,
+                )
+            )
+            cursor += span
+        return tuple(result)
 
     def promote_vararg(self, spec: str | CType) -> CType:
         """Apply C's default argument promotions to a variadic value."""

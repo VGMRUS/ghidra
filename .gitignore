@@ -90,5 +90,6 @@ core.*
 # python files
 *.egg-info
 __pycache__
+**/.venv/
 
 gradle.lockfile

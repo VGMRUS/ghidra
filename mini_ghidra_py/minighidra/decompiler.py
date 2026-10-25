@@ -29,6 +29,32 @@ except ImportError as exc:  # pragma: no cover - declared package dependency
         "Falta Capstone. Instálalo con: python -m pip install capstone"
     ) from exc
 
+from .c_ast import (
+    CBinary,
+    CBlock,
+    CCall,
+    CCast,
+    CCompoundLiteral,
+    CConditional,
+    CDesignatedInitializer,
+    CEmitter,
+    CExpression,
+    CFloat,
+    CFunction,
+    CGoto,
+    CIdentifier,
+    CInitializerList,
+    CInteger,
+    CMember,
+    CParenthesized,
+    CRawExpression,
+    CString,
+    CTranslationUnit,
+    CUnary,
+    parse_c_declaration,
+    parse_c_parameter,
+    parse_c_statements,
+)
 from .abi import (
     CallingConvention,
     abi_argument_registers,
@@ -45,9 +71,10 @@ from .model import (
     Instruction,
 )
 from .paramid import ParamActive, ParamIDAnalysis, ParamRank, PcodeLikeGraph
+from .printlanguage_rpn import PcodeSymbolResolver
 from .prototype import PrototypeResolver
 from .sleigh import SleighInstruction, SleighTranslator, SleighVarnode
-from .ssa import SSAFunction, SSAHeritage, SSALocation
+from .ssa import SSAFunction, SSAHeritage, SSAOperand, SSAOperation, SSALocation
 from .typesys import StorageLocation, TypeDatabase, TypeKind
 
 
@@ -508,6 +535,7 @@ class SemanticDecompiler:
 
     def __init__(self, analyzer) -> None:
         self.analyzer = analyzer
+        self._c_emitter = CEmitter(expression_mode="rpn")
         self.bits = analyzer.image.bits
         self.pointer_size = self.bits // 8
         self._sleigh_translator = SleighTranslator(self.bits)
@@ -593,7 +621,180 @@ class SemanticDecompiler:
         """The validated p-code SSA/heritage graph from the latest decompilation."""
         return self._ssa_function
 
+    def emit_pcode_value(self, function: Function, value_id: int) -> str:
+        """Render an SSA value by recursively dispatching its original p-code ops."""
+        self._ensure_pcode_function(function)
+        assert self._ssa_function is not None
+        return self._c_emitter.emit_pcode_value(
+            self._ssa_function,
+            value_id,
+            symbols=self._pcode_symbol_resolver(),
+        )
+
+    def emit_pcode_operation(self, function: Function, operation_index: int) -> str:
+        """Render one original SLEIGH operation through the direct p-code path."""
+        self._ensure_pcode_function(function)
+        assert self._ssa_function is not None
+        return self._c_emitter.emit_pcode_operation(
+            self._ssa_function,
+            operation_index,
+            symbols=self._pcode_symbol_resolver(),
+        )
+
+    def emit_pcode_listing(self, function: Function) -> str:
+        """Emit every translated SLEIGH operation, including unreachable p-code."""
+        self._ensure_pcode_function(function)
+        assert self._ssa_function is not None
+        symbols = PcodeSymbolResolver(
+            address_names=dict(getattr(self.analyzer, "_name_by_address", {})),
+            function_addresses=getattr(self.analyzer, "functions", {}).keys(),
+            raw_register_names=True,
+        )
+        ssa_operations = {
+            (operation.instruction_address, operation.sequence): operation
+            for operation in self._ssa_function.operations
+        }
+        lines: list[str] = []
+        for instruction in self._sleigh_instructions:
+            for pcode in instruction.ops:
+                operation = ssa_operations.get((pcode.address, pcode.sequence))
+                if operation is None:
+                    inputs = tuple(
+                        SSAOperand(
+                            "constant",
+                            varnode.size_bits,
+                            constant=varnode.offset
+                            & ((1 << max(varnode.size_bits, 1)) - 1),
+                        )
+                        if varnode.space == "const"
+                        else SSAOperand(
+                            "address"
+                            if varnode.space == "ram"
+                            and pcode.opcode in {"BRANCH", "CBRANCH", "CALL"}
+                            and input_index == 0
+                            else "memory"
+                            if varnode.space == "ram"
+                            else "value",
+                            varnode.size_bits,
+                            address=varnode.offset if varnode.space == "ram" else None,
+                        )
+                        for input_index, varnode in enumerate(pcode.inputs)
+                    )
+                    operation = SSAOperation(
+                        index=-1,
+                        block_id=-1,
+                        instruction_address=pcode.address,
+                        instruction_mnemonic=instruction.mnemonic,
+                        sequence=pcode.sequence,
+                        opcode=pcode.opcode,
+                        inputs=inputs,
+                        pcode=pcode,
+                    )
+                expression = self._c_emitter.emit_pcode_operation(
+                    self._ssa_function,
+                    operation,
+                    symbols=symbols,
+                    resolve_definitions=False,
+                )
+                if pcode.opcode == "IMARK":
+                    statement = "IMARK"
+                elif operation.output_value is not None:
+                    statement = f"v{operation.output_value} = {expression}"
+                elif pcode.output is not None:
+                    output_name = _c_identifier(pcode.output.display)
+                    statement = f"out_{output_name} = {expression}"
+                else:
+                    statement = expression or pcode.opcode.lower()
+                lines.append(
+                    f"{pcode.address:#x}:{pcode.sequence} "
+                    f"{pcode.opcode} {statement}"
+                )
+        return "\n".join(lines)
+
+    def emit_pcode_operand(
+        self, function: Function, operation_index: int, input_index: int
+    ) -> str:
+        """Render one SSA-resolved operand and preserve its source Varnode identity."""
+        self._ensure_pcode_function(function)
+        assert self._ssa_function is not None
+        operation = next(
+            (
+                item
+                for item in self._ssa_function.operations
+                if item.index == operation_index
+            ),
+            None,
+        )
+        if operation is None:
+            raise KeyError(f"no SSA p-code operation with index {operation_index}")
+        if input_index < 0 or input_index >= len(operation.inputs):
+            raise IndexError(f"p-code input index {input_index} is out of range")
+        varnode = (
+            operation.pcode.inputs[input_index]
+            if operation.pcode is not None and input_index < len(operation.pcode.inputs)
+            else None
+        )
+        return self._c_emitter.emit_pcode_operand(
+            self._ssa_function,
+            operation.inputs[input_index],
+            varnode=varnode,
+            symbols=self._pcode_symbol_resolver(),
+        )
+
+    def emit_pcode_value_html(self, function: Function, value_id: int) -> str:
+        """Render p-code value tokens with semantic HTML markup classes."""
+        self.emit_pcode_value(function, value_id)
+        return self._c_emitter.emit_token_markup()
+
+    def _ensure_pcode_function(self, function: Function) -> None:
+        if (
+            self._ssa_function is None
+            or self._function is None
+            or self._function.address != function.address
+        ):
+            self.decompile_ast(function)
+
+    def _pcode_symbol_resolver(self) -> PcodeSymbolResolver:
+        input_locations, _widths = self._ssa_paramid_input_locations()
+        storage_names = {
+            (location.space, location.offset): name
+            for location, name in input_locations.items()
+        }
+        register_names: dict[tuple[str, int, int], str] = {}
+        for register, varnode in self._sleigh_translator.registers.items():
+            if not varnode.is_register:
+                continue
+            names = [
+                storage_names.get((varnode.space, varnode.offset + index))
+                for index in range(varnode.size)
+            ]
+            name = (
+                names[0]
+                if names
+                and names[0] is not None
+                and all(item == names[0] for item in names)
+                else f"in_{register.lower()}"
+            )
+            register_names[(varnode.space, varnode.offset, varnode.size)] = name
+        address_names = dict(getattr(self.analyzer, "_name_by_address", {}))
+        project_state = getattr(self.analyzer, "project_state", None)
+        if project_state is not None:
+            address_names.update(project_state.labels)
+        for address, target in getattr(self.analyzer, "functions", {}).items():
+            address_names.setdefault(address, target.name)
+        return PcodeSymbolResolver(
+            address_names=address_names,
+            register_names=register_names,
+            storage_names=storage_names,
+            function_addresses=getattr(self.analyzer, "functions", {}).keys(),
+        )
+
     def decompile(self, function: Function) -> str:
+        """Return emitted C for a function, using the typed AST as the boundary."""
+        return self._c_emitter.emit(self.decompile_ast(function))
+
+    def decompile_ast(self, function: Function) -> CTranslationUnit:
+        """Build the function translation-unit AST without emitting source text."""
         self._function = function
         self._calling_convention = calling_convention_for(self.analyzer, function)
         self._configure_calling_convention(self._calling_convention)
@@ -731,7 +932,6 @@ class SemanticDecompiler:
         ]
         if signature.variadic:
             parameter_declarations.append("...")
-        params = ", ".join(parameter_declarations) if parameter_declarations else "void"
         function.calling_convention = self._calling_convention.name
         resolved_signature = self._prototype_resolver.resolve(
             signature, self._calling_convention
@@ -773,29 +973,36 @@ class SemanticDecompiler:
                 function, resolved_signature
             )
         function.signature = resolved_signature
+
         self._artifact_return_type = return_type
         self._artifact_parameters = tuple(parameters)
         self._artifact_parameter_declarations = tuple(parameter_declarations)
         self._artifact_local_declarations = tuple(self._local_declaration_specs(body))
         self._structured_body = tuple(body)
-        name = _c_identifier(function.name)
-        convention_prefix = (
-            f"{self._calling_convention.name} "
-            if self._calling_convention.print_name
-            else ""
+
+        c_function = CFunction(
+            return_type=return_type,
+            name=_c_identifier(function.name),
+            parameters=tuple(
+                parse_c_parameter(declaration) for declaration in parameter_declarations
+            ),
+            body=parse_c_statements(body),
+            calling_convention=(
+                self._calling_convention.name
+                if self._calling_convention.print_name
+                else ""
+            ),
+            local_declarations=tuple(
+                parse_c_declaration(declaration)
+                for declaration in self._local_declarations(body)
+            ),
+            leading_comments=(
+                "/* Experimental semantic pseudocode: symbolic propagation, structured branches, and CFG goto fallback.",
+                " * Types, prototypes, and unsupported instruction effects remain conservative guesses;",
+                " * this is not a byte-for-byte or feature-complete replacement for Ghidra. */",
+            ),
         )
-        lines = [
-            "/* Experimental semantic pseudocode: symbolic propagation, structured branches, and CFG goto fallback.",
-            " * Types, prototypes, and unsupported instruction effects remain conservative guesses;",
-            " * this is not a byte-for-byte or feature-complete replacement for Ghidra. */",
-            f"{return_type} {convention_prefix}{name}({params}) {{",
-        ]
-        lines.extend(
-            f"  {declaration}" for declaration in self._local_declarations(body)
-        )
-        lines.extend(body)
-        lines.append("}")
-        return "\n".join(lines)
+        return CTranslationUnit(functions=(c_function,))
 
     def decompile_artifacts(self, function: Function) -> DecompileArtifacts:
         """Decompile and return the structural artifacts the printer consumes.
@@ -831,21 +1038,22 @@ class SemanticDecompiler:
             is_thunk=self._artifact_is_thunk,
         )
 
-    def _decompile_thunk(self, function: Function) -> str:
+
+    def _decompile_thunk(self, function: Function) -> CTranslationUnit:
         function.calling_convention = self._calling_convention.name
         signature = self._declared_signature
         if signature is None:
             signature = FunctionSignature("void", (), self._calling_convention.name)
             function.signature = signature
-            parameters = "void"
             return_type = "void"
+            parameters: tuple[str, ...] = ()
         else:
-            parameters = ", ".join(
+            parameter_items = [
                 _parameter_declaration(parameter) for parameter in signature.parameters
-            )
+            ]
             if signature.variadic:
-                parameters = f"{parameters}, ..." if parameters else "..."
-            parameters = parameters or "void"
+                parameter_items.append("...")
+            parameters = tuple(parameter_items)
             return_type = signature.return_type
         self._artifact_is_thunk = True
         self._artifact_return_type = return_type
@@ -854,25 +1062,27 @@ class SemanticDecompiler:
             _parameter_declaration(parameter) for parameter in signature.parameters
         )
         self._structured_body = (f"  goto {function.thunk_target_name or ''};",)
-        name = _c_identifier(function.name)
         if function.thunk_target_name:
             target = _c_identifier(function.thunk_target_name)
         elif function.thunk_target is not None:
             target = f"loc_{function.thunk_target:X}"
         else:
             target = "indirect_target"
-        convention_prefix = (
-            f"{self._calling_convention.name} "
-            if self._calling_convention.print_name
-            else ""
+        c_function = CFunction(
+            return_type=return_type,
+            name=_c_identifier(function.name),
+            parameters=tuple(parse_c_parameter(parameter) for parameter in parameters),
+            body=CBlock((CGoto(target),)),
+            calling_convention=(
+                self._calling_convention.name
+                if self._calling_convention.print_name
+                else ""
+            ),
+            leading_comments=(
+                "/* Tail thunk; target forwarding remains represented as a goto. */",
+            ),
         )
-        lines = [
-            "/* Tail thunk; target forwarding remains represented as a goto. */",
-            f"{return_type} {convention_prefix}{name}({parameters}) {{",
-            f"  goto {target};",
-            "}",
-        ]
-        return "\n".join(lines)
+        return CTranslationUnit(functions=(c_function,))
 
     def _configure_calling_convention(self, convention: CallingConvention) -> None:
         self._argument_registers = convention.argument_registers
@@ -7143,19 +7353,596 @@ class SemanticDecompiler:
             state.pending_pushes.clear()
 
     def _render(self, expression: _Expr) -> str:
-        """Render an expression and index it for the Ghidra-style printer.
+        """Render the common expression IR through structured C AST nodes.
 
-        The rendered text is recorded in ``_render_catalog`` so the printer can
-        re-associate a statement's expression text with the AST node that
-        produced it.  Rendering itself is unchanged.
+        The rendered text is also indexed in ``_render_catalog`` so the
+        Ghidra-style printer (``printdoc``/``printc``) can re-associate a
+        statement's expression text with the AST node that produced it.
+        Rendering itself follows the typed C AST path, with the previous
+        textual renderer kept as ``_render_legacy`` fallback.
         """
-        text = self._render_expression(expression)
+        node = self._expression_ast(expression)
+        if node is not None:
+            text = self._c_emitter.emit_expression(node)
+        else:
+            text = self._render_legacy(expression)
         catalog = self._render_catalog
         if catalog is not None:
             catalog.setdefault(text, expression)
         return text
 
+    def _expression_child_ast(self, expression: _Expr):
+        node = self._expression_ast(expression)
+        if node is None:
+            return CRawExpression(self._render_legacy(expression))
+        return node
+
+    @staticmethod
+    def _or_ast_chain(terms: list[CExpression]) -> CExpression:
+        if not terms:
+            return CInteger(0)
+        result = terms[0]
+        for term in terms[1:]:
+            result = CBinary("|", result, term)
+        return result
+
+    @staticmethod
+    def _float_integer_union_ast(
+        value: CExpression, width: int, source_field: str, result_field: str
+    ) -> CExpression:
+        float_type = _float_type(width)
+        integer_type = _unsigned_type(width)
+        type_name = f"union {{ {integer_type} i; {float_type} f; }}"
+        source_type = float_type if source_field == "f" else integer_type
+        literal = CCompoundLiteral(
+            type_name,
+            CInitializerList(
+                (CDesignatedInitializer(source_field, CCast(source_type, value)),)
+            ),
+        )
+        return CMember(literal, result_field)
+
+    def _expression_ast(self, expression: _Expr):
+        """Lower the core symbolic expression operators into C expression AST."""
+        kind = expression.kind
+        if kind == "const":
+            value = int(expression.value)
+            return CInteger(value, 16 if value > 9 else 10)
+        if kind == "aggregate_value":
+            return self._aggregate_value_ast(expression)
+        if kind == "var":
+            return CIdentifier(str(expression.value))
+        if kind == "fp_const":
+            return CFloat(f"{_format_float(float(expression.value))}L")
+        if kind in {"fp_to_bits", "simd_float"}:
+            width = int(expression.value)
+            source = self._expression_child_ast(expression.args[0])
+            source_field, result_field = (
+                ("f", "i") if kind == "fp_to_bits" else ("i", "f")
+            )
+            return self._float_integer_union_ast(source, width, source_field, result_field)
+        if kind in {"load", "typed_load", "aggregate_load", "fp_load", "fp_int_load"}:
+            pointer = self._expression_child_ast(expression.args[0])
+            is_typed_load = kind in {"typed_load", "aggregate_load"}
+            if is_typed_load:
+                ctype = expression.value
+                type_name = f"{getattr(ctype, 'name', ctype)} *"
+            elif kind == "fp_load":
+                width, _is_integer = expression.value
+                type_name = f"{_float_type(width)} *"
+            elif kind == "fp_int_load":
+                width, _is_integer = expression.value
+                type_name = f"{_signed_type(width)} *"
+            else:
+                type_name = f"{_memory_type(expression.bits)} *"
+            cast_pointer = CCast(type_name, pointer)
+            if is_typed_load:
+                cast_pointer = CParenthesized(cast_pointer)
+            loaded = CUnary("*", cast_pointer)
+            return CCast("long double", loaded) if kind == "fp_int_load" else loaded
+        if kind == "address":
+            address_kind, value = expression.value
+            if address_kind == "stack":
+                return CUnary("&", CIdentifier(str(value)))
+            address = int(value)
+            symbol = self.analyzer.name_at(address)
+            if symbol:
+                return CUnary("&", CIdentifier(_c_identifier(symbol)))
+            text = self._string_by_address.get(address)
+            if text is not None:
+                return CString(text)
+            return CInteger(address, 16)
+        if kind == "stack_pointer":
+            delta = int(expression.value)
+            base = CIdentifier("in_rsp" if self.bits == 64 else "in_esp")
+            if delta == 0:
+                return base
+            operator = "+" if delta > 0 else "-"
+            return CBinary(operator, base, CInteger(abs(delta), 16))
+        if kind == "segment_address":
+            return CBinary(
+                "+",
+                CIdentifier(f"{expression.value}_base"),
+                self._expression_child_ast(expression.args[0]),
+            )
+        if kind in {"zext", "sext", "trunc"}:
+            source = expression.args[0]
+            type_name = (
+                _signed_type(expression.bits)
+                if kind == "sext"
+                else _unsigned_type(expression.bits)
+            )
+            value = self._expression_child_ast(source)
+            if kind in {"zext", "sext"}:
+                source_bits = source.bits or expression.bits
+                source_type = (
+                    _signed_type(source_bits)
+                    if kind == "sext"
+                    else _unsigned_type(source_bits)
+                )
+                value = CCast(source_type, value)
+            return CCast(type_name, value)
+        if kind == "concat":
+            high, low = expression.args
+            low_bits = int(expression.value)
+            shifted_high = CBinary(
+                "<<",
+                CCast(_unsigned_type(expression.bits), self._expression_child_ast(high)),
+                CInteger(low_bits),
+            )
+            low_value = CCast(
+                _unsigned_type(low_bits), self._expression_child_ast(low)
+            )
+            return CBinary("|", shifted_high, low_value)
+        if kind == "extract":
+            value, offset = expression.args
+            value_ast = self._expression_child_ast(value)
+            if offset.kind == "const" and int(offset.value) == 0:
+                return CCast(_unsigned_type(expression.bits), value_ast)
+            mask = (1 << expression.bits) - 1
+            shifted = CBinary(
+                ">>", value_ast, self._expression_child_ast(offset)
+            )
+            return CBinary("&", shifted, CInteger(mask, 16))
+        if kind == "insert":
+            old, new, offset = expression.args
+            if offset.kind != "const":
+                return None
+            inserted_bits = new.bits
+            shift = int(offset.value)
+            mask = ((1 << inserted_bits) - 1) << shift
+            preserved = CBinary(
+                "&",
+                self._expression_child_ast(old),
+                CUnary("~", CInteger(mask, 16)),
+            )
+            inserted = CBinary(
+                "<<",
+                CBinary(
+                    "&",
+                    self._expression_child_ast(new),
+                    CInteger((1 << inserted_bits) - 1, 16),
+                ),
+                CInteger(shift),
+            )
+            return CBinary("|", preserved, inserted)
+        if kind in {"unary", "fp_unary"}:
+            operand = self._expression_ast(expression.args[0])
+            if operand is None:
+                operand = CRawExpression(self._render_legacy(expression.args[0]))
+            operation = str(expression.value)
+            if kind == "unary":
+                operator = {"neg": "-", "bitnot": "~", "boolnot": "!"}.get(
+                    operation
+                )
+                return CUnary(operator, operand) if operator else None
+            if operation == "neg":
+                return CUnary("-", operand)
+            function = {
+                "abs": "fabsl",
+                "sqrt": "sqrtl",
+                "sin": "sinl",
+                "cos": "cosl",
+                "tan": "tanl",
+                "round": "nearbyintl",
+                "ceil": "ceill",
+                "floor": "floorl",
+                "trunc": "truncl",
+            }.get(operation, operation)
+            if operation == "exp2m1":
+                return CBinary(
+                    "-", CCall(CIdentifier("exp2l"), (operand,)), CRawExpression("1.0L")
+                )
+            return CCall(CIdentifier(function), (operand,))
+        if kind == "select":
+            children = [self._expression_ast(item) for item in expression.args]
+            if any(child is None for child in children):
+                return None
+            return CConditional(children[0], children[1], children[2])
+        if kind in {"op", "fp_op", "fp_compare"} and len(expression.args) == 2:
+            left, right = expression.args
+            left_ast = self._expression_ast(left)
+            right_ast = self._expression_ast(right)
+            if left_ast is None:
+                left_ast = CRawExpression(self._render_legacy(left))
+            if right_ast is None:
+                right_ast = CRawExpression(self._render_legacy(right))
+            operation = str(expression.value)
+            if kind == "fp_compare":
+                operator = {"eq": "==", "ne": "!=", "lt": "<", "le": "<="}.get(
+                    operation, "=="
+                )
+            else:
+                operator = self._BINARY_OPERATORS.get(operation)
+            if operator is None:
+                return None
+            if kind == "op" and operation in {"ult", "ule", "ugt", "uge"}:
+                type_name = _unsigned_type(max(left.bits, right.bits))
+                left_ast = CCast(type_name, left_ast)
+                right_ast = CCast(type_name, right_ast)
+            elif kind == "op" and operation in {"slt", "sle", "sgt", "sge"}:
+                type_name = _signed_type(max(left.bits, right.bits))
+                left_ast = CCast(type_name, left_ast)
+                right_ast = CCast(type_name, right_ast)
+            return CBinary(operator, left_ast, right_ast)
+        if kind == "fp_cast":
+            value = self._expression_ast(expression.args[0])
+            if value is None:
+                value = CRawExpression(self._render_legacy(expression.args[0]))
+            return CCast(_float_type(int(expression.value)), value)
+        if kind == "fp_from_int":
+            source = expression.args[0]
+            value = self._expression_ast(source)
+            if value is None:
+                value = CRawExpression(self._render_legacy(source))
+            return CCast("long double", CCast(_signed_type(source.bits), value))
+        if kind == "fp_to_int":
+            width, truncate = expression.value
+            value = self._expression_ast(expression.args[0])
+            if value is None:
+                value = CRawExpression(self._render_legacy(expression.args[0]))
+            function = "truncl" if truncate else "nearbyintl"
+            return CCast(_signed_type(width), CCall(CIdentifier(function), (value,)))
+        if kind == "fp_nan":
+            value = self._expression_ast(expression.args[0])
+            if value is None:
+                value = CRawExpression(self._render_legacy(expression.args[0]))
+            return CCall(CIdentifier("isnan"), (value,))
+        if kind == "fp_func" and len(expression.args) == 2:
+            left, right = (
+                self._expression_child_ast(argument)
+                for argument in expression.args
+            )
+            operation = str(expression.value)
+            if operation in {"fyl2x", "fyl2xp1"}:
+                return CBinary(
+                    "*", left, CCall(CIdentifier("log2l"), (right,))
+                )
+            functions = {
+                "fpatan": "atan2l",
+                "fprem": "fmodl",
+                "fprem1": "remainderl",
+            }
+            if operation == "fscale":
+                scale = CCall(
+                    CIdentifier("exp2l"),
+                    (CCall(CIdentifier("truncl"), (right,)),),
+                )
+                return CBinary("*", left, scale)
+            function = functions.get(operation)
+            return (
+                CCall(CIdentifier(function), (left, right))
+                if function is not None
+                else None
+            )
+        if kind == "fp_condition" and len(expression.args) == 2:
+            left, right = (
+                self._expression_child_ast(argument)
+                for argument in expression.args
+            )
+            unordered = CBinary(
+                "||",
+                CCall(CIdentifier("isnan"), (left,)),
+                CCall(CIdentifier("isnan"), (right,)),
+            )
+            condition = str(expression.value)
+            if condition in {"jp", "jpe"}:
+                return unordered
+            if condition in {"jnp", "jpo"}:
+                return CUnary("!", unordered)
+            comparison = {
+                "je": "==",
+                "jz": "==",
+                "jne": "!=",
+                "jnz": "!=",
+                "jb": "<",
+                "jc": "<",
+                "jnae": "<",
+                "jbe": "<=",
+                "jna": "<=",
+                "ja": ">",
+                "jnbe": ">",
+                "jae": ">=",
+                "jnb": ">=",
+                "jnc": ">=",
+            }.get(condition)
+            if comparison is None:
+                return None
+            compare = CBinary(comparison, left, right)
+            if condition in {"jne", "jnz", "ja", "jnbe", "jae", "jnb", "jnc"}:
+                return CBinary("&&", CUnary("!", unordered), compare)
+            return CBinary("||", unordered, compare)
+        if kind == "pcode_builtin":
+            value = self._expression_child_ast(expression.args[0])
+            operation = str(expression.value)
+            unsigned_value = CCast("unsigned long long", value)
+            if operation == "popcount":
+                return CCall(CIdentifier("__builtin_popcountll"), (unsigned_value,))
+            if operation == "bsf":
+                is_zero = CBinary("==", value, CInteger(0))
+                return CConditional(
+                    is_zero,
+                    CInteger(0),
+                    CCall(CIdentifier("__builtin_ctzll"), (unsigned_value,)),
+                )
+            if operation in {"bsr", "lzcount"}:
+                source_bits = expression.args[0].bits
+                is_zero = CBinary("==", value, CInteger(0))
+                count = CCall(CIdentifier("__builtin_clzll"), (unsigned_value,))
+                if operation == "bsr":
+                    result = CBinary("-", CInteger(63), count)
+                    zero_result = CInteger(source_bits - 1)
+                else:
+                    result = CBinary("-", count, CInteger(64 - source_bits))
+                    zero_result = CInteger(source_bits)
+                return CConditional(is_zero, zero_result, result)
+        if kind == "parity":
+            value = self._expression_child_ast(expression.args[0])
+            byte_value = CCast("uint8_t", value)
+            folded = CBinary(
+                "^", byte_value, CBinary(">>", CCast("uint8_t", value), CInteger(4))
+            )
+            table_index = CBinary("&", folded, CInteger(0xF, 16))
+            table_value = CBinary(">>", CInteger(0x6996, 16), table_index)
+            return CBinary("==", CBinary("&", table_value, CInteger(1)), CInteger(0))
+        if kind in {"mmx_lanes", "simd_lanes"}:
+            operation, lane_width = expression.value
+            left, right = (
+                self._expression_child_ast(argument) for argument in expression.args
+            )
+            vector_bits = 64 if kind == "mmx_lanes" else expression.bits
+            lane_mask = _mask(lane_width)
+            lanes = []
+            for index in range(vector_bits // lane_width):
+                shift = index * lane_width
+                lhs = CCast(
+                    _unsigned_type(lane_width),
+                    CBinary(">>", left, CInteger(shift)),
+                )
+                rhs = CCast(
+                    _unsigned_type(lane_width),
+                    CBinary(">>", right, CInteger(shift)),
+                )
+                if kind == "simd_lanes" and operation == "eq":
+                    lane = CConditional(
+                        CBinary("==", lhs, rhs), CInteger(lane_mask, 16), CInteger(0)
+                    )
+                elif kind == "simd_lanes" and operation in {"smin", "smax"}:
+                    signed_type = _signed_type(lane_width)
+                    comparator = "<" if operation == "smin" else ">"
+                    lane = CConditional(
+                        CBinary(
+                            comparator,
+                            CCast(signed_type, lhs),
+                            CCast(signed_type, rhs),
+                        ),
+                        lhs,
+                        rhs,
+                    )
+                else:
+                    operator = {"add": "+", "sub": "-", "mul": "*"}[operation]
+                    lane = CBinary(
+                        "&", CBinary(operator, lhs, rhs), CInteger(lane_mask, 16)
+                    )
+                extension_type = "uint64_t" if kind == "mmx_lanes" else "__uint128_t"
+                lanes.append(
+                    CBinary(
+                        "<<", CCast(extension_type, lane), CInteger(shift)
+                    )
+                )
+            return self._or_ast_chain(lanes)
+        if kind == "mmx_shift":
+            operation, lane_width = expression.value
+            vector, count = expression.args
+            value = self._expression_child_ast(vector)
+            amount = self._expression_child_ast(count)
+            if lane_width == 64:
+                overwide = CBinary(">=", amount, CInteger(64))
+                if operation == "shl":
+                    shifted = CBinary("<<", CCast("uint64_t", value), amount)
+                    return CConditional(overwide, CInteger(0), shifted)
+                if operation == "lshr":
+                    shifted = CBinary(">>", CCast("uint64_t", value), amount)
+                    return CConditional(overwide, CInteger(0), shifted)
+                signed_value = CCast("int64_t", value)
+                sign_fill = CBinary(">>", signed_value, CInteger(63))
+                shifted = CBinary(">>", signed_value, amount)
+                return CConditional(overwide, sign_fill, shifted)
+
+            lane_mask = _mask(lane_width)
+            signed_type = "int16_t" if lane_width == 16 else "int32_t"
+            lanes = []
+            for index in range(64 // lane_width):
+                shift = index * lane_width
+                lane = CCast(
+                    _unsigned_type(lane_width),
+                    CBinary(">>", value, CInteger(shift)),
+                )
+                if operation == "shl":
+                    shifted = CBinary("<<", lane, amount)
+                elif operation == "lshr":
+                    shifted = CBinary(">>", lane, amount)
+                else:
+                    shifted = CBinary(
+                        ">>", CCast(signed_type, lane), amount
+                    )
+                if operation == "ashr":
+                    negative = CBinary("<", CCast(signed_type, lane), CInteger(0))
+                    overflow = CConditional(
+                        negative, CInteger(lane_mask, 16), CInteger(0)
+                    )
+                else:
+                    overflow = CInteger(0)
+                bounded = CConditional(
+                    CBinary(">=", amount, CInteger(lane_width)),
+                    overflow,
+                    CBinary("&", shifted, CInteger(lane_mask, 16)),
+                )
+                lanes.append(
+                    CBinary("<<", CCast("uint64_t", bounded), CInteger(shift))
+                )
+            return self._or_ast_chain(lanes)
+        if kind == "simd_fp_binary":
+            width = int(expression.value)
+            result, old_destination = expression.args
+            raw_result = self._float_integer_union_ast(
+                self._expression_child_ast(result), width, "f", "i"
+            )
+            old = self._expression_child_ast(old_destination)
+            preserved = CBinary(
+                "<<",
+                CBinary(">>", CCast("__uint128_t", old), CInteger(width)),
+                CInteger(width),
+            )
+            return CBinary("|", preserved, CCast("__uint128_t", raw_result))
+        if kind == "simd_convert_int_fp":
+            input_bits, output_bits = expression.value
+            source, old_destination = expression.args
+            integer = CCast(
+                _signed_type(input_bits), self._expression_child_ast(source)
+            )
+            packed = self._float_integer_union_ast(integer, output_bits, "f", "i")
+            old = self._expression_child_ast(old_destination)
+            preserved = CBinary(
+                "<<",
+                CBinary(">>", CCast("__uint128_t", old), CInteger(output_bits)),
+                CInteger(output_bits),
+            )
+            return CBinary("|", preserved, CCast("__uint128_t", packed))
+        if kind == "simd_convert_fp":
+            _input_bits, output_bits = expression.value
+            source, old_destination = expression.args
+            packed = self._float_integer_union_ast(
+                self._expression_child_ast(source), output_bits, "f", "i"
+            )
+            old = self._expression_child_ast(old_destination)
+            preserved = CBinary(
+                "<<",
+                CBinary(">>", CCast("__uint128_t", old), CInteger(output_bits)),
+                CInteger(output_bits),
+            )
+            return CBinary("|", preserved, CCast("__uint128_t", packed))
+        if kind == "simd_minmax":
+            operation = str(expression.value)
+            left, right, old_destination = expression.args
+            lhs = self._expression_child_ast(left)
+            rhs = self._expression_child_ast(right)
+            comparator = "<" if operation == "min" else ">"
+            unordered = CBinary(
+                "||",
+                CCall(CIdentifier("isnan"), (lhs,)),
+                CCall(CIdentifier("isnan"), (rhs,)),
+            )
+            not_better = CUnary("!", CBinary(comparator, lhs, rhs))
+            choose_rhs = CBinary("||", unordered, not_better)
+            float_result = CConditional(choose_rhs, rhs, lhs)
+            raw_result = self._float_integer_union_ast(float_result, 64, "f", "i")
+            old = self._expression_child_ast(old_destination)
+            preserved = CBinary(
+                "<<",
+                CBinary(">>", CCast("__uint128_t", old), CInteger(64)),
+                CInteger(64),
+            )
+            return CBinary("|", preserved, CCast("__uint128_t", raw_result))
+        if kind == "simd_cvtdq2pd":
+            source = self._expression_child_ast(expression.args[0])
+            lanes = []
+            for index in range(2):
+                shift = index * 32
+                integer = CCast(
+                    "int32_t",
+                    CCast(
+                        "uint32_t",
+                        CBinary(">>", source, CInteger(shift)),
+                    ),
+                )
+                converted = self._float_integer_union_ast(integer, 64, "f", "i")
+                lanes.append(
+                    CBinary(
+                        "<<",
+                        CCast("__uint128_t", converted),
+                        CInteger(index * 64),
+                    )
+                )
+            return self._or_ast_chain(lanes)
+        if kind == "simd_cvtt_to_int":
+            bits, _input_bits = expression.value
+            value = self._expression_child_ast(expression.args[0])
+            minimum = -(1 << (bits - 1))
+            upper_bound = 1 << (bits - 1)
+            invalid = 1 << (bits - 1)
+            out_of_range = CBinary(
+                "||",
+                CBinary(
+                    "||",
+                    CUnary("!", CCall(CIdentifier("isfinite"), (value,))),
+                    CBinary("<", value, CInteger(minimum)),
+                ),
+                CBinary(">=", value, CInteger(upper_bound)),
+            )
+            converted = CCast(
+                _signed_type(bits), CCall(CIdentifier("trunc"), (value,))
+            )
+            return CCast(
+                _unsigned_type(bits),
+                CConditional(out_of_range, CInteger(invalid, 16), converted),
+            )
+        if kind == "simd_shuffle_dwords":
+            vector = self._expression_child_ast(expression.args[0])
+            shuffle = int(expression.value)
+            lanes = []
+            for index in range(4):
+                source_index = (shuffle >> (index * 2)) & 3
+                lane = CCast(
+                    "uint32_t",
+                    CBinary(">>", vector, CInteger(source_index * 32)),
+                )
+                lanes.append(
+                    CBinary(
+                        "<<", CCast("__uint128_t", lane), CInteger(index * 32)
+                    )
+                )
+            return self._or_ast_chain(lanes)
+        if kind == "simd_shift_bytes":
+            vector, count = expression.args
+            value = self._expression_child_ast(vector)
+            amount = self._expression_child_ast(count)
+            shift = CBinary("*", amount, CInteger(8))
+            operator = "<<" if expression.value == "left" else ">>"
+            shifted = CBinary(
+                operator, CCast("__uint128_t", value), shift
+            )
+            return CConditional(
+                CBinary(">=", amount, CInteger(16)), CInteger(0), shifted
+            )
+        return None
+
+
     def _render_expression(self, expression: _Expr) -> str:
+        """Alias of the legacy textual renderer kept for the printer."""
+        return self._render_legacy(expression)
+
+    def _render_legacy(self, expression: _Expr) -> str:
         kind = expression.kind
         if kind == "const":
             return _format_integer(int(expression.value))
@@ -7573,6 +8360,85 @@ class SemanticDecompiler:
             return f"({left_text} {operator} {right_text})"
         return f"unknown_expr_{kind}"
 
+    def _aggregate_value_ast(self, expression: _Expr):
+        ctype, locations = expression.value
+        fields = ctype.fields[:1] if ctype.kind == TypeKind.UNION else ctype.fields
+        initializers: list[CDesignatedInitializer] = []
+        for struct_field in fields:
+            field_type = struct_field.type.unwrapped()
+            field_size = field_type.size
+            if field_size is None or field_size <= 0:
+                continue
+            pieces: list[tuple[int, _Expr]] = []
+            field_start = struct_field.offset
+            field_end = field_start + field_size
+            for location, value in zip(locations, expression.args, strict=True):
+                location_start = location.value_offset
+                location_end = location_start + location.size
+                overlap_start = max(field_start, location_start)
+                overlap_end = min(field_end, location_end)
+                if overlap_start >= overlap_end:
+                    continue
+                width = (overlap_end - overlap_start) * 8
+                bit_offset = (overlap_start - location_start) * 8
+                part = (
+                    _extract(value, bit_offset, width)
+                    if bit_offset or width < value.bits
+                    else value
+                )
+                pieces.append((overlap_start, part))
+            pieces.sort(key=lambda item: item[0])
+            if not pieces or pieces[0][0] != field_start:
+                continue
+            raw = pieces[0][1]
+            covered_until = field_start + raw.bits // 8
+            complete = True
+            for offset, piece in pieces[1:]:
+                if offset != covered_until:
+                    complete = False
+                    break
+                raw = _concat(piece, raw, raw.bits)
+                covered_until += piece.bits // 8
+            if not complete or covered_until < field_end:
+                continue
+            if field_type.kind == TypeKind.FLOAT and field_type.size in {4, 8}:
+                field_value = self._expression_child_ast(
+                    _simd_float(raw, field_type.size * 8)
+                )
+            elif field_type.is_aggregate:
+                nested_pieces = [
+                    (location, value)
+                    for location, value in zip(locations, expression.args, strict=True)
+                    if location.value_offset < field_end
+                    and location.value_offset + location.size > field_start
+                ]
+                nested_locations = tuple(
+                    replace(
+                        location,
+                        value_offset=location.value_offset - struct_field.offset,
+                    )
+                    for location, _value in nested_pieces
+                )
+                nested = _Expr(
+                    "aggregate_value",
+                    (field_type, nested_locations),
+                    args=tuple(value for _location, value in nested_pieces),
+                    bits=(field_type.size or 0) * 8,
+                )
+                field_value = self._expression_child_ast(nested)
+            else:
+                if field_size * 8 < raw.bits:
+                    raw = _truncate(raw, field_size * 8)
+                field_value = CParenthesized(
+                    CCast(struct_field.type.name, self._expression_child_ast(raw))
+                )
+            field_name = _c_identifier(
+                struct_field.name or f"field_{len(initializers)}"
+            )
+            initializers.append(CDesignatedInitializer(field_name, field_value))
+        entries = tuple(initializers) if initializers else (CInteger(0),)
+        return CCompoundLiteral(ctype.name, CInitializerList(entries))
+
     def _render_aggregate_value(self, expression: _Expr) -> str:
         ctype, locations = expression.value
         fields = ctype.fields[:1] if ctype.kind == TypeKind.UNION else ctype.fields
@@ -7803,11 +8669,36 @@ class SemanticDecompiler:
                     else None
                 ),
             )
+        paramid_graph.type_database = self._type_database
+        paramid_graph.parameter_types = dict(self._parameter_types)
+        paramid_graph.big_endian = bool(
+            getattr(self.analyzer.image, "big_endian", False)
+        )
         self._paramid_analysis = ParamIDAnalysis(paramid_graph)
         self._paramid_active = self._paramid_analysis.analyze(
             justproto=justproto,
             input_names=input_names,
         )
+
+        # These focused datatype and alias passes can run even while the
+        # broader universal action catalog is unavailable (several unrelated
+        # type-op rules are still incomplete in this Python port).
+        from .action_controlflow import ActionCopyMarker, ActionShadowVar
+        from .action_name import ActionNameVars
+        from .datatype_split import SplitDatatype
+        from .merge import Merge
+
+        SplitDatatype.apply_to_graph(paramid_graph)
+        ActionShadowVar("analysis").apply(paramid_graph)
+        merge = getattr(paramid_graph, "merge", None)
+        if merge is None:
+            merge = Merge(paramid_graph)
+            paramid_graph.merge = merge  # type: ignore[attr-defined]
+        merge.assign_highs()
+        merge.merge_op("MULTIEQUAL")
+        merge.merge_op("COPY")
+        ActionCopyMarker("merge").apply(paramid_graph)
+        ActionNameVars("merge").apply(paramid_graph)
 
         try:
             from .action import ActionDatabase
