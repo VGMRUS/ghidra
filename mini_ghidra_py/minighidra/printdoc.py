@@ -720,6 +720,67 @@ _BINARY_OPS = {
 _SIGNED_COMPARISONS = frozenset({"slt", "sle", "sgt", "sge"})
 _UNSIGNED_COMPARISONS = frozenset({"ult", "ule", "ugt", "uge"})
 
+# ---------------------------------------------------------------------------
+# Floating point (x87 / scalar SSE) forms produced by the AST backend
+# ---------------------------------------------------------------------------
+# Ghidra prints CPUI_FLOAT_* with the very same tokens as the integer ops
+# (printc.hh: opFloatAdd -> binary_plus, opFloatEqual -> equal, ...), so the
+# converter maps the backend's float operators onto dedicated names that the
+# printer resolves to those tokens without adding integer casts.
+_FP_BINARY_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "div": "fdiv"}
+
+_FP_COMPARISONS = {
+    "eq": "feq",
+    "ne": "fne",
+    "lt": "flt",
+    "le": "fle",
+    "gt": "fgt",
+    "ge": "fge",
+}
+
+# FP_ABS/FP_SQRT/FP_CEIL/... are printed by Ghidra with opFunc (function syntax
+# whose name is the operator name).  The AST backend renders them with the libm
+# long double function that matches the x87 instruction, which is kept here.
+_FP_UNARY_FUNCTIONS = {
+    "abs": "fabsl",
+    "sqrt": "sqrtl",
+    "sin": "sinl",
+    "cos": "cosl",
+    "tan": "tanl",
+    "round": "nearbyintl",
+    "ceil": "ceill",
+    "floor": "floorl",
+    "trunc": "truncl",
+}
+
+# Two-operand x87 instructions (FPATAN, FPREM, FPREM1) and the ones the backend
+# expands into an expression (FYL2X, FSCALE).
+_FP_BINARY_FUNCTIONS = {"fpatan": "atan2l", "fprem": "fmodl", "fprem1": "remainderl"}
+
+# x86 floating point jump codes: how the parity (unordered) test combines with
+# the comparison.  "or" is ``unordered || (a op b)``, "and" is
+# ``!unordered && (a op b)`` -- the exact forms the backend renders.
+_FP_CONDITION_FORMS = {
+    "jp": ("unordered", None),
+    "jpe": ("unordered", None),
+    "jnp": ("ordered", None),
+    "jpo": ("ordered", None),
+    "je": ("or", "feq"),
+    "jz": ("or", "feq"),
+    "jne": ("and", "fne"),
+    "jnz": ("and", "fne"),
+    "jb": ("or", "flt"),
+    "jc": ("or", "flt"),
+    "jnae": ("or", "flt"),
+    "jbe": ("or", "fle"),
+    "jna": ("or", "fle"),
+    "ja": ("and", "fgt"),
+    "jnbe": ("and", "fgt"),
+    "jae": ("and", "fge"),
+    "jnb": ("and", "fge"),
+    "jnc": ("and", "fge"),
+}
+
 
 class ExpressionConverter:
     """Convert backend ``_Expr`` nodes into normalized :class:`PrintExpr`."""
@@ -736,13 +797,121 @@ class ExpressionConverter:
         self.bits = bits
         self.catalog = catalog
         self._reverse: dict[int, str] = {}
-        for text, expr in catalog.items():
-            self._reverse.setdefault(id(expr), text)
+        self._by_value: dict[Any, str] = {}
+        for rendered, expr in catalog.items():
+            self._reverse.setdefault(id(expr), rendered)
+            try:
+                # Two distinct but equal nodes render to the same text and the
+                # catalog keeps only the first; index by value as well so the
+                # second one does not degrade to "unknown_expr_<kind>".
+                self._by_value.setdefault(expr, rendered)
+            except TypeError:  # pragma: no cover - unhashable node payload
+                pass
         self._memo: dict[int, PrintExpr] = {}
         self._next_index = 1
 
+    def _synth(
+        self,
+        kind: str,
+        *,
+        op: Optional[PrintOp],
+        args: tuple[PrintExpr, ...] = (),
+        ctype: Optional[PrintType] = None,
+        name: str = "",
+        bits: int = 0,
+        int_value: int = 0,
+        float_value: Optional[float] = None,
+    ) -> PrintExpr:
+        """Build a normalized node that has no single backend ``_Expr``.
+
+        Floating point and SIMD forms are expanded into several tokens (a cast
+        around a rounding function, a comparison guarded by ``isnan``, ...); each
+        synthesized node still gets its own ``create_index`` so markup keeps
+        referring to distinct objects, exactly as the C++ engine refers to
+        distinct ``Varnode``/``PcodeOp`` pointers.
+        """
+        index = self._next_index
+        self._next_index += 1
+        return PrintExpr(
+            kind=kind,
+            args=tuple(args),
+            bits=bits,
+            ctype=ctype,
+            name=name,
+            int_value=int_value,
+            float_value=float_value,
+            op=op,
+            create_index=index,
+        )
+
+    def _func(
+        self,
+        name: str,
+        args: tuple[PrintExpr, ...],
+        ctype: Optional[PrintType],
+        op: Optional[PrintOp],
+        bits: int = 0,
+    ) -> PrintExpr:
+        """A functional expression (``PrintC::opFunc`` syntax)."""
+        return self._synth("func", op=op, args=args, ctype=ctype, name=name, bits=bits)
+
+    def _fp_condition(
+        self,
+        form: tuple[str, Optional[str]],
+        converted: tuple[PrintExpr, ...],
+        op: Optional[PrintOp],
+    ) -> PrintExpr:
+        """Build the parity-aware boolean test of an x87 comparison.
+
+        ``fp_condition`` renders the x86 jump codes as ``(isnan(a) || isnan(b))``
+        combined with the comparison; the same shape is rebuilt here from real
+        nodes so the printer marks up ``isnan``, ``||``, ``&&`` and the
+        comparison operator separately (``CPUI_FLOAT_*`` + ``BOOL_OR``/``BOOL_AND``
+        in Ghidra).
+        """
+        policy, comparison = form
+        left, right = converted
+        boolean = self.resolver.integer(1, False)
+        unordered = self._synth(
+            "op",
+            op=op,
+            args=(
+                self._func("isnan", (left,), boolean, op, bits=1),
+                self._func("isnan", (right,), boolean, op, bits=1),
+            ),
+            name="lor",
+            ctype=boolean,
+            bits=1,
+        )
+        if policy == "unordered":
+            return unordered
+        if policy == "ordered":
+            return self._synth(
+                "unary", op=op, args=(unordered,), name="boolnot", ctype=boolean, bits=1
+            )
+        if comparison is None:  # pragma: no cover - defensive
+            return unordered
+        test = self._synth(
+            "op", op=op, args=(left, right), name=comparison, ctype=boolean, bits=1
+        )
+        if policy == "or":
+            return self._synth(
+                "op", op=op, args=(unordered, test), name="lor", ctype=boolean, bits=1
+            )
+        ordered = self._synth(
+            "unary", op=op, args=(unordered,), name="boolnot", ctype=boolean, bits=1
+        )
+        return self._synth(
+            "op", op=op, args=(ordered, test), name="land", ctype=boolean, bits=1
+        )
+
     def opaque_text(self, expr: Any) -> str:
         text = self._reverse.get(id(expr))
+        if text is None:
+            try:
+                text = self._by_value.get(expr)
+            except TypeError:  # pragma: no cover - unhashable node payload
+                text = None
         if text is not None:
             return text
         return f"unknown_expr_{getattr(expr, 'kind', 'node')}"
@@ -986,8 +1155,199 @@ class ExpressionConverter:
                 ctype=converted[0].ctype if converted else None,
                 **common,
             )
-        # Everything else (x87, MMX/SSE composites, builtins, aggregates, ...)
-        # keeps the backend's own C rendering as an opaque token.
+        if kind in {"fp_load", "fp_int_load"}:
+            width = value[0] if isinstance(value, tuple) else (bits or 64)
+            width = int(width or 64)
+            pointer = self.convert(args[0], op) if args else None
+            arguments = (pointer,) if pointer is not None else ()
+            if kind == "fp_int_load":
+                # *(int32_t *)(ptr) widened to the x87 register width.
+                loaded = self._synth(
+                    "load_typed",
+                    op=op,
+                    args=arguments,
+                    ctype=self.resolver.integer(width, True),
+                    bits=width,
+                )
+                return self._synth(
+                    "cast",
+                    op=op,
+                    args=(loaded,),
+                    ctype=self.resolver.floating(80),
+                    bits=80,
+                )
+            return self._synth(
+                "load_typed",
+                op=op,
+                args=arguments,
+                ctype=self.resolver.floating(width),
+                bits=width,
+            )
+        if kind == "fp_cast":
+            # CPUI_FLOAT_FLOAT2FLOAT: PrintC prints a plain C cast.
+            operand = self.convert(args[0], op) if args else None
+            width = int(value or bits or 64)
+            return self._synth(
+                "cast",
+                op=op,
+                args=(operand,) if operand is not None else (),
+                ctype=self.resolver.floating(width),
+                bits=bits or width,
+            )
+        if kind == "fp_from_int":
+            # CPUI_FLOAT_INT2FLOAT: PrintC::opFloatInt2Float casts to the output
+            # float type and absorbs the integer widening.
+            operand = self.convert(args[0], op) if args else None
+            width = bits or 80
+            return self._synth(
+                "cast",
+                op=op,
+                args=(operand,) if operand is not None else (),
+                ctype=self.resolver.floating(width),
+                bits=width,
+            )
+        if kind == "fp_to_int":
+            # CPUI_FLOAT_TRUNC: a cast around the rounding function that the x87
+            # instruction actually performs (nearbyintl or truncl).
+            width, truncate = value if isinstance(value, tuple) else (bits, False)
+            width = int(width or 32)
+            operand = self.convert(args[0], op) if args else None
+            rounded = self._func(
+                "truncl" if truncate else "nearbyintl",
+                (operand,) if operand is not None else (),
+                self.resolver.floating(80),
+                op,
+                bits=80,
+            )
+            return self._synth(
+                "cast",
+                op=op,
+                args=(rounded,),
+                ctype=self.resolver.integer(width, True),
+                bits=width,
+            )
+        if kind == "fp_nan":
+            # CPUI_FLOAT_NAN: functional syntax, as PrintC::opFunc does.
+            operand = self.convert(args[0], op) if args else None
+            return self._func(
+                "isnan",
+                (operand,) if operand is not None else (),
+                self.resolver.integer(1, False),
+                op,
+                bits=1,
+            )
+        if kind == "fp_unary":
+            operand = self.convert(args[0], op) if args else None
+            arguments = (operand,) if operand is not None else ()
+            width = bits or 80
+            ctype = self.resolver.floating(width)
+            operation = str(value)
+            if operation == "neg":
+                # CPUI_FLOAT_NEG -> unary_minus.
+                return self._synth(
+                    "unary", op=op, args=arguments, name="neg", ctype=ctype, bits=width
+                )
+            if operation == "exp2m1":
+                call = self._func("exp2l", arguments, ctype, op, bits=width)
+                one = self._synth(
+                    "fp_const",
+                    op=op,
+                    float_value=1.0,
+                    ctype=self.resolver.floating(80),
+                    bits=80,
+                )
+                return self._synth(
+                    "op", op=op, args=(call, one), name="fsub", ctype=ctype, bits=width
+                )
+            return self._func(
+                _FP_UNARY_FUNCTIONS.get(operation, operation), arguments, ctype, op,
+                bits=width,
+            )
+        if kind == "fp_op":
+            # CPUI_FLOAT_ADD/SUB/MULT/DIV share the integer operator tokens.
+            converted = tuple(self.convert(arg, op) for arg in args)
+            width = bits or 64
+            return self._synth(
+                "op",
+                op=op,
+                args=converted,
+                name=_FP_BINARY_OPS.get(str(value), str(value)),
+                ctype=self.resolver.floating(width),
+                bits=width,
+            )
+        if kind == "fp_compare":
+            converted = tuple(self.convert(arg, op) for arg in args)
+            comparison = _FP_COMPARISONS.get(str(value))
+            if comparison is not None and len(converted) == 2:
+                return self._synth(
+                    "op",
+                    op=op,
+                    args=converted,
+                    name=comparison,
+                    ctype=self.resolver.integer(1, False),
+                    bits=1,
+                )
+        if kind == "fp_func":
+            converted = tuple(self.convert(arg, op) for arg in args)
+            width = bits or 80
+            ctype = self.resolver.floating(width)
+            operation = str(value)
+            if len(converted) == 2:
+                left, right = converted
+                if operation in {"fyl2x", "fyl2xp1", "fscale"}:
+                    if operation == "fscale":
+                        inner = self._func(
+                            "exp2l",
+                            (self._func("truncl", (right,), ctype, op, bits=width),),
+                            ctype,
+                            op,
+                            bits=width,
+                        )
+                    else:
+                        inner = self._func("log2l", (right,), ctype, op, bits=width)
+                    return self._synth(
+                        "op", op=op, args=(left, inner), name="fmul", ctype=ctype,
+                        bits=width,
+                    )
+                name = _FP_BINARY_FUNCTIONS.get(operation)
+                if name is not None:
+                    return self._func(name, (left, right), ctype, op, bits=width)
+        if kind == "fp_condition":
+            converted = tuple(self.convert(arg, op) for arg in args)
+            form = _FP_CONDITION_FORMS.get(str(value))
+            if form is not None and len(converted) == 2:
+                return self._fp_condition(form, converted, op)
+        if kind == "concat":
+            # CPUI_PIECE: the backend widens the high part and ors the low part
+            # in; both operands become real tokens instead of one opaque blob.
+            converted = tuple(self.convert(arg, op) for arg in args)
+            if len(converted) == 2:
+                high, low = converted
+                low_bits = int(value or 0) or (low.bits if low is not None else 0)
+                total = bits or (low_bits + (high.bits if high is not None else 0))
+                high_cast = self._synth(
+                    "cast", op=op, args=(high,),
+                    ctype=self.resolver.integer(total, False), bits=total,
+                )
+                shift = self._synth(
+                    "const", op=op, int_value=low_bits,
+                    ctype=self.resolver.integer(self.bits, False), bits=self.bits,
+                )
+                shifted = self._synth(
+                    "op", op=op, args=(high_cast, shift), name="shl",
+                    ctype=self.resolver.integer(total, False), bits=total,
+                )
+                low_cast = self._synth(
+                    "cast", op=op, args=(low,),
+                    ctype=self.resolver.integer(low_bits, False), bits=low_bits,
+                )
+                return self._synth(
+                    "op", op=op, args=(shifted, low_cast), name="or",
+                    ctype=self.resolver.integer(total, False), bits=total,
+                )
+        # Everything else (wide MMX/SSE lane expansions, bit punning through
+        # unions, aggregates, ...) keeps the backend's own C rendering as an
+        # opaque token, which the printer splits into highlighted tokens.
         return PrintExpr(
             kind="opaque",
             text=self.opaque_text(expr),

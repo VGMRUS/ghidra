@@ -28,10 +28,12 @@ HELP_TEXT = """Comandos disponibles:
   disasm [direccion] [cantidad]     desensamblar desde una dirección
   pseudo <direccion|nombre>         pseudocódigo semántico x86/x64 (experimental)
   emit <direccion|nombre> [opciones]  emisión completa con el motor Emit/PrintC de Ghidra
-                                    --markup (XML <clang_document>), --flat, --width N,
-                                    --indent N, --no-casts, --hex|--dec|--best,
-                                    --comments c|cplusplus, --brace same_line|next_line|skip_line,
-                                    --labels goto|join|none, --no-convention, --output archivo
+                                    --markup (XML <clang_document>), --packed (PackedEncode),
+                                    --flat, --width N, --indent N, --no-casts,
+                                    --hex|--dec|--best, --comments c|cplusplus,
+                                    --brace same_line|next_line|skip_line,
+                                    --labels goto|join|none, --no-convention,
+                                    --no-for-loops, --output archivo
   graph <funcion> [archivo.dot]     grafo CFG en formato Graphviz DOT
   strings [filtro] [cantidad]       cadenas ASCII y UTF-16LE
   imports | exports | symbols [filtro]
@@ -413,13 +415,16 @@ class Console:
         """Emit a whole function through the ported Ghidra Emit/PrintC engine."""
         if not args:
             raise ValueError(
-                "Uso: emit <direccion|nombre> [--markup] [--flat] [--width N] "
-                "[--indent N] [--no-casts] [--hex|--dec|--best] "
+                "Uso: emit <direccion|nombre> [--markup] [--packed] [--flat] "
+                "[--width N] [--indent N] [--no-casts] [--hex|--dec|--best] "
                 "[--comments c|cplusplus] [--brace same_line|next_line|skip_line] "
-                "[--labels goto|join|none] [--no-convention] [--output archivo]"
+                "[--labels goto|join|none] [--no-convention] [--no-for-loops] "
+                "[--output archivo]"
             )
         options = {
             "markup": False,
+            "packed": False,
+            "for_loops": True,
             "flat": False,
             "max_line_size": 100,
             "indent_increment": 2,
@@ -438,6 +443,12 @@ class Console:
             index += 1
             if token == "--markup":
                 options["markup"] = True
+            elif token == "--packed":
+                # Ghidra's binary marshaling format; it is a markup encoding.
+                options["packed"] = True
+                options["markup"] = True
+            elif token == "--no-for-loops":
+                options["for_loops"] = False
             elif token == "--flat":
                 options["flat"] = True
             elif token == "--no-casts":
@@ -481,9 +492,10 @@ class Console:
         if len(positional) != 1:
             raise ValueError("Uso: emit <direccion|nombre> [opciones]")
         function = self.analyzer.function_at(positional[0])
-        text = self.analyzer.print_function(
+        emitted = self.analyzer.print_function(
             function,
             markup=options["markup"],
+            packed=options["packed"],
             max_line_size=options["max_line_size"],
             indent_increment=options["indent_increment"],
             flat=options["flat"],
@@ -493,12 +505,23 @@ class Console:
             convention=options["convention"],
             brace=options["brace"],
             labels=options["labels"],
+            for_loops=options["for_loops"],
         )
+        if isinstance(emitted, bytes):
+            if output is not None:
+                output.write_bytes(emitted)
+                print(f"Marcado empaquetado ({len(emitted)} bytes) guardado en {output}")
+            else:
+                from .gui import hex_dump
+
+                print(f"PackedEncode: {len(emitted)} bytes")
+                print(hex_dump(emitted))
+            return
         if output is not None:
-            output.write_text(text, encoding="utf-8")
+            output.write_text(emitted, encoding="utf-8")
             print(f"Emisión guardada en {output}")
         else:
-            print(text)
+            print(emitted)
 
     def _graph(self, args: list[str]) -> None:
         if not 1 <= len(args) <= 2:

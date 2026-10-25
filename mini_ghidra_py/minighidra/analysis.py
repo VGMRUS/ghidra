@@ -1354,7 +1354,9 @@ class Analyzer:
         convention: bool | None = None,
         brace: str | None = None,
         labels: str = "goto",
-    ) -> str:
+        for_loops: bool = True,
+        packed: bool = False,
+    ) -> str | bytes:
         """Emit a whole function through the ported Ghidra printing engine.
 
         The decompiler backend still runs on its expression AST; this method
@@ -1365,6 +1367,12 @@ class Analyzer:
         :class:`~minighidra.emit.EmitMarkup` (Ghidra's ``<clang_document>``
         XML with ``<function>``, ``<funcproto>``, ``<statement>``, ``<op>``,
         ``<variable>`` and ``<datatype>`` tokens).
+
+        ``for_loops`` mirrors Ghidra's ``analyze_for_loops`` architecture
+        option: a ``while`` structure whose head merges a loop variable is
+        printed with ``for`` syntax when it is on.  ``packed`` selects
+        ``PackedEncode`` (Ghidra's binary marshaling format) instead of XML and
+        returns ``bytes``; it requires ``markup=True``.
         """
         import io
 
@@ -1378,14 +1386,18 @@ class Analyzer:
         )
         if target is None:
             raise KeyError(f"No existe función en {function:#x}")
+        if packed and not markup:
+            raise ValueError("La salida empaquetada (PackedEncode) necesita markup=True")
 
         artifacts = SemanticDecompiler(self).decompile_artifacts(target)
         printable = build_printable_function(artifacts)
 
         printer = PrintC(self)
-        stream = io.StringIO()
+        stream = io.BytesIO() if packed else io.StringIO()
         printer.set_output_stream(stream)
         printer.set_markup(markup)
+        if packed:
+            printer.set_packed_output(True)
         printer.set_max_line_size(max_line_size)
         printer.set_indent_increment(indent_increment)
         printer.set_comment_style(comment_style)
@@ -1401,6 +1413,7 @@ class Analyzer:
             printer.set_brace_format_switch(style)
         printer.set_flat(flat)
         printer.set_label_mode(labels)
+        printer.set_analyze_for_loops(for_loops)
         printer.attach_document(printable)
         if document:
             document_id = printer.emit.begin_document()
@@ -1408,7 +1421,63 @@ class Analyzer:
         if document:
             printer.emit.end_document(document_id)
         printer.emit.flush()
+        if packed:
+            # The bytes live in the encoder when the caller passed a text
+            # stream; a binary stream receives them directly.
+            return printer.emit.get_packed_bytes() or stream.getvalue()
         return stream.getvalue()
+
+    def clang_document(
+        self,
+        function: int | Function,
+        *,
+        packed: bool = False,
+        max_line_size: int = 100,
+        indent_increment: int = 2,
+        flat: bool = False,
+        comment_style: str = "c",
+        integer_format: str = "best",
+        casts: bool = True,
+        convention: bool | None = None,
+        brace: str | None = None,
+        labels: str = "goto",
+        for_loops: bool = True,
+        resolver: object | None = None,
+    ):
+        """Emit a function and decode its markup into a Clang token tree.
+
+        This is the consumer side of the printing engine, the equivalent of
+        Ghidra's ``DecompileResults``/``ClangMarkup.buildClangTree``: the
+        ``<clang_document>`` markup (XML, or Ghidra's packed byte format when
+        ``packed=True``) is turned into
+        :class:`~minighidra.clangdoc.ClangDocument`, whose lines carry one token
+        per emitted element together with its ``syntax_highlight`` colour.  A
+        graphical front-end renders those tokens directly instead of guessing
+        the highlighting from the text.
+        """
+        from .clangdoc import ClangDocument
+
+        target = (
+            self.functions.get(function) if isinstance(function, int) else function
+        )
+        markup = self.print_function(
+            target,
+            markup=True,
+            packed=packed,
+            max_line_size=max_line_size,
+            indent_increment=indent_increment,
+            flat=flat,
+            comment_style=comment_style,
+            integer_format=integer_format,
+            casts=casts,
+            convention=convention,
+            brace=brace,
+            labels=labels,
+            for_loops=for_loops,
+        )
+        return ClangDocument.parse(
+            markup, packed=packed, function=target, resolver=resolver
+        )
 
     def ssa(self, function: int | Function) -> SSAFunction:
         """Return the p-code SSA/heritage graph for a recovered function."""

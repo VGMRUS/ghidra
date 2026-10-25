@@ -26,203 +26,125 @@ references are read through the attribute names used by the C++ accessors
 object does not carry the attribute the reference is simply omitted, exactly as
 the C++ code omits it for a null pointer.
 
-Only the unpacked XML encoder is ported.  ``PackedEncode`` (Ghidra's binary
-marshaling format) is not reproduced; :meth:`Emit.set_packed_output` rejects it.
+Both markup encoders from ``marshal.cc`` are available: :class:`XmlEncoder`
+(``XmlEncode``) writes the readable ``<clang_document>`` XML and
+:class:`PackedEncoder` (``PackedEncode``) writes Ghidra's compact byte format,
+selected with :meth:`Emit.set_packed_output`.  :class:`PackedDecode` and
+``XmlDecode`` read either form back, which is what :mod:`minighidra.clangdoc`
+(the port of Ghidra's Java ``Clang*`` document model) uses to rebuild a token
+tree from markup.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional, TextIO
+
+from .marshal import (
+    ATTRIB_BLOCKREF,
+    ATTRIB_CLOSE,
+    ATTRIB_COLOR,
+    ATTRIB_CONTENT,
+    ATTRIB_ID,
+    ATTRIB_INDENT,
+    ATTRIB_NAME,
+    ATTRIB_OFF,
+    ATTRIB_OPEN,
+    ATTRIB_OPREF,
+    ATTRIB_SPACE,
+    ATTRIB_SYMREF,
+    ATTRIB_VARREF,
+    ELEM_BITFIELD,
+    ELEM_BLOCK,
+    ELEM_BREAK,
+    ELEM_CLANG_DOCUMENT,
+    ELEM_COMMENT,
+    ELEM_FIELD,
+    ELEM_FUNCTION,
+    ELEM_FUNCNAME,
+    ELEM_FUNCPROTO,
+    ELEM_LABEL,
+    ELEM_OP,
+    ELEM_RETURN_TYPE,
+    ELEM_STATEMENT,
+    ELEM_SYNTAX,
+    ELEM_TYPE,
+    ELEM_VALUE,
+    ELEM_VARDECL,
+    ELEM_VARIABLE,
+    AttributeId,
+    ElementId,
+    PackedDecode,
+    PackedEncoder,
+    XmlEncoder,
+    xml_escape,
+)
+
+__all__ = [
+    # Re-exported from minighidra.marshal (the port of marshal.hh/marshal.cc).
+    "ATTRIB_BLOCKREF",
+    "ATTRIB_CLOSE",
+    "ATTRIB_COLOR",
+    "ATTRIB_CONTENT",
+    "ATTRIB_ID",
+    "ATTRIB_INDENT",
+    "ATTRIB_NAME",
+    "ATTRIB_OFF",
+    "ATTRIB_OPEN",
+    "ATTRIB_OPREF",
+    "ATTRIB_SPACE",
+    "ATTRIB_SYMREF",
+    "ATTRIB_VARREF",
+    "AttributeId",
+    "ELEM_BITFIELD",
+    "ELEM_BLOCK",
+    "ELEM_BREAK",
+    "ELEM_CLANG_DOCUMENT",
+    "ELEM_COMMENT",
+    "ELEM_FIELD",
+    "ELEM_FUNCTION",
+    "ELEM_FUNCNAME",
+    "ELEM_FUNCPROTO",
+    "ELEM_LABEL",
+    "ELEM_OP",
+    "ELEM_RETURN_TYPE",
+    "ELEM_STATEMENT",
+    "ELEM_SYNTAX",
+    "ELEM_TYPE",
+    "ELEM_VALUE",
+    "ELEM_VARDECL",
+    "ELEM_VARIABLE",
+    "ElementId",
+    "PackedDecode",
+    "PackedEncoder",
+    "XmlEncoder",
+    "xml_escape",
+    # Defined here.
+    "BraceStyle",
+    "CircularQueue",
+    "Emit",
+    "EmitError",
+    "EmitMarkup",
+    "EmitNoMarkup",
+    "EmitPrettyPrint",
+    "PendPrint",
+    "PrintClass",
+    "SyntaxHighlight",
+    "TagType",
+    "TokenSplit",
+]
 
 
 class EmitError(RuntimeError):
     """Raised for emitter misuse, mirroring C++ ``LowlevelError``."""
 
 
-@dataclass(frozen=True, slots=True)
-class ElementId:
-    """Marshaling element identifier (``ElementId`` in ``marshal.hh``)."""
-
-    name: str
-    id: int
-
-
-@dataclass(frozen=True, slots=True)
-class AttributeId:
-    """Marshaling attribute identifier (``AttributeId`` in ``marshal.hh``)."""
-
-    name: str
-    id: int
-
-
-# Attribute ids, matching the numeric values assigned in marshal.cc/prettyprint.cc.
-ATTRIB_CONTENT = AttributeId("XMLcontent", 1)
-ATTRIB_ID = AttributeId("id", 9)
-ATTRIB_NAME = AttributeId("name", 14)
-ATTRIB_SPACE = AttributeId("space", 20)
-ATTRIB_BLOCKREF = AttributeId("blockref", 35)
-ATTRIB_CLOSE = AttributeId("close", 36)
-ATTRIB_COLOR = AttributeId("color", 37)
-ATTRIB_INDENT = AttributeId("indent", 38)
-ATTRIB_OFF = AttributeId("off", 39)
-ATTRIB_OPEN = AttributeId("open", 40)
-ATTRIB_OPREF = AttributeId("opref", 41)
-ATTRIB_VARREF = AttributeId("varref", 42)
-ATTRIB_SYMREF = AttributeId("symref", 68)
-
-# Element ids, matching the numeric values assigned across the C++ sources.
-ELEM_VALUE = ElementId("value", 9)
-ELEM_BREAK = ElementId("break", 17)
-ELEM_CLANG_DOCUMENT = ElementId("clang_document", 18)
-ELEM_FUNCNAME = ElementId("funcname", 19)
-ELEM_FUNCPROTO = ElementId("funcproto", 20)
-ELEM_LABEL = ElementId("label", 21)
-ELEM_RETURN_TYPE = ElementId("return_type", 22)
-ELEM_STATEMENT = ElementId("statement", 23)
-ELEM_SYNTAX = ElementId("syntax", 24)
-ELEM_VARDECL = ElementId("vardecl", 25)
-ELEM_VARIABLE = ElementId("variable", 26)
-ELEM_OP = ElementId("op", 27)
-ELEM_FIELD = ElementId("field", 49)
-ELEM_TYPE = ElementId("type", 60)
-ELEM_COMMENT = ElementId("comment", 86)
-ELEM_BLOCK = ElementId("block", 103)
-ELEM_FUNCTION = ElementId("function", 116)
-ELEM_BITFIELD = ElementId("bitfield", 289)
-
-
-def xml_escape(text: str) -> str:
-    """Escape the characters with special XML meaning (``xml_escape`` in xml.cc)."""
-    out = []
-    for char in text:
-        if char < "?":
-            if char == "<":
-                out.append("&lt;")
-                continue
-            if char == ">":
-                out.append("&gt;")
-                continue
-            if char == "&":
-                out.append("&amp;")
-                continue
-            if char == '"':
-                out.append("&quot;")
-                continue
-            if char == "'":
-                out.append("&apos;")
-                continue
-        out.append(char)
-    return "".join(out)
-
-
-class XmlEncoder:
-    """Unpacked XML encoder, a port of ``XmlEncode`` in ``marshal.cc``."""
-
-    SPACES = "\n                        "
-    MAX_SPACES = 24 + 1
-
-    TAG_START = 0
-    TAG_CONTENT = 1
-    TAG_STOP = 2
-
-    def __init__(self, stream: TextIO, do_format: bool = True) -> None:
-        self.stream = stream
-        self.depth = 0
-        self.tag_status = self.TAG_STOP
-        self.do_formatting = do_format
-
-    def _write(self, text: str) -> None:
-        self.stream.write(text)
-
-    def _new_line(self) -> None:
-        if not self.do_formatting:
-            return
-        num_spaces = self.depth * 2 + 1
-        if num_spaces > self.MAX_SPACES:
-            num_spaces = self.MAX_SPACES
-        self._write(self.SPACES[:num_spaces])
-
-    def open_element(self, elem_id: ElementId) -> None:
-        if self.tag_status == self.TAG_START:
-            self._write(">")
-        else:
-            self.tag_status = self.TAG_START
-        self._new_line()
-        self._write("<" + elem_id.name)
-        self.depth += 1
-
-    def close_element(self, elem_id: ElementId) -> None:
-        self.depth -= 1
-        if self.tag_status == self.TAG_START:
-            self._write("/>")
-            self.tag_status = self.TAG_STOP
-            return
-        if self.tag_status != self.TAG_CONTENT:
-            self._new_line()
-        else:
-            self.tag_status = self.TAG_STOP
-        self._write("</" + elem_id.name + ">")
-
-    def _a_v(self, attrib_id: AttributeId, value: str) -> None:
-        self._write(" " + attrib_id.name + '="' + xml_escape(value) + '"')
-
-    def _a_v_i(self, attrib_id: AttributeId, value: int) -> None:
-        self._write(f' {attrib_id.name}="{value:d}"')
-
-    def _a_v_u(self, attrib_id: AttributeId, value: int) -> None:
-        self._write(f' {attrib_id.name}="0x{value:x}"')
-
-    def _a_v_b(self, attrib_id: AttributeId, value: bool) -> None:
-        self._write(f' {attrib_id.name}="{"true" if value else "false"}"')
-
-    def _content_prefix(self) -> None:
-        if self.tag_status == self.TAG_START:
-            self._write(">")
-
-    def write_bool(self, attrib_id: AttributeId, value: bool) -> None:
-        if attrib_id == ATTRIB_CONTENT:
-            self._content_prefix()
-            self._write("true" if value else "false")
-            self.tag_status = self.TAG_CONTENT
-            return
-        self._a_v_b(attrib_id, value)
-
-    def write_signed_integer(self, attrib_id: AttributeId, value: int) -> None:
-        if attrib_id == ATTRIB_CONTENT:
-            self._content_prefix()
-            self._write(f"{value:d}")
-            self.tag_status = self.TAG_CONTENT
-            return
-        self._a_v_i(attrib_id, value)
-
-    def write_unsigned_integer(self, attrib_id: AttributeId, value: int) -> None:
-        if attrib_id == ATTRIB_CONTENT:
-            self._content_prefix()
-            self._write(f"0x{value:x}")
-            self.tag_status = self.TAG_CONTENT
-            return
-        self._a_v_u(attrib_id, value)
-
-    def write_string(self, attrib_id: AttributeId, value: str) -> None:
-        if attrib_id == ATTRIB_CONTENT:
-            self._content_prefix()
-            self._write(xml_escape(value))
-            self.tag_status = self.TAG_CONTENT
-            return
-        self._a_v(attrib_id, value)
-
-    def write_space(self, attrib_id: AttributeId, space: Any) -> None:
-        name = getattr(space, "name", space)
-        if attrib_id == ATTRIB_CONTENT:
-            self._content_prefix()
-            self._write(xml_escape(str(name)))
-            self.tag_status = self.TAG_CONTENT
-            return
-        self._a_v(attrib_id, str(name))
-
+# The marshaling vocabulary -- element/attribute ids, the XML codec and the
+# packed codec -- lives in :mod:`minighidra.marshal` (the port of
+# ``marshal.hh``/``marshal.cc``); the names are re-exported here because the
+# emitter is their main consumer and earlier revisions defined them in this
+# module.
 
 class SyntaxHighlight(IntEnum):
     """``Emit::syntax_highlight``; values must match ``ClangToken``."""
@@ -427,6 +349,10 @@ class Emit(ABC):
     def set_packed_output(self, val: bool) -> None:
         return None
 
+    def get_packed_bytes(self) -> bytes:
+        """Packed markup written so far; empty for emitters without a codec."""
+        return b""
+
     def spaces(self, num: int, bump: int = 0) -> None:
         space_array = [
             "",
@@ -524,18 +450,45 @@ class Emit(ABC):
         self.print(brace)
 
 
+def _is_binary_stream(stream: Any) -> bool:
+    """True for streams that accept ``bytes`` (``BytesIO``, files opened 'wb')."""
+    import io as _io
+
+    return isinstance(stream, (_io.RawIOBase, _io.BufferedIOBase))
+
+
 class EmitMarkup(Emit):
     """Emitter that associates markup with individual tokens."""
 
     def __init__(self) -> None:
         super().__init__()
         self.s: Optional[TextIO] = None
-        self.encoder: Optional[XmlEncoder] = None
+        self.encoder: Optional[Any] = None
+        self.packed = False
 
-    def _encoder(self) -> XmlEncoder:
+    def _encoder(self) -> Any:
         if self.encoder is None:
             raise EmitError("EmitMarkup sin stream de salida")
         return self.encoder
+
+    def _attach_encoder(self) -> None:
+        """(Re)build the codec for the current stream and format selection."""
+        if self.s is None:
+            self.encoder = None
+            return
+        if self.packed:
+            # Ghidra writes the packed bytes straight to the output stream; a
+            # text stream cannot hold them, so they are kept in the encoder.
+            self.encoder = PackedEncoder(self.s if _is_binary_stream(self.s) else None)
+        else:
+            self.encoder = XmlEncoder(self.s)
+
+    def get_packed_bytes(self) -> bytes:
+        """The packed encoding written so far (empty when XML output is on)."""
+        encoder = self.encoder
+        if isinstance(encoder, PackedEncoder):
+            return encoder.get_bytes()
+        return b""
 
     def begin_document(self) -> int:
         self._encoder().open_element(ELEM_CLANG_DOCUMENT)
@@ -756,20 +709,24 @@ class EmitMarkup(Emit):
 
     def set_output_stream(self, stream: Optional[TextIO]) -> None:
         self.s = stream
-        self.encoder = XmlEncoder(stream) if stream is not None else None
+        self._attach_encoder()
 
     def get_output_stream(self) -> Optional[TextIO]:
         return self.s
 
     def set_packed_output(self, val: bool) -> None:
+        """``EmitMarkup::setPackedOutput``: switch between the two codecs.
+
+        Ghidra builds a ``PackedEncode`` as soon as the output stream is set and
+        only falls back to ``XmlEncode`` on ``setPackedOutput(false)``.  Here the
+        XML form stays the default, because ``print_function(markup=True)``
+        returns text; ``set_packed_output(True)`` selects the byte format exactly
+        as the C++ call does.
+        """
         if self.encoder is None:
             return
-        if val:
-            raise EmitError(
-                "PackedEncode (marshaling binario de Ghidra) no está portado; "
-                "usa set_packed_output(False) para XML"
-            )
-        self.encoder = XmlEncoder(self.s) if self.s is not None else None
+        self.packed = bool(val)
+        self._attach_encoder()
 
     def emits_markup(self) -> bool:
         return True
@@ -1415,6 +1372,7 @@ class EmitPrettyPrint(Emit):
         self.needbreak = False
         self.commentmode = False
         self.commentfill = ""
+        self.packed = False
         self.scanqueue = CircularQueue(3 * 100, int)
         self.tokqueue = CircularQueue(3 * 100, TokenSplit)
         # Mirrors the C++ PRETTY_DEBUG compile-time switch: delimiter ids are
@@ -1890,6 +1848,9 @@ class EmitPrettyPrint(Emit):
         stream = self.lowlevel.get_output_stream()
         self.lowlevel = EmitMarkup() if val else EmitNoMarkup()
         self.lowlevel.set_output_stream(stream)
+        if self.packed:
+            # setMarkup rebuilds the low-level emitter; keep the format choice.
+            self.lowlevel.set_packed_output(True)
 
     def set_output_stream(self, stream: Optional[TextIO]) -> None:
         self.lowlevel.set_output_stream(stream)
@@ -1898,7 +1859,11 @@ class EmitPrettyPrint(Emit):
         return self.lowlevel.get_output_stream()
 
     def set_packed_output(self, val: bool) -> None:
+        self.packed = bool(val)
         self.lowlevel.set_packed_output(val)
+
+    def get_packed_bytes(self) -> bytes:
+        return self.lowlevel.get_packed_bytes()
 
     def set_max_line_size(self, val: int) -> None:
         if val < 20 or val > 10000:

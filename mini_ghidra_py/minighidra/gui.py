@@ -1,11 +1,92 @@
-"""Optional Tkinter front-end; the static-analysis core remains headless."""
+"""Optional Tkinter front-end; the static-analysis core remains headless.
+
+The window has two independent views of the recovered code:
+
+* the ``Pseudocódigo`` tab shows the text of the experimental AST backend
+  (:meth:`~minighidra.analysis.Analyzer.pseudocode`);
+* the ``Impresión (PrintC)`` tab renders the ported Ghidra printing engine
+  (:meth:`~minighidra.analysis.Analyzer.print_function`), decoding its
+  ``<clang_document>`` markup into a
+  :class:`~minighidra.clangdoc.ClangDocument` so every token keeps the
+  ``syntax_highlight`` colour the printer assigned.  The same tab can show the
+  raw markup, in XML or in Ghidra's packed byte format.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any, Optional
 
+from .emit import SyntaxHighlight
 from .image import BinaryImage, LoadError
 from .project import ProjectState
+
+#: Foreground colour (and bold flag) of every ``Emit::syntax_highlight`` value.
+#: Ghidra picks these from its decompiler theme; a fixed dark-on-light palette
+#: is used here so the tab looks the same on every platform.
+HIGHLIGHT_COLORS: dict[int, tuple[str, bool]] = {
+    SyntaxHighlight.keyword_color.value: ("#7d1fae", True),
+    SyntaxHighlight.comment_color.value: ("#6a737d", False),
+    SyntaxHighlight.type_color.value: ("#0b6e6e", False),
+    SyntaxHighlight.funcname_color.value: ("#1f5fbf", True),
+    SyntaxHighlight.var_color.value: ("#24292e", False),
+    SyntaxHighlight.const_color.value: ("#b3261e", False),
+    SyntaxHighlight.param_color.value: ("#8250df", False),
+    SyntaxHighlight.global_color.value: ("#bc4c00", False),
+    SyntaxHighlight.no_color.value: ("#24292e", False),
+    SyntaxHighlight.error_color.value: ("#d1242f", True),
+    SyntaxHighlight.special_color.value: ("#57606a", False),
+}
+
+#: Values offered by the option combos of the printing tab.
+PRINT_MODES = ("texto", "marcado XML", "marcado empaquetado")
+INTEGER_FORMATS = ("best", "hex", "dec")
+BRACE_STYLES = ("same_line", "next_line", "skip_line")
+LABEL_MODES = ("goto", "join", "none")
+COMMENT_STYLES = ("c", "cplusplus")
+
+
+def highlight_tag(colour: int) -> str:
+    """Name of the ``tk.Text`` tag holding one ``syntax_highlight`` colour."""
+    return f"hl{colour}"
+
+
+def hex_dump(data: bytes, row: int = 16) -> str:
+    """Offset/hex/ASCII dump of a byte string (used for the packed markup)."""
+    lines = []
+    for offset in range(0, len(data), row):
+        chunk = data[offset:offset + row]
+        hexed = " ".join(f"{byte:02x}" for byte in chunk)
+        ascii_text = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)
+        lines.append(
+            f"{offset:08x}  {hexed:<{row * 3 - 1}}  |{ascii_text:<{row}}|"
+        )
+    return "\n".join(lines)
+
+
+def packed_report(packed: bytes, unpacked: str) -> str:
+    """Header describing a ``PackedEncode`` stream next to its XML equivalent."""
+    ratio = len(packed) / len(unpacked) if unpacked else 0.0
+    return (
+        f"PackedEncode: {len(packed)} bytes  |  XmlEncode: {len(unpacked)} bytes"
+        f"  |  {ratio:.0%} del XML\n"
+        "Formato: cabeceras 01x/10x/11x + id, enteros de 7 bits por byte, "
+        "cadenas UTF-8 con longitud.\n\n"
+    )
+
+
+def document_report(document: Any) -> str:
+    """Trailing note with the layout statistics of a decoded Clang document."""
+    tokens = sum(
+        1
+        for piece, _colour in document.spans()
+        if piece not in ("", "\n") and piece.strip()
+    )
+    signature = document.signature() or ""
+    return (
+        f"/* {len(document.lines)} líneas, {tokens} tokens marcados"
+        + (f"; firma: {signature}" if signature else "")
+        + " */\n"
+    )
 
 
 def launch_gui(console) -> None:
@@ -117,9 +198,183 @@ def launch_gui(console) -> None:
 
     listing_view = create_text_tab("Desensamblado")
     pseudo_view = create_text_tab("Pseudocódigo")
+
+    # -- Pestaña del motor de impresión (Emit/PrintC) ---------------------
+    # Ghidra's GUI never re-highlights the C text: the decompiler sends the
+    # <clang_document> markup and every token carries its own colour.  This tab
+    # does the same through Analyzer.clang_document().
+    print_mode = tk.StringVar(value="texto")
+    print_integer_format = tk.StringVar(value="best")
+    print_brace = tk.StringVar(value="same_line")
+    print_labels = tk.StringVar(value="goto")
+    print_comment_style = tk.StringVar(value="c")
+    print_casts = tk.BooleanVar(value=True)
+    print_for_loops = tk.BooleanVar(value=True)
+    print_flat = tk.BooleanVar(value=False)
+    print_width = tk.IntVar(value=100)
+    print_indent = tk.IntVar(value=2)
+    print_state: dict[str, Any] = {}
+
+    def create_print_tab(name: str):
+        frame = ttk.Frame(right_tabs)
+        bar = ttk.Frame(frame, padding=(6, 4))
+        bar.pack(fill="x")
+
+        def add_combo(label: str, values, variable, width: int) -> None:
+            ttk.Label(bar, text=label).pack(side="left", padx=(0, 3))
+            box = ttk.Combobox(
+                bar, textvariable=variable, values=values, width=width, state="readonly"
+            )
+            box.pack(side="left", padx=(0, 8))
+
+        def add_check(label: str, variable) -> None:
+            ttk.Checkbutton(bar, text=label, variable=variable).pack(
+                side="left", padx=(0, 8)
+            )
+
+        add_combo("Vista", PRINT_MODES, print_mode, 19)
+        add_combo("Enteros", INTEGER_FORMATS, print_integer_format, 6)
+        add_combo("Llaves", BRACE_STYLES, print_brace, 10)
+        add_combo("Etiquetas", LABEL_MODES, print_labels, 6)
+        add_combo("Comentarios", COMMENT_STYLES, print_comment_style, 9)
+        add_check("Casts", print_casts)
+        add_check("for", print_for_loops)
+        add_check("Plano", print_flat)
+        ttk.Label(bar, text="Ancho").pack(side="left", padx=(0, 3))
+        ttk.Spinbox(bar, from_=20, to=400, textvariable=print_width, width=5).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Label(bar, text="Sangría").pack(side="left", padx=(0, 3))
+        ttk.Spinbox(bar, from_=1, to=8, textvariable=print_indent, width=4).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(bar, text="Actualizar", command=lambda: render_print_view()).pack(
+            side="left"
+        )
+
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        widget = tk.Text(body, wrap="none", font=("TkFixedFont", 10), undo=False)
+        yscroll = ttk.Scrollbar(body, orient="vertical", command=widget.yview)
+        xscroll = ttk.Scrollbar(body, orient="horizontal", command=widget.xview)
+        widget.configure(
+            yscrollcommand=yscroll.set, xscrollcommand=xscroll.set, state="disabled"
+        )
+        widget.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        for code, (colour, bold) in HIGHLIGHT_COLORS.items():
+            widget.tag_configure(
+                highlight_tag(code),
+                foreground=colour,
+                font=("TkFixedFont", 10, "bold") if bold else ("TkFixedFont", 10),
+            )
+        widget.tag_configure("notice", foreground="#6a737d")
+        right_tabs.add(frame, text=name)
+        text_views[name] = widget
+        print_state["widget"] = widget
+        return widget
+
+    create_print_tab("Impresión (PrintC)")
+
     graph_view = create_text_tab("Grafo CFG (DOT)")
     xrefs_view = create_text_tab("Referencias")
     summary_view = create_text_tab("Resumen")
+
+    def print_view_options() -> dict[str, Any]:
+        """Options shared by every printing mode of the tab."""
+        try:
+            width = int(print_width.get())
+        except (tk.TclError, ValueError):
+            width = 100
+        try:
+            indent = int(print_indent.get())
+        except (tk.TclError, ValueError):
+            indent = 2
+        return {
+            "max_line_size": min(400, max(20, width)),
+            "indent_increment": min(8, max(1, indent)),
+            "flat": bool(print_flat.get()),
+            "comment_style": print_comment_style.get(),
+            "integer_format": print_integer_format.get(),
+            "casts": bool(print_casts.get()),
+            "brace": print_brace.get(),
+            "labels": print_labels.get(),
+            "for_loops": bool(print_for_loops.get()),
+        }
+
+    def render_print_view(function=None) -> None:
+        """Print the selected function through the ported Emit/PrintC engine."""
+        widget = print_state.get("widget")
+        if widget is None:
+            return
+        target = function if function is not None else current_function["value"]
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        if target is None:
+            widget.insert(
+                "1.0",
+                "Selecciona una función de la lista para imprimirla con el motor "
+                "Emit/PrintC.\n",
+                "notice",
+            )
+            widget.configure(state="disabled")
+            return
+        mode = print_mode.get()
+        options = print_view_options()
+        try:
+            if mode == "marcado XML":
+                markup = console.analyzer.print_function(
+                    target, markup=True, **options
+                )
+                widget.insert("1.0", markup)
+                status.set(
+                    f"{target.name}: marcado <clang_document> ({len(markup)} caracteres)"
+                )
+            elif mode == "marcado empaquetado":
+                packed = console.analyzer.print_function(
+                    target, markup=True, packed=True, **options
+                )
+                unpacked = console.analyzer.print_function(
+                    target, markup=True, **options
+                )
+                widget.insert("1.0", packed_report(packed, unpacked), "notice")
+                widget.insert("end", hex_dump(packed))
+                status.set(
+                    f"{target.name}: {len(packed)} bytes de marcado empaquetado"
+                )
+            else:
+                document = console.analyzer.clang_document(target, **options)
+                for piece, colour in document.spans():
+                    if piece:
+                        widget.insert("end", piece, highlight_tag(colour))
+                widget.insert("end", "\n")
+                widget.insert("end", document_report(document), "notice")
+                status.set(
+                    f"{target.name}: impresión PrintC, {len(document.lines)} líneas"
+                )
+        except Exception as exc:  # noqa: BLE001 - la vista nunca debe romperse
+            widget.insert(
+                "1.0",
+                f"Error del motor de impresión: {type(exc).__name__}: {exc}\n",
+                "notice",
+            )
+            status.set(f"Error al imprimir {getattr(target, 'name', target)}: {exc}")
+        widget.configure(state="disabled")
+
+    for variable in (
+        print_mode,
+        print_integer_format,
+        print_brace,
+        print_labels,
+        print_comment_style,
+        print_casts,
+        print_for_loops,
+        print_flat,
+    ):
+        variable.trace_add("write", lambda *_args: render_print_view())
 
     def set_text(widget, value: str) -> None:
         widget.configure(state="normal")
@@ -191,6 +446,7 @@ def launch_gui(console) -> None:
         current_function["value"] = function
         set_text(listing_view, console.analyzer.format_function(function))
         set_text(pseudo_view, console.analyzer.pseudocode(function))
+        render_print_view(function)
         set_text(graph_view, console.analyzer.cfg_dot(function))
         refs = []
         for instruction in function.instructions:
@@ -244,7 +500,7 @@ def launch_gui(console) -> None:
         for xref in references:
             lines.append(f"{xref.source:#x} -> {xref.target:#x}  {xref.kind}")
         set_text(xrefs_view, "\n".join(lines))
-        right_tabs.select(3)
+        right_tabs.select(xrefs_view.master)
         status.set(f"Cadena en {address:#x}")
 
     def on_symbol_selected(event=None) -> None:

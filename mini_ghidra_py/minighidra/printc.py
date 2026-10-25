@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .block import (
@@ -350,6 +352,20 @@ class PrintC(PrintLanguage):
         "sge": "greater_equal",
         "land": "boolean_and",
         "lor": "boolean_or",
+        # Floating point operators reuse the very same tokens, as Ghidra does
+        # (printc.hh: opFloatAdd -> binary_plus, opFloatEqual -> equal, ...).
+        # They are kept under their own names so the printer never routes them
+        # through op_comparison, which would add integer casts.
+        "fadd": "binary_plus",
+        "fsub": "binary_minus",
+        "fmul": "multiply",
+        "fdiv": "divide",
+        "feq": "equal",
+        "fne": "not_equal",
+        "flt": "less_than",
+        "fle": "less_equal",
+        "fgt": "greater_than",
+        "fge": "greater_equal",
     }
     _NEGATABLE = {
         "less_than": "greater_equal",
@@ -366,6 +382,13 @@ class PrintC(PrintLanguage):
         "bitnot": "bitwise_not",
         "boolnot": "boolean_not",
     }
+    # OpToken::space ("like binary but just a space between") glues the C tokens
+    # of a pre-rendered (opaque) expression and gives the pretty printer a break
+    # opportunity between them.  The whitespace itself stays inside the token
+    # text, so the spacing is 0 and the unbroken output is byte-for-byte the
+    # text the backend produced.  A single shared instance keeps
+    # `parentheses()` from adding parens between the pieces.
+    opaque_join = OpToken("", "", 2, 66, True, OpTokenType.space, 0, 0)
 
     def __init__(self, arch: Any = None, nm: str = "c-language") -> None:
         super().__init__(arch, nm)
@@ -376,6 +399,11 @@ class PrintC(PrintLanguage):
         self.resolver: Optional[TypeResolver] = None
         self._visited_blocks: set[int] = set()
         self._label_targets: set[int] = set()
+        # Architecture::analyze_for_loops: recover `for` syntax from while loops.
+        self.analyze_for_loops = True
+        # Phi statements of a loop head are held back while the head is printed
+        # inside a `while(...)`/`for(...)` header and re-emitted in the body.
+        self._phi_defer: list[_PhiDefer] = []
 
         # Set the flip tokens
         PrintC.less_than.negate = PrintC.greater_equal
@@ -445,7 +473,12 @@ class PrintC(PrintLanguage):
             raise EmitError('Unknown label mode. Use "goto", "join" or "none"')
         self.label_mode = mode
 
+    def set_analyze_for_loops(self, val: bool) -> None:
+        """``Architecture::analyze_for_loops``: enable/disable `for` recovery."""
+        self.analyze_for_loops = bool(val)
+
     def reset_defaults_print_c(self) -> None:
+        self.analyze_for_loops = True
         self.option_convention = True
         self.option_hide_exts = True
         self.option_inplace_ops = False
@@ -499,6 +532,7 @@ class PrintC(PrintLanguage):
         self.initialize_from_architecture()
         self._visited_blocks = set()
         self._label_targets = _collect_label_targets(doc)
+        self._phi_defer = []
 
     def doc_function(self, fd: PrintableFunction) -> None:
         """Emit the declaration and body of a complete function."""
@@ -1462,14 +1496,29 @@ class PrintC(PrintLanguage):
         self.push_node(condition, node, self.mods)
 
     def op_opaque(self, node: PrintExpr, op: Any) -> None:
-        self.push_atom(
-            Atom(
-                node.text or "unknown_expr",
-                TagType.syntax,
-                SyntaxHighlight.no_color,
-                op=op,
+        """Emit an expression the bridge could not model as a real node.
+
+        Wide MMX/SSE lane expansions and union based bit punning are rendered by
+        the backend as one long C expression.  Ghidra has no equivalent (its
+        p-code has already been typed), so instead of a single unbreakable
+        ``<syntax>`` blob the text is split into C tokens: each one keeps its own
+        markup colour and the whitespace between tokens becomes a break
+        opportunity, so the Oppen pretty printer can wrap the expression.
+        Concatenating the emitted pieces reproduces the original text exactly.
+        """
+        text = node.text or "unknown_expr"
+        segments = _opaque_segments(text, self.doc)
+        if len(segments) <= 1:
+            self.push_atom(
+                Atom(text, TagType.syntax, SyntaxHighlight.no_color, op=op)
             )
-        )
+            return
+        # A left nested chain of `space` tokens, one per pair of neighbours:
+        # the operators are pushed before the atoms they separate.
+        for _ in range(len(segments) - 1):
+            self.push_op(PrintC.opaque_join, node)
+        for piece, highlight in segments:
+            self.push_atom(Atom(piece, TagType.syntax, highlight, op=op))
 
     def op_constant(self, node: PrintExpr, op: Any) -> None:
         self.push_constant(
@@ -1851,7 +1900,17 @@ class PrintC(PrintLanguage):
                 self.emit_condition(term, bb, boolean_flip=boolean_flip)
             return
         separator = False
+        defer = self._phi_defer[-1] if self._phi_defer else None
         for stmt in doc.statements_by_block.get(start, ()):
+            if stmt.kind == "phi" and defer is not None:
+                # Ghidra never prints a MULTIEQUAL: heritage has already
+                # folded it into the variable names.  The AST backend keeps it
+                # as an explicit statement, so it is moved out of the loop
+                # header and printed with the body instead of being squeezed
+                # into a comma separated condition.
+                if id(stmt) not in defer.consumed:
+                    defer.statements.append(stmt)
+                continue
             if separator:
                 if self.is_set(Modifier.comma_separate.value):
                     self.emit.print(self.COMMA)
@@ -2350,7 +2409,11 @@ class PrintC(PrintLanguage):
             self.emit.close_brace_indent(self.CLOSE_CURLY, pending_brace.get_indent_id())
 
     def emit_block_while_do(self, bl: Any) -> None:
-        # while/do blocks never print their final branch.
+        form = _for_loop_form(self, bl)
+        if form is not None:
+            self.emit_for_loop(bl, form)
+            return
+        # whiledo block NEVER prints final branch
         self.push_mod()
         self.unset_mod(Modifier.no_branch.value | Modifier.only_branch.value)
         self.emit_any_label_statement(bl)
@@ -2362,21 +2425,79 @@ class PrintC(PrintLanguage):
         id1 = self.emit.open_paren(self.OPEN_PAREN)
         self.push_mod()
         self.set_mod(Modifier.comma_separate.value)
+        self._phi_defer.append(_PhiDefer())
         self.emit_block(
             cond_block,
             boolean_flip=_loop_condition_flipped(
                 self, cond_block, getattr(front_leaf(bl.body_block), "start_addr", None)
             ),
         )
+        deferred = self._phi_defer.pop()
         self.pop_mod()
         self.emit.close_paren(self.CLOSE_PAREN, id1)
         indent = self.emit.open_brace_indent(self.OPEN_CURLY, self.option_brace_loop)
         self.set_mod(Modifier.no_branch.value)
         id2 = self.emit.begin_block(bl.body_block)
+        self.emit_deferred_statements(deferred.statements)
         self.emit_block(bl.body_block)
         self.emit.end_block(id2)
         self.emit.close_brace_indent(self.CLOSE_CURLY, indent)
         self.pop_mod()
+
+    def emit_for_loop(self, bl: Any, form: "ForLoopForm") -> None:
+        """``PrintC::emitForLoop``: ``for`` keyword plus three ;-separated parts.
+
+        The initializer statement, the condition and the iterator statement are
+        printed inside one parenthesised group with the ``comma_separate``
+        modifier active, then the body of the loop follows in braces.
+        """
+        self.push_mod()
+        self.unset_mod(Modifier.no_branch.value | Modifier.only_branch.value)
+        self.emit_any_label_statement(bl)
+        cond_block = bl.cond_block
+        self.emit_comment_block_tree(cond_block)
+        self.emit.tag_line()
+        self.emit.tag_op(self.KEYWORD_FOR, SyntaxHighlight.keyword_color, form.op)
+        self.emit.spaces(1)
+        id1 = self.emit.open_paren(self.OPEN_PAREN)
+        self.push_mod()
+        self.set_mod(Modifier.comma_separate.value)
+        self._phi_defer.append(_PhiDefer(consumed=frozenset({id(form.loop_def)})))
+        if form.initialize is not None:  # Emit the (optional) initializer
+            id3 = self.emit.begin_statement(form.initialize.op)
+            self.emit_expression(form.initialize)
+            self.emit.end_statement(id3)
+        self.emit.print(self.SEMICOLON)
+        self.emit.spaces(1)
+        self.emit_block(
+            cond_block,  # Emit the conditional statement
+            boolean_flip=_loop_condition_flipped(
+                self, cond_block, getattr(front_leaf(bl.body_block), "start_addr", None)
+            ),
+        )
+        self.emit.print(self.SEMICOLON)
+        self.emit.spaces(1)
+        id4 = self.emit.begin_statement(form.iterate.op)  # Emit the iterator
+        self.emit_expression(form.iterate)
+        self.emit.end_statement(id4)
+        deferred = self._phi_defer.pop()
+        self.pop_mod()
+        self.emit.close_paren(self.CLOSE_PAREN, id1)
+        indent = self.emit.open_brace_indent(self.OPEN_CURLY, self.option_brace_loop)
+        self.set_mod(Modifier.no_branch.value)  # Dont print goto at bottom of clause
+        id2 = self.emit.begin_block(bl.body_block)
+        self.emit_deferred_statements(deferred.statements)
+        self.emit_block(bl.body_block)
+        self.emit.end_block(id2)
+        self.emit.close_brace_indent(self.CLOSE_CURLY, indent)
+        self.pop_mod()
+
+    def emit_deferred_statements(self, statements: list[PrintStatement]) -> None:
+        """Print merge (phi) statements held back from a loop header."""
+        for stmt in statements:
+            self.emit_comment_group(stmt)
+            self.emit.tag_line()
+            self.emit_statement(stmt)
 
     def emit_block_do_while(self, bl: Any) -> None:
         self.push_mod()
@@ -2594,6 +2715,7 @@ _AST_DISPATCH = {
     "const": PrintC.op_constant,
     "extract": PrintC.op_extract,
     "fp_const": PrintC.op_float_constant,
+    "func": PrintC.op_func,
     "function_address": PrintC.op_function_address,
     "load": PrintC.op_load,
     "load_typed": PrintC.op_load,
@@ -2639,6 +2761,131 @@ _AST_DISPATCH["op"] = _dispatch_ast
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+# C tokens inside a pre-rendered (opaque) expression.  The alternatives are
+# ordered so that the pieces always concatenate back to the original text.
+_OPAQUE_PIECE_RE = re.compile(
+    r"""
+      (?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')
+    | (?P<number>
+        0[xX][0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?(?:[pP][-+]?[0-9]+)?[uUlL]*
+      | 0[bB][01]+[uUlL]*
+      | [0-9]+\.[0-9]*(?:[eE][-+]?[0-9]+)?[fFlL]*
+      | \.[0-9]+(?:[eE][-+]?[0-9]+)?[fFlL]*
+      | [0-9]+(?:[eE][-+]?[0-9]+)?[fFlL]*
+      )
+    | (?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
+    | (?P<space>\s+)
+    | (?P<punct><<|>>|->|\+\+|--|&&|\|\||==|!=|<=|>=|[^\s])
+    """,
+    re.VERBOSE,
+)
+
+_OPAQUE_KEYWORDS = frozenset({"struct", "union", "enum", "sizeof", "typedef"})
+_OPAQUE_BASE_TYPES = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "bool",
+    }
+)
+
+
+def _split_opaque(text: str) -> list[tuple[str, str]]:
+    """Split pre-rendered C text into ``(kind, piece)`` tokens."""
+    pieces: list[tuple[str, str]] = []
+    position = 0
+    for match in _OPAQUE_PIECE_RE.finditer(text):
+        if match.start() > position:
+            # Never drop a character: anything unrecognized stays verbatim.
+            pieces.append(("punct", text[position:match.start()]))
+        kind = match.lastgroup or "punct"
+        pieces.append((kind, match.group()))
+        position = match.end()
+    if position < len(text):
+        pieces.append(("punct", text[position:]))
+    return pieces
+
+
+def _opaque_highlight(
+    pieces: list[tuple[str, str]], index: int, doc: Optional[PrintableFunction]
+) -> SyntaxHighlight:
+    """Colour one identifier of an opaque expression like the printer would."""
+    name = pieces[index][1]
+    if name in _OPAQUE_KEYWORDS:
+        return SyntaxHighlight.keyword_color
+    for kind, piece in pieces[index + 1:]:
+        if kind == "space":
+            continue
+        if kind == "punct" and piece == "(":
+            return SyntaxHighlight.funcname_color
+        break
+    if name in _OPAQUE_BASE_TYPES or (name.endswith("_t") and len(name) > 2):
+        return SyntaxHighlight.type_color
+    symbols = getattr(doc, "symbols", None) if doc is not None else None
+    symbol = None
+    if isinstance(symbols, dict):
+        symbol = symbols.get(name)
+    elif symbols is not None:
+        lookup = getattr(symbols, "lookup", None)
+        if lookup is not None:
+            symbol = lookup(name)
+    if symbol is not None:
+        return get_symbol_highlight(symbol)
+    return SyntaxHighlight.no_color
+
+
+#: Punctuation that must not be separated from what follows it: a line break
+#: between ``.`` and a field name is legal C but reads as a mistake.
+_STICKY_PUNCT = frozenset({".", "->", "::"})
+
+
+def _opaque_segments(
+    text: str, doc: Optional[PrintableFunction] = None
+) -> list[tuple[str, SyntaxHighlight]]:
+    """Split pre-rendered C text into highlighted segments.
+
+    Whitespace is appended to the segment on its left, so joining the segments
+    reproduces ``text`` exactly while every boundary stays a place where the
+    pretty printer may wrap the line.  A segment boundary is never placed right
+    after :data:`_STICKY_PUNCT`.
+    """
+    pieces = _split_opaque(text)
+    segments: list[tuple[str, SyntaxHighlight]] = []
+    sticky = False
+    for index, (kind, piece) in enumerate(pieces):
+        if kind == "space":
+            sticky = False
+            if segments:
+                previous, highlight = segments[-1]
+                segments[-1] = (previous + piece, highlight)
+            else:
+                segments.append((piece, SyntaxHighlight.no_color))
+            continue
+        if kind == "identifier":
+            highlight = _opaque_highlight(pieces, index, doc)
+        elif kind in ("number", "string"):
+            highlight = SyntaxHighlight.const_color
+        else:
+            highlight = SyntaxHighlight.no_color
+        if segments and sticky:
+            previous, previous_highlight = segments[-1]
+            segments[-1] = (
+                previous + piece,
+                highlight if kind != "punct" else previous_highlight,
+            )
+        else:
+            segments.append((piece, highlight))
+        sticky = kind == "punct" and piece in _STICKY_PUNCT
+    return segments
 
 
 def _calc_mask(sz: int) -> int:
@@ -2752,6 +2999,135 @@ def _terminator_prints(term: PrintTerminator) -> bool:
     if term.kind in ("return", "noreturn_call", "none"):
         return bool(term.text)
     return True
+
+
+@dataclass
+class _PhiDefer:
+    """Merge statements held back while a loop header is being printed."""
+
+    consumed: frozenset[int] = frozenset()
+    statements: list[PrintStatement] = field(default_factory=list)
+
+
+@dataclass
+class ForLoopForm:
+    """The ``for`` syntax recovered from a ``BlockWhileDo``.
+
+    Mirrors the ``initializeOp``/``iterateOp``/``loopDef`` triple that
+    ``BlockWhileDo::finalTransform`` and ``finalizePrinting`` compute in
+    ``block.cc``.  ``loop_def`` is the merge (phi) statement playing the role of
+    the MULTIEQUAL, ``initialize``/``iterate`` are the two assignment statements
+    built from its inputs.
+    """
+
+    op: Any
+    head: Any
+    loop_def: PrintStatement
+    iterate: PrintStatement
+    initialize: Optional[PrintStatement] = None
+
+
+def _expr_mentions(node: Any, name: str) -> bool:
+    """Does the expression read the variable called ``name``?"""
+    if node is None or not name:
+        return False
+    if node.kind == "var":
+        if node.name == name:
+            return True
+        symbol = node.symbol
+        return symbol is not None and getattr(symbol, "name", None) == name
+    if node.kind == "opaque" and node.text:
+        # Opaque tokens keep the backend's own rendering; scan it for the name.
+        return re.search(rf"\b{re.escape(name)}\b", node.text) is not None
+    return any(_expr_mentions(arg, name) for arg in node.args)
+
+
+def _assign_from_phi(stmt: PrintStatement, value: Optional[PrintExpr]) -> Optional[PrintStatement]:
+    """Turn one input of a merge statement into a plain assignment statement."""
+    if value is None:
+        return None
+    return PrintStatement(
+        kind="assign",
+        op=stmt.op,
+        out_symbol=stmt.out_symbol,
+        out_name=stmt.out_name,
+        expression=value,
+    )
+
+
+def _split_phi_inputs(stmt: PrintStatement, name: str) -> tuple[Any, Any]:
+    """Split a two-input merge into (initializer value, iterator value).
+
+    ``BlockWhileDo::findLoopVariable`` follows the branch condition back to a
+    MULTIEQUAL in the loop head whose tail input is written by the last
+    statement of the loop body, and ``testIterateForm`` then insists that the
+    loop variable is an input of the iterator statement.  The AST backend
+    renders the two MULTIEQUAL inputs inline, so the input that reads the
+    variable is the iterator and the other one is the initializer.
+    """
+    values = stmt.values
+    if len(values) != 2:
+        return None, None
+    mentions = [_expr_mentions(value, name) for value in values]
+    if mentions.count(True) != 1:
+        return None, None
+    index = mentions.index(True)
+    return values[1 - index], values[index]
+
+
+def _block_successors(doc: PrintableFunction, start: int) -> tuple[int, ...]:
+    for block in doc.blocks:
+        if block.start == start:
+            return tuple(block.successors)
+    return ()
+
+
+def _for_loop_form(printer: "PrintC", bl: Any) -> Optional[ForLoopForm]:
+    """``BlockWhileDo::finalTransform``: recover the ``for`` form of a loop."""
+    if not printer.analyze_for_loops:
+        return None
+    doc = printer.doc
+    if doc is None:
+        return None
+    cond_block = getattr(bl, "cond_block", None)
+    body_block = getattr(bl, "body_block", None)
+    if cond_block is None or body_block is None:
+        return None
+    head = front_leaf(cond_block)
+    start = getattr(head, "start_addr", None)
+    if start is None:
+        return None
+    term = doc.terminators.get(start)
+    if term is None or term.kind not in ("cbranch", "cbranch_indirect"):
+        return None
+    if term.condition is None:
+        return None
+    # The body must have a single basic block tail flowing back to the head
+    # (tail->sizeOut() == 1 && tail->getOut(0) == head).
+    tail = _last_leaf(body_block)
+    tail_start = getattr(tail, "start_addr", None)
+    if tail_start is None:
+        return None
+    successors = _block_successors(doc, tail_start)
+    if successors != (start,):
+        return None
+    for stmt in doc.statements_by_block.get(start, ()):
+        if stmt.kind != "phi" or not stmt.out_name:
+            continue
+        # findLoopVariable: the conditional branch must read the merged value.
+        if not _expr_mentions(term.condition, stmt.out_name):
+            continue
+        init_value, iterate_value = _split_phi_inputs(stmt, stmt.out_name)
+        if iterate_value is None:
+            continue
+        return ForLoopForm(
+            op=stmt.op,
+            head=head,
+            loop_def=stmt,
+            iterate=_assign_from_phi(stmt, iterate_value),
+            initialize=_assign_from_phi(stmt, init_value),
+        )
+    return None
 
 
 def _loop_condition_flipped(
