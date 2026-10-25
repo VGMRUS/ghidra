@@ -367,19 +367,31 @@ class BlockGraph(FlowBlock):
         # Outputs:
         # cond points to body and outblock
         # body points to outblock
-        outblock = body.out_edges[0]
-        
-        # Remove cond -> outblock
-        cond.out_edges.remove(outblock)
-        outblock.in_edges.remove(cond)
-        
-        # Remove body -> outblock
-        body.out_edges.remove(outblock)
-        outblock.in_edges.remove(body)
-        
-        # new_if -> outblock
-        new_if.out_edges.append(outblock)
-        outblock.in_edges.append(new_if)
+        outblock = body.out_edges[0] if body.out_edges else None
+        if outblock is None:
+            # The body leaves the function (return/trap/no-return call), so it
+            # has no out edge to reattach. Ghidra models that case with
+            # BlockIfNoExit; here the if is simply built without an exit edge
+            # instead of failing on the missing block.
+            remaining = [item for item in cond.out_edges if item is not body]
+            outblock = remaining[0] if remaining else None
+
+        if outblock is not None:
+            # Remove cond -> outblock
+            if outblock in cond.out_edges:
+                cond.out_edges.remove(outblock)
+            if cond in outblock.in_edges:
+                outblock.in_edges.remove(cond)
+
+            # Remove body -> outblock
+            if outblock in body.out_edges:
+                body.out_edges.remove(outblock)
+            if body in outblock.in_edges:
+                outblock.in_edges.remove(body)
+
+            # new_if -> outblock
+            new_if.out_edges.append(outblock)
+            outblock.in_edges.append(new_if)
         
         idx = self.blocks.index(cond)
         self.blocks[idx] = new_if

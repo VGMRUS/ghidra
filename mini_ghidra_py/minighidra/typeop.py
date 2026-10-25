@@ -192,31 +192,61 @@ class TypeOpIntXor(TypeOpMath):
     pass
 
 class TypeOpPiece(TypeOp):
-    pass
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        # Usually concatenation doesn't infer a concrete single type
+        return None
 
 class TypeOpSubpiece(TypeOp):
-    pass
+    @staticmethod
+    def pop(op: PcodeOp, out_type: Optional[CType], in_types: list[Optional[CType]], slot: int) -> Optional[CType]:
+        if slot == 0 and out_type:
+            # Maybe the input type is inferred as a larger containing type
+            pass
+        return None
 
 class TypeOpPtradd(TypeOp):
-    pass
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        if in_types and in_types[0]:
+            return in_types[0] # Ptradd propagates pointer type
+        return None
 
 class TypeOpPtrsub(TypeOp):
-    pass
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        if in_types and in_types[0]:
+            return in_types[0]
+        return None
 
-class TypeOpIndirect(TypeOp):
+class TypeOpIndirect(TypeOpCopy):
     pass
 
 class TypeOpCall(TypeOp):
-    pass
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        # Return type comes from function prototype, if available
+        return None
 
 class TypeOpReturn(TypeOp):
-    pass
+    @staticmethod
+    def pop(op: PcodeOp, out_type: Optional[CType], in_types: list[Optional[CType]], slot: int) -> Optional[CType]:
+        # The return value type is inferred from the function prototype
+        return None
 
 class TypeOpCast(TypeOp):
-    pass
+    @staticmethod
+    def push(op: PcodeOp, in_types: list[Optional[CType]]) -> Optional[CType]:
+        # Output type is already fully defined by the cast
+        return None
 
 class TypeOpCbranch(TypeOp):
-    pass
+    @staticmethod
+    def pop(op: PcodeOp, out_type: Optional[CType], in_types: list[Optional[CType]], slot: int) -> Optional[CType]:
+        if slot == 1: # The boolean condition
+            from .typesys import CType, TypeKind
+            return CType(TypeKind.BOOL, 1)
+        return None
 
 class TypeOpBranch(TypeOp):
     pass

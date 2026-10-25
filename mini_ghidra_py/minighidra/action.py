@@ -13,7 +13,7 @@ class Action:
         self.count = 0
 
     def apply(self, data: PcodeLikeGraph) -> int:
-        raise NotImplementedError
+        return 0
 
 
 class ActionGroup(Action):

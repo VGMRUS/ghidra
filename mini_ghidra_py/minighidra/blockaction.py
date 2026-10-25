@@ -66,22 +66,14 @@ class ActionConditionalConst(Action):
         return None
 
     def _find_const_compare(self, points: list[ConstPoint], bool_vn: int, bl: 'FlowBlock', block_dom: list[bool], flip_edge: bool, data) -> None:
-        comp_op = None
-        for op in data.ops:
-            if op.output == bool_vn:
-                comp_op = op
-                break
+        comp_op = data.get_def(bool_vn)
         if not comp_op: return
 
         opc = comp_op.opcode
         if opc == "BOOL_NEGATE":
             flip_edge = not flip_edge
             bool_vn = comp_op.inputs[0]
-            comp_op = None
-            for op in data.ops:
-                if op.output == bool_vn:
-                    comp_op = op
-                    break
+            comp_op = data.get_def(bool_vn)
             if not comp_op: return
             opc = comp_op.opcode
 
@@ -114,9 +106,7 @@ class ActionConditionalConst(Action):
             const_vn = pt.const_vn
             const_block = pt.const_block
             
-            for op in data.ops:
-                if op.opcode == "IMARK": continue
-                if var_vn in op.inputs:
+            for op in data.get_uses(var_vn):
                     op_block = self._block_for_op(op, data)
                     if op_block and pt.block_is_dom and const_block.dominates(op_block):
                         if op.opcode == "RETURN":
