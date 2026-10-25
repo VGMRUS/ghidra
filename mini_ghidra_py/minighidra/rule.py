@@ -7320,33 +7320,53 @@ class RulePullAbsorb(Rule):
 
 class RuleDoubleIn(Rule):
     """Stub for RuleDoubleIn (Double precision logic). 
-    In Ghidra, identifies complementary SUBPIECEs extracting halves of a double-precision whole, 
-    and applies split flow."""
-    def __init__(self, group: str) -> None:
+    Placeholder in minighidra."""
+    def __init__(self, group: str):
         super().__init__(group, 0, "doublein")
+        
+    def reset(self, data: 'PcodeLikeGraph') -> None:
+        pass # data.double_precis_recovery = True
+
     def get_op_list(self) -> list[str]:
         return ["SUBPIECE"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+
+    def attempt_marking(self, vn: int, subpiece_op: Any) -> int:
+        return 0
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 
 class RuleDoubleOut(Rule):
     """Stub for RuleDoubleOut (Double precision logic).
-    In Ghidra, collapses complementary input halves feeding a PIECE back into a single double-precision input."""
-    def __init__(self, group: str) -> None:
+    Placeholder in minighidra."""
+    def __init__(self, group: str):
         super().__init__(group, 0, "doubleout")
+
     def get_op_list(self) -> list[str]:
         return ["PIECE"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+
+    def attempt_marking(self, vnhi: int, vnlo: int, piece_op: Any) -> int:
+        return 0
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 
 class RuleDoubleStore(Rule):
     """Stub for RuleDoubleStore (Double precision logic).
-    In Ghidra, collapses contiguous stores of complementary SUBPIECEs back into a single STORE of the whole."""
-    def __init__(self, group: str) -> None:
+    Placeholder in minighidra."""
+    def __init__(self, group: str):
         super().__init__(group, 0, "doublestore")
+
     def get_op_list(self) -> list[str]:
         return ["STORE"]
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+
+    def test_indirect_use(self, op1: Any, op2: Any, indirects: list[Any]) -> bool:
+        return False
+
+    def reassign_indirects(self, data: Any, new_store: Any, indirects: list[Any]) -> None:
+        pass
+
+    def apply_op(self, op: Any, data: Any) -> int:
         return 0
 class RuleOrPredicate(Rule):
     """Delegate to simplify INT_OR predicates. Simulates RuleOrPredicate in Ghidra."""
