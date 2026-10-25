@@ -329,11 +329,7 @@ class ActionDeindirect(Action):
             node = data.nodes[vn]
             
             while node.kind != "const":
-                def_op = None
-                for cand in data.ops:
-                    if cand.output == vn:
-                        def_op = cand
-                        break
+                def_op = data.get_def(vn)
                 if def_op and def_op.opcode == "COPY":
                     vn = def_op.inputs[0]
                     node = data.nodes[vn]
