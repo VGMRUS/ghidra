@@ -91,10 +91,7 @@ class JumpBasic:
         descend = self.data.nodes[self.norm_vn]
         # In minighidra, we don't store descend on nodes. We have to iterate over all ops or use def-use chains.
         # Let's iterate all ops that use norm_vn
-        uses = []
-        for op in self.data.ops:
-            if self.norm_vn in op.inputs:
-                uses.append(op)
+        uses = self.data.get_uses(self.norm_vn)
                 
         for use_op in uses:
             if use_op.opcode in ("INT_LESS", "INT_SLESS", "INT_LESSEQUAL", "INT_SLESSEQUAL"):

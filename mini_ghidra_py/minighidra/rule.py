@@ -2839,11 +2839,7 @@ class RuleSborrow(Rule):
             cvn_id = compop.inputs[1 - slot]
             cvn = data.nodes[cvn_id]
             
-            signop = None
-            for dop in data.ops:
-                if dop.output == cvn_id:
-                    signop = dop
-                    break
+            signop = data.get_def(cvn_id)
                     
             if not signop or signop.opcode != "INT_SLESS":
                 continue
@@ -4117,11 +4113,7 @@ class RuleConditionalMove(Rule):
                 andorselect = path0istrue
                 
                 if boolvn != op.inputs[0]:
-                    negop = None
-                    for dop in data.ops:
-                        if dop.output == boolvn:
-                            negop = dop
-                            break
+                    negop = data.get_def(boolvn)
                     if not negop or negop.opcode != "BOOL_NEGATE": return 0
                     if negop.inputs[0] != op.inputs[0]: return 0
                     andorselect = not andorselect
@@ -4135,11 +4127,7 @@ class RuleConditionalMove(Rule):
                 andorselect = not path0istrue
                 
                 if boolvn != op.inputs[1]:
-                    negop = None
-                    for dop in data.ops:
-                        if dop.output == boolvn:
-                            negop = dop
-                            break
+                    negop = data.get_def(boolvn)
                     if not negop or negop.opcode != "BOOL_NEGATE": return 0
                     if negop.inputs[0] != op.inputs[1]: return 0
                     andorselect = not andorselect
@@ -4325,11 +4313,7 @@ class RulePopcountBoolXor(Rule):
             if bitPos == 0 and node.size_bits == 1 and nzmask == mask:
                 return vn, constRes
                 
-            def_op = None
-            for dop in data.ops:
-                if dop.output == vn:
-                    def_op = dop
-                    break
+            def_op = data.get_def(vn)
             if not def_op: return -1, constRes
             
             opc = def_op.opcode
@@ -4656,11 +4640,7 @@ class RuleCollectTerms(Rule):
         if node.kind == "const":
             return vn_id, 1
             
-        def_op = None
-        for op in data.ops:
-            if op.output == vn_id:
-                def_op = op
-                break
+        def_op = data.get_def(vn_id)
                 
         if def_op and def_op.opcode == "INT_MULT" and len(def_op.inputs) == 2:
             in1 = data.nodes[def_op.inputs[1]]
@@ -4809,32 +4789,20 @@ class RuleIgnoreNan(Rule):
 
     def _is_another_nan(self, vn: int, data: PcodeLikeGraph) -> bool:
         if vn < 0: return False
-        def_op = None
-        for dop in data.ops:
-            if dop.output == vn:
-                def_op = dop
-                break
+        def_op = data.get_def(vn)
         if not def_op: return False
         
         opc = def_op.opcode
         if opc == "BOOL_NEGATE":
             vn = def_op.inputs[0]
-            def_op = None
-            for dop in data.ops:
-                if dop.output == vn:
-                    def_op = dop
-                    break
+            def_op = data.get_def(vn)
             if not def_op: return False
             opc = def_op.opcode
             
         return opc == "FLOAT_NAN"
 
     def _check_back_for_compare(self, floatVar: int, vn: int, data: PcodeLikeGraph) -> bool:
-        def1 = None
-        for dop in data.ops:
-            if dop.output == vn:
-                def1 = dop
-                break
+        def1 = data.get_def(vn)
         if not def1: return False
         
         if def1.opcode in ("FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL"):
@@ -4847,11 +4815,7 @@ class RuleIgnoreNan(Rule):
             
         for i in range(2):
             in_vn = def1.inputs[i]
-            def2 = None
-            for dop in data.ops:
-                if dop.output == in_vn:
-                    def2 = dop
-                    break
+            def2 = data.get_def(in_vn)
             if not def2: continue
             if def2.opcode in ("FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL"):
                 if def2.inputs[0] == floatVar or def2.inputs[1] == floatVar:
@@ -5051,11 +5015,7 @@ class RuleInt2FloatCollapse(Rule):
         slot = multiop.inputs.index(op.output)
         otherout = multiop.inputs[1 - slot]
         
-        op2 = None
-        for dop in data.ops:
-            if dop.output == otherout:
-                op2 = dop
-                break
+        op2 = data.get_def(otherout)
                 
         if not op2 or op2.opcode != "FLOAT_INT2FLOAT": return 0
         if op2.inputs[0] != basevn: return 0
@@ -5193,11 +5153,7 @@ class RuleFloatSign(Rule):
         def process_input(in_slot: int) -> int:
             if op.inputs[in_slot] < 0: return 0
             vn = op.inputs[in_slot]
-            signOp = None
-            for dop in data.ops:
-                if dop.output == vn:
-                    signOp = dop
-                    break
+            signOp = data.get_def(vn)
             if signOp:
                 resCode = TypeOp.float_sign_manipulation(signOp, data)
                 if resCode:
@@ -5866,11 +5822,7 @@ class RuleDumptyHumpLate(Rule):
         node = data.nodes[vn]
         # In Python minighidra we check if it is written.
         # But data.op_get_def will do that.
-        piece_op = None
-        for cand_op in data.ops:
-            if cand_op.output == vn:
-                piece_op = cand_op
-                break
+        piece_op = data.get_def(vn)
                 
         if piece_op is None or piece_op.opcode != "SUBPIECE":
             return 0
