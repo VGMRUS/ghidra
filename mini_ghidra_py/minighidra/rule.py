@@ -7500,6 +7500,14 @@ class RuleDoubleIn(Rule):
         return 0
 
     def apply_op(self, op: Any, data: Any) -> int:
+        outvn = op.output
+        if outvn is None: return 0
+        node = data.nodes[outvn]
+        if not getattr(node, "is_precis_lo", False):
+            if getattr(node, "is_precis_hi", False): return 0
+            return self.attempt_marking(outvn, op)
+            
+        # Omitted SplitVarnode list expansion
         return 0
 
 class RuleDoubleOut(Rule):
@@ -7515,6 +7523,17 @@ class RuleDoubleOut(Rule):
         return 0
 
     def apply_op(self, op: Any, data: Any) -> int:
+        if len(op.inputs) < 2: return 0
+        vnhi, vnlo = op.inputs[0], op.inputs[1]
+        
+        nhi, nlo = data.nodes[vnhi], data.nodes[vnlo]
+        if getattr(nhi, "is_input", False) or getattr(nlo, "is_input", False):
+            return 0
+            
+        if not getattr(nhi, "is_precis_hi", False) or not getattr(nlo, "is_precis_lo", False):
+            return self.attempt_marking(vnhi, vnlo, op)
+            
+        # Omitted addr-tied contiguous logic
         return 0
 
 class RuleDoubleStore(Rule):
@@ -7533,6 +7552,21 @@ class RuleDoubleStore(Rule):
         pass
 
     def apply_op(self, op: Any, data: Any) -> int:
+        if len(op.inputs) < 3: return 0
+        vnlo = op.inputs[2]
+        if vnlo < 0: return 0
+        
+        nlo = data.nodes[vnlo]
+        if not getattr(nlo, "is_precis_lo", False): return 0
+        
+        def_op = data.get_def(vnlo)
+        if not def_op or def_op.opcode != "SUBPIECE": return 0
+        if data.get_constant_value(def_op.inputs[1]) != 0: return 0
+        
+        whole_vn = def_op.inputs[0]
+        if whole_vn < 0: return 0
+        
+        # Omitted deep search for second contiguous SUBPIECE
         return 0
 class RuleOrPredicate(Rule):
     """Delegate to simplify INT_OR predicates. Simulates RuleOrPredicate in Ghidra."""
