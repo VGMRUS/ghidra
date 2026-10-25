@@ -245,3 +245,26 @@ class LaneDivide:
         
     def trace_backward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
         return False
+
+
+class SplitDatatype:
+    """
+    Helper engine to rewrite operations handling full structured types (like structs or arrays)
+    by splitting them into multiple partial operations per-field when datatype partial tracking
+    requires it.
+    """
+    def __init__(self, data: PcodeLikeGraph):
+        self.data = data
+        self.split_structures = True
+        self.split_arrays = True
+        self.is_load_store = False
+        self.data_type_pieces = []
+
+    def split_copy(self, copy_op: PcodeOp, in_type: Any, out_type: Any) -> bool:
+        return False
+        
+    def split_load(self, load_op: PcodeOp, in_type: Any) -> bool:
+        return False
+        
+    def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
+        return False
