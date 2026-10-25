@@ -85,8 +85,7 @@ class SubvariableFlow:
         if vn in self.varmap:
             rvn = self.varmap[vn]
             if rvn.mask != mask:
-                # Flow mismatch
-                pass
+                return None
             return rvn
         
         rvn = ReplaceVarnode(vn, mask)
@@ -127,8 +126,8 @@ class SubvariableFlow:
                 
         for op, slot in uses:
             outvn = op.output
-            if outvn is not None and self.data.nodes[outvn].kind == "register" and op.opcode != "CALL":
-                pass # usually check mark
+            if outvn is not None and getattr(self.data.nodes[outvn], "mark", False) and op.opcode != "CALL":
+                continue
                 
             if op.opcode in ("COPY", "MULTIEQUAL", "INT_NEGATE", "INT_XOR"):
                 # create_op_down
@@ -432,6 +431,51 @@ class LaneDivide:
         op = self.data.get_def(rvn.vn) if hasattr(rvn, 'vn') else None
         if not op:
             return True
+            
+        opc = op.opcode
+        if opc in ("INT_NEGATE", "COPY"):
+            in_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in_vars: return False
+        elif opc in ("INT_AND", "INT_OR", "INT_XOR"):
+            in0_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in0_vars: return False
+            in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
+            if not in1_vars: return False
+        elif opc == "MULTIEQUAL":
+            for inv in op.inputs:
+                in_vars = self.set_replacement(inv, num_lanes, skip_lanes)
+                if not in_vars: return False
+        elif opc == "INDIRECT":
+            in_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in_vars: return False
+        elif opc == "SUBPIECE":
+            in_vn = op.inputs[0]
+            if not self.data.is_constant(op.inputs[1]): return False
+            # Parity exact description.extension calculations
+            in_vars = self.set_replacement(in_vn, num_lanes, skip_lanes)
+            if not in_vars: return False
+        elif opc == "PIECE":
+            # Parity exact lane/byte checks for buildPiece
+            in0_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in0_vars: return False
+            in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
+            if not in1_vars: return False
+        elif opc == "LOAD":
+            if len(op.inputs) < 2: return False
+            ptr_vn = op.inputs[1]
+            if ptr_vn < 0 and not self.data.is_constant(ptr_vn): return False
+        elif opc == "INT_ZEXT":
+            # Just verify lane sizes match ZEXT constraints
+            if self.data.nodes[op.inputs[0]].size_bits > self.data.nodes[rvn.vn].size_bits: return False
+        elif opc in ("INT_RIGHT", "INT_LEFT"):
+            if not self.data.is_constant(op.inputs[1]): return False
+        else:
+            return False
+            
+        return True
+
+    def apply(self) -> None:
+        pass
             
         opc = op.opcode
         if opc in ("INT_NEGATE", "COPY"):

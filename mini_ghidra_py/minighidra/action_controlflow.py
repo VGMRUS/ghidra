@@ -396,7 +396,17 @@ class ActionLaneDivide(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        from minighidra.subflow import LaneDivide, LaneDescription
+        for mode in range(3):
+            all_storage_processed = True
+            for vn_id, node in enumerate(data.nodes):
+                if not getattr(node, 'is_laned', False): continue
+                # We do a simplified iteration over all laned nodes
+                if not self.process_varnode(data, vn_id, mode):
+                    all_storage_processed = False
+            if all_storage_processed: break
+            
+        return self.count
 
 class ActionMergeMultiEntry(Action):
     """Simplifies blocks that have complex multi-entry control flow."""
