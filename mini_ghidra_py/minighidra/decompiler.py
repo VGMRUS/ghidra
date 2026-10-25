@@ -71,7 +71,7 @@ from .model import (
     Instruction,
 )
 from .paramid import ParamActive, ParamIDAnalysis, ParamRank, PcodeLikeGraph
-from .printlanguage import PcodeSymbolResolver
+from .printlanguage_rpn import PcodeSymbolResolver
 from .prototype import PrototypeResolver
 from .sleigh import SleighInstruction, SleighTranslator, SleighVarnode
 from .ssa import SSAFunction, SSAHeritage, SSAOperand, SSAOperation, SSALocation
@@ -180,6 +180,89 @@ class _Decoded:
     mnemonic: str
     operands: tuple[_Operand, ...]
     repeat: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StatementRecord:
+    """One pseudocode statement recovered for a basic block.
+
+    ``address`` is the instruction the statement was lifted from (the backend
+    prefixes collected statements with an address comment), which gives the
+    printer the same per-statement address association Ghidra gets from the
+    ``PcodeOp`` sequence number.
+    """
+
+    text: str
+    address: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallRecord:
+    """Structural description of a recovered call statement."""
+
+    address: int
+    target_text: str
+    target_address: int | None
+    arguments: tuple[_Expr, ...]
+    result: _Expr | None
+    no_return: bool
+    indirect: bool = False
+    target_expr: _Expr | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminatorRecord:
+    """Structural description of how a basic block transfers control.
+
+    This is the AST-backend counterpart of the branch ``PcodeOp`` that Ghidra
+    keeps as the ``lastOp()`` of a ``BlockBasic``: it carries the condition
+    expression, the branch targets and any switch/tail-call information, so the
+    printer does not have to re-parse rendered text.
+    """
+
+    kind: str
+    block: int
+    condition: _Expr | None = None
+    true_target: int | None = None
+    fallthrough: int | None = None
+    targets: tuple[int, ...] = ()
+    switch_value: _Expr | None = None
+    switch_cases: tuple[tuple[int, int], ...] = ()
+    indirect: _Expr | None = None
+    tail_call: str | None = None
+    tail_call_address: int | None = None
+    tail_call_no_return: bool = False
+    text: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DecompileArtifacts:
+    """Everything the Ghidra-style printer needs besides the expression AST.
+
+    ``decompile`` keeps rendering text through the backend's own ``_render``;
+    these artifacts expose the same information structurally so
+    :mod:`minighidra.printc` can emit a whole function through Ghidra's
+    ``Emit``/``PrintLanguage`` machinery.
+    """
+
+    function: Function
+    analyzer: object
+    text: str
+    bits: int
+    calling_convention: CallingConvention
+    signature: FunctionSignature | None
+    return_type: str
+    parameters: tuple[FunctionParameter, ...]
+    parameter_declarations: tuple[str, ...]
+    local_declarations: tuple[tuple[str, str], ...]
+    blocks: tuple[BasicBlock, ...]
+    statements_by_block: dict[int, tuple[StatementRecord, ...]]
+    terminators: dict[int, TerminatorRecord]
+    calls: dict[int, tuple[CallRecord, ...]]
+    render_catalog: dict[str, _Expr]
+    structure: object | None
+    structured_body: tuple[str, ...]
+    is_thunk: bool = False
 
 
 class SemanticDecompiler:
@@ -488,6 +571,19 @@ class SemanticDecompiler:
         self._declared_signature: FunctionSignature | None = None
         self._input_parameter_names_by_register: dict[str, str] = {}
         self._input_parameter_names_by_stack: dict[int, str] = {}
+        # Structural capture consumed by the Ghidra-style printer
+        # (minighidra.printc); None keeps rendering-only behaviour.
+        self._render_catalog: dict[str, _Expr] | None = None
+        self._terminators: dict[int, TerminatorRecord] = {}
+        self._calls: dict[int, list[CallRecord]] = defaultdict(list)
+        self._block_lines: dict[int, tuple[StatementRecord, ...]] = {}
+        self._structured_graph: object | None = None
+        self._structured_body: tuple[str, ...] = ()
+        self._artifact_return_type = "void"
+        self._artifact_parameters: tuple[FunctionParameter, ...] = ()
+        self._artifact_parameter_declarations: tuple[str, ...] = ()
+        self._artifact_local_declarations: tuple[tuple[str, str], ...] = ()
+        self._artifact_is_thunk = False
         self._type_database = getattr(analyzer, "type_database", None) or TypeDatabase(
             self.bits, getattr(analyzer.image, "format", "")
         )
@@ -743,6 +839,17 @@ class SemanticDecompiler:
         self._declared_signature = None
         self._input_parameter_names_by_register = {}
         self._input_parameter_names_by_stack = {}
+        self._render_catalog = {}
+        self._terminators = {}
+        self._calls = defaultdict(list)
+        self._block_lines = {}
+        self._structured_graph = None
+        self._structured_body = ()
+        self._artifact_return_type = "void"
+        self._artifact_parameters = ()
+        self._artifact_parameter_declarations = ()
+        self._artifact_local_declarations = ()
+        self._artifact_is_thunk = False
         if function.signature is not None and function.signature.locked:
             layout = self._prototype_resolver.resolve(
                 function.signature, self._calling_convention
@@ -867,6 +974,12 @@ class SemanticDecompiler:
             )
         function.signature = resolved_signature
 
+        self._artifact_return_type = return_type
+        self._artifact_parameters = tuple(parameters)
+        self._artifact_parameter_declarations = tuple(parameter_declarations)
+        self._artifact_local_declarations = tuple(self._local_declaration_specs(body))
+        self._structured_body = tuple(body)
+
         c_function = CFunction(
             return_type=return_type,
             name=_c_identifier(function.name),
@@ -891,6 +1004,41 @@ class SemanticDecompiler:
         )
         return CTranslationUnit(functions=(c_function,))
 
+    def decompile_artifacts(self, function: Function) -> DecompileArtifacts:
+        """Decompile and return the structural artifacts the printer consumes.
+
+        The rendered pseudocode text is produced by the same backend pipeline as
+        :meth:`decompile` (the backend keeps working on its ``_Expr`` AST); this
+        method additionally exposes the recovered prototype, per-block
+        statements, branch terminators, call sites, collapsed control-flow
+        structure and the rendered-text → AST index.
+        """
+        text = self.decompile(function)
+        return DecompileArtifacts(
+            function=function,
+            analyzer=self.analyzer,
+            text=text,
+            bits=self.bits,
+            calling_convention=self._calling_convention,
+            signature=function.signature,
+            return_type=self._artifact_return_type,
+            parameters=self._artifact_parameters,
+            parameter_declarations=self._artifact_parameter_declarations,
+            local_declarations=self._artifact_local_declarations,
+            blocks=tuple(self._blocks),
+            statements_by_block={
+                start: tuple(records)
+                for start, records in self._block_lines.items()
+            },
+            terminators=dict(self._terminators),
+            calls={address: tuple(records) for address, records in self._calls.items()},
+            render_catalog=dict(self._render_catalog or {}),
+            structure=self._structured_graph,
+            structured_body=self._structured_body,
+            is_thunk=self._artifact_is_thunk,
+        )
+
+
     def _decompile_thunk(self, function: Function) -> CTranslationUnit:
         function.calling_convention = self._calling_convention.name
         signature = self._declared_signature
@@ -907,6 +1055,13 @@ class SemanticDecompiler:
                 parameter_items.append("...")
             parameters = tuple(parameter_items)
             return_type = signature.return_type
+        self._artifact_is_thunk = True
+        self._artifact_return_type = return_type
+        self._artifact_parameters = tuple(signature.parameters)
+        self._artifact_parameter_declarations = tuple(
+            _parameter_declaration(parameter) for parameter in signature.parameters
+        )
+        self._structured_body = (f"  goto {function.thunk_target_name or ''};",)
         if function.thunk_target_name:
             target = _c_identifier(function.thunk_target_name)
         elif function.thunk_target is not None:
@@ -5183,6 +5338,23 @@ class SemanticDecompiler:
             no_return = bool(self.analyzer._call_is_noreturn(instruction))
             result_name = f"call_result_{instruction.address:X}"
             result = None if no_return else _var(result_name, self.bits)
+            if collect and self._calls is not None:
+                self._calls[instruction.address].append(
+                    CallRecord(
+                        address=instruction.address,
+                        target_text=target,
+                        target_address=(
+                            instruction.branch_target
+                            if target_value is None
+                            else None
+                        ),
+                        arguments=tuple(arguments),
+                        result=result,
+                        no_return=no_return,
+                        indirect=target_value is not None,
+                        target_expr=target_value,
+                    )
+                )
             if self._paramid_recording_enabled:
                 self._paramid_graph.record_call(
                     arguments,
@@ -5988,6 +6160,16 @@ class SemanticDecompiler:
             elif current_start is not None:
                 block_lines[current_start].append(line)
 
+        self._block_lines = {
+            start: tuple(
+                _parse_statement_line(line)
+                for line in _strip_terminator_lines(
+                    lines, self._terminators.get(start)
+                )
+            )
+            for start, lines in block_lines.items()
+        }
+
         if not hasattr(self, "_ssa_function") or self._ssa_function is None:
             return body
 
@@ -6000,6 +6182,7 @@ class SemanticDecompiler:
 
 
         collapse.collapse_all()
+        self._structured_graph = graph
         
         def extract_condition(lines: list[str]) -> tuple[str, list[str]]:
             new_lines = []
@@ -6110,23 +6293,44 @@ class SemanticDecompiler:
         lines: list[str] = []
         decoded = self._decode(last)
         if last.is_return or last.is_trap:
+            self._record_terminator(block.start, "return", text=())
             return lines
         if last.is_call and self.analyzer._call_is_noreturn(last):
+            self._record_terminator(block.start, "noreturn_call", text=())
             return lines
         if last.is_conditional_jump:
             condition = self._condition_expression(
                 decoded.mnemonic, state.flags, state, last
             )
             target = last.branch_target
+            fallthrough = last.next_address
             if target is None:
                 lines.append(f"/* conditional indirect branch: {last.op_str} */")
-            else:
-                lines.append(
-                    f"if ({self._render(condition)}) goto {self._branch_target(target)};"
+                self._record_terminator(
+                    block.start,
+                    "cbranch_indirect",
+                    condition=condition,
+                    fallthrough=(
+                        fallthrough if fallthrough in self._block_by_start else None
+                    ),
+                    text=tuple(lines),
                 )
-            fallthrough = last.next_address
-            if fallthrough in self._block_by_start:
+                return lines
+            lines.append(
+                f"if ({self._render(condition)}) goto {self._branch_target(target)};"
+            )
+            has_fallthrough = fallthrough in self._block_by_start
+            if has_fallthrough:
                 lines.append(f"goto loc_{fallthrough:X};")
+            self._record_terminator(
+                block.start,
+                "cbranch",
+                condition=condition,
+                true_target=target,
+                fallthrough=fallthrough if has_fallthrough else None,
+                targets=(target,) + ((fallthrough,) if has_fallthrough else ()),
+                text=tuple(lines),
+            )
             return lines
         if last.is_jump:
             if last.computed_targets:
@@ -6139,6 +6343,16 @@ class SemanticDecompiler:
                 for target in last.computed_targets:
                     lines.append(f"  case {target:#x}: goto {self._branch_target(target)};")
                 lines.append("}")
+                self._record_terminator(
+                    block.start,
+                    "switch",
+                    switch_value=indirect,
+                    switch_cases=tuple(
+                        (target, target) for target in last.computed_targets
+                    ),
+                    targets=tuple(last.computed_targets),
+                    text=tuple(lines),
+                )
             elif last.branch_target is not None:
                 target_function = self.analyzer.functions.get(last.branch_target)
                 if (
@@ -6148,13 +6362,35 @@ class SemanticDecompiler:
                     target_name = _c_identifier(target_function.name)
                     if target_function.no_return:
                         lines.append(f"{target_name}(); /* tail jump; no retorna */")
+                        self._record_terminator(
+                            block.start,
+                            "tail_call",
+                            tail_call=target_name,
+                            tail_call_address=target_function.address,
+                            tail_call_no_return=True,
+                            text=tuple(lines),
+                        )
                     else:
                         lines.append(
                             f"return {target_name}(/* argumentos reenviados, firma desconocida */);"
                         )
                         self._saw_value_return = True
+                        self._record_terminator(
+                            block.start,
+                            "tail_call",
+                            tail_call=target_name,
+                            tail_call_address=target_function.address,
+                            text=tuple(lines),
+                        )
                 else:
                     lines.append(f"goto {self._branch_target(last.branch_target)};")
+                    self._record_terminator(
+                        block.start,
+                        "branch",
+                        true_target=last.branch_target,
+                        targets=(last.branch_target,),
+                        text=tuple(lines),
+                    )
             else:
                 indirect = (
                     self._read_operand(state, decoded.operands[0], last)
@@ -6162,6 +6398,12 @@ class SemanticDecompiler:
                     else _var("computed_target", self.bits)
                 )
                 lines.append(f"goto *({self._render(indirect)});")
+                self._record_terminator(
+                    block.start,
+                    "branch_indirect",
+                    indirect=indirect,
+                    text=tuple(lines),
+                )
             return lines
 
         successors = [
@@ -6169,11 +6411,36 @@ class SemanticDecompiler:
         ]
         if successors:
             lines.append(f"goto loc_{successors[0]:X};")
+            self._record_terminator(
+                block.start,
+                "fallthrough",
+                true_target=successors[0],
+                targets=tuple(successors),
+                text=tuple(lines),
+            )
         elif last.next_address in self._block_by_start:
             lines.append(f"goto loc_{last.next_address:X};")
+            self._record_terminator(
+                block.start,
+                "fallthrough",
+                true_target=last.next_address,
+                targets=(last.next_address,),
+                text=tuple(lines),
+            )
         elif not last.is_return:
             lines.append("/* recovered control flow ends here */")
+            self._record_terminator(block.start, "none", text=tuple(lines))
+        else:
+            self._record_terminator(block.start, "return", text=())
         return lines
+
+    def _record_terminator(self, block_start: int, kind: str, **fields) -> None:
+        """Store the structured counterpart of a block's branch instructions."""
+        if self._terminators is None:
+            return
+        self._terminators[block_start] = TerminatorRecord(
+            kind=kind, block=block_start, **fields
+        )
 
     def _branch_target(self, address: int) -> str:
         if address in self._block_by_start:
@@ -7086,11 +7353,23 @@ class SemanticDecompiler:
             state.pending_pushes.clear()
 
     def _render(self, expression: _Expr) -> str:
-        """Render the common expression IR through structured C AST nodes."""
+        """Render the common expression IR through structured C AST nodes.
+
+        The rendered text is also indexed in ``_render_catalog`` so the
+        Ghidra-style printer (``printdoc``/``printc``) can re-associate a
+        statement's expression text with the AST node that produced it.
+        Rendering itself follows the typed C AST path, with the previous
+        textual renderer kept as ``_render_legacy`` fallback.
+        """
         node = self._expression_ast(expression)
         if node is not None:
-            return self._c_emitter.emit_expression(node)
-        return self._render_legacy(expression)
+            text = self._c_emitter.emit_expression(node)
+        else:
+            text = self._render_legacy(expression)
+        catalog = self._render_catalog
+        if catalog is not None:
+            catalog.setdefault(text, expression)
+        return text
 
     def _expression_child_ast(self, expression: _Expr):
         node = self._expression_ast(expression)
@@ -7657,6 +7936,11 @@ class SemanticDecompiler:
                 CBinary(">=", amount, CInteger(16)), CInteger(0), shifted
             )
         return None
+
+
+    def _render_expression(self, expression: _Expr) -> str:
+        """Alias of the legacy textual renderer kept for the printer."""
+        return self._render_legacy(expression)
 
     def _render_legacy(self, expression: _Expr) -> str:
         kind = expression.kind
@@ -8708,7 +8992,8 @@ class SemanticDecompiler:
             inference_evidence=tuple(sorted(inference_evidence)),
         )
 
-    def _local_declarations(self, body: list[str]) -> list[str]:
+    def _local_declaration_specs(self, body: list[str]) -> list[tuple[str, str]]:
+        """Recover ``(name, type_name)`` pairs for the function's local symbols."""
         names: set[str] = set()
         patterns = (
             r"\b(call_result_[0-9A-F]+)\b",
@@ -8733,7 +9018,7 @@ class SemanticDecompiler:
             for pattern in patterns:
                 names.update(re.findall(pattern, line))
         names = {name for name in names if not re.fullmatch(r"param_\d+", name)}
-        declarations = []
+        declarations: list[tuple[str, str]] = []
         for name in sorted(names):
             if name == "__hidden_return" and self._declared_signature is not None:
                 type_name = f"{self._declared_signature.return_type} *"
@@ -8753,8 +9038,14 @@ class SemanticDecompiler:
                 type_name = "uint8_t"
             else:
                 type_name = _unsigned_type(self.bits)
-            declarations.append(f"{type_name} {name};")
+            declarations.append((name, type_name))
         return declarations
+
+    def _local_declarations(self, body: list[str]) -> list[str]:
+        return [
+            f"{type_name} {name};"
+            for name, type_name in self._local_declaration_specs(body)
+        ]
 
     def _call_is_noreturn(self, instruction: Instruction) -> bool:
         try:
@@ -9629,6 +9920,32 @@ def _signed_type(bits: int) -> str:
         return "__int128"
     width = next(width for width in (8, 16, 32, 64) if bits <= width)
     return f"int{width}_t"
+
+
+_STATEMENT_ADDRESS = re.compile(r"^/\* (0x[0-9a-fA-F]+) \*/ ")
+
+
+def _strip_terminator_lines(lines: list[str], terminator) -> list[str]:
+    """Drop the rendered branch lines; the printer uses the structured record."""
+    if terminator is None or not terminator.text:
+        return list(lines)
+    result = list(lines)
+    pending = list(terminator.text)
+    while pending and result and result[-1].strip() == pending[-1].strip():
+        result.pop()
+        pending.pop()
+    return result
+
+
+def _parse_statement_line(line: str) -> StatementRecord:
+    """Split a rendered statement line into its text and source address."""
+    text = line.strip()
+    address = None
+    match = _STATEMENT_ADDRESS.match(text)
+    if match is not None:
+        address = int(match.group(1), 16)
+        text = text[match.end() :]
+    return StatementRecord(text=text, address=address)
 
 
 def _parameter_declaration(parameter: FunctionParameter) -> str:

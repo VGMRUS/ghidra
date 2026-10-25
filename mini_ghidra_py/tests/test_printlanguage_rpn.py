@@ -16,7 +16,7 @@ from minighidra.c_ast import (
     CUnary,
     parse_c_type_name,
 )
-from minighidra.printlanguage import (
+from minighidra.printlanguage_rpn import (
     OpToken,
     OpTokenKind,
     PcodeSymbolResolver,

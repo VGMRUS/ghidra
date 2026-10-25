@@ -27,6 +27,11 @@ HELP_TEXT = """Comandos disponibles:
   function <direccion|nombre>       desensamblar una función
   disasm [direccion] [cantidad]     desensamblar desde una dirección
   pseudo <direccion|nombre>         pseudocódigo semántico x86/x64 (experimental)
+  emit <direccion|nombre> [opciones]  emisión completa con el motor Emit/PrintC de Ghidra
+                                    --markup (XML <clang_document>), --flat, --width N,
+                                    --indent N, --no-casts, --hex|--dec|--best,
+                                    --comments c|cplusplus, --brace same_line|next_line|skip_line,
+                                    --labels goto|join|none, --no-convention, --output archivo
   graph <funcion> [archivo.dot]     grafo CFG en formato Graphviz DOT
   strings [filtro] [cantidad]       cadenas ASCII y UTF-16LE
   imports | exports | symbols [filtro]
@@ -92,6 +97,8 @@ class Console:
             self._disasm(rest)
         elif command in {"pseudo", "decompile"}:
             self._pseudo(rest)
+        elif command in {"emit", "print", "printc"}:
+            self._emit(rest)
         elif command in {"graph", "cfg"}:
             self._graph(rest)
         elif command == "strings":
@@ -401,6 +408,97 @@ class Console:
             raise ValueError("Uso: pseudo <direccion|nombre>")
         function = self.analyzer.function_at(args[0])
         print(self.analyzer.pseudocode(function))
+
+    def _emit(self, args: list[str]) -> None:
+        """Emit a whole function through the ported Ghidra Emit/PrintC engine."""
+        if not args:
+            raise ValueError(
+                "Uso: emit <direccion|nombre> [--markup] [--flat] [--width N] "
+                "[--indent N] [--no-casts] [--hex|--dec|--best] "
+                "[--comments c|cplusplus] [--brace same_line|next_line|skip_line] "
+                "[--labels goto|join|none] [--no-convention] [--output archivo]"
+            )
+        options = {
+            "markup": False,
+            "flat": False,
+            "max_line_size": 100,
+            "indent_increment": 2,
+            "casts": True,
+            "integer_format": "best",
+            "comment_style": "c",
+            "brace": None,
+            "labels": "goto",
+            "convention": None,
+        }
+        output: Optional[Path] = None
+        positional: list[str] = []
+        index = 0
+        while index < len(args):
+            token = args[index]
+            index += 1
+            if token == "--markup":
+                options["markup"] = True
+            elif token == "--flat":
+                options["flat"] = True
+            elif token == "--no-casts":
+                options["casts"] = False
+            elif token == "--no-convention":
+                options["convention"] = False
+            elif token in ("--hex", "--dec", "--best"):
+                options["integer_format"] = token[2:]
+            elif token == "--width":
+                options["max_line_size"] = _positive_int(args, index, token)
+                index += 1
+            elif token == "--indent":
+                options["indent_increment"] = _positive_int(args, index, token)
+                index += 1
+            elif token == "--comments":
+                if index >= len(args):
+                    raise ValueError("--comments necesita c o cplusplus")
+                options["comment_style"] = args[index]
+                index += 1
+            elif token == "--brace":
+                if index >= len(args):
+                    raise ValueError(
+                        "--brace necesita same_line, next_line o skip_line"
+                    )
+                options["brace"] = args[index]
+                index += 1
+            elif token == "--labels":
+                if index >= len(args):
+                    raise ValueError("--labels necesita goto, join o none")
+                options["labels"] = args[index]
+                index += 1
+            elif token == "--output":
+                if index >= len(args):
+                    raise ValueError("--output necesita una ruta")
+                output = Path(args[index]).expanduser().resolve()
+                index += 1
+            elif token.startswith("--"):
+                raise ValueError(f"Opción desconocida: {token}")
+            else:
+                positional.append(token)
+        if len(positional) != 1:
+            raise ValueError("Uso: emit <direccion|nombre> [opciones]")
+        function = self.analyzer.function_at(positional[0])
+        text = self.analyzer.print_function(
+            function,
+            markup=options["markup"],
+            max_line_size=options["max_line_size"],
+            indent_increment=options["indent_increment"],
+            flat=options["flat"],
+            comment_style=options["comment_style"],
+            integer_format=options["integer_format"],
+            casts=options["casts"],
+            convention=options["convention"],
+            brace=options["brace"],
+            labels=options["labels"],
+        )
+        if output is not None:
+            output.write_text(text, encoding="utf-8")
+            print(f"Emisión guardada en {output}")
+        else:
+            print(text)
 
     def _graph(self, args: list[str]) -> None:
         if not 1 <= len(args) <= 2:
@@ -768,6 +866,19 @@ def _parse_int(value: str) -> int:
         return int(value, 0)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"dirección no válida: {value}") from exc
+
+
+def _positive_int(args: list[str], index: int, option: str) -> int:
+    """Read the integer argument of a console option such as ``--width``."""
+    if index >= len(args):
+        raise ValueError(f"{option} necesita un número entero positivo")
+    try:
+        value = int(args[index], 0)
+    except ValueError as exc:
+        raise ValueError(f"{option} necesita un número entero positivo") from exc
+    if value < 1:
+        raise ValueError(f"{option} necesita un número entero positivo")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:

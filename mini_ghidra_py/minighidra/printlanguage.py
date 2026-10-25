@@ -1,1460 +1,1158 @@
-"""RPN-based C token emission modeled on Ghidra's PrintLanguage/PrintC.
+"""Port of Ghidra's ``printlanguage.hh``/``printlanguage.cc`` base printer.
 
-Ghidra's C renderer does not first build a source-level C expression tree. It
-pushes operators and atoms while walking p-code, then resolves precedence and
-parentheses with a reverse-polish operator stack. MiniGhidraPy retains a Python
-C AST path and also exposes a direct walk from its SSA-linked SLEIGH operations;
-both paths feed the same token stack, with explicit generic fallbacks for
-untranslated opcodes.
+:class:`PrintLanguage` owns the pieces every high-level language back-end needs:
+
+* the Reverse Polish Notation (RPN) stack that turns a data-flow/expression tree
+  into a correctly parenthesised token stream (:meth:`PrintLanguage.push_op`,
+  :meth:`PrintLanguage.push_atom`, :meth:`PrintLanguage.recurse`,
+  :meth:`PrintLanguage.parentheses`, :meth:`PrintLanguage.emit_op`),
+* :class:`OpToken`, the description of a language operator (printed characters,
+  stage, precedence, associativity, spacing, line-break bump and the token that
+  represents its negation),
+* the printing *modification* stack (``force_hex``, ``comma_separate``,
+  ``no_branch``, ``flat``, ``negatetoken``, ...) and the symbol *scope* stack,
+* comment emission (:meth:`PrintLanguage.emit_line_comment`) including the
+  ``{@...}`` annotation tokens and the comment fill characters,
+* integer/float formatting helpers (:meth:`PrintLanguage.most_natural_base`,
+  :meth:`PrintLanguage.format_binary`) and unicode escaping rules.
+
+Ghidra walks ``Varnode``/``PcodeOp`` data-flow.  MiniGhidraPy's decompiler
+backend keeps its own expression AST, so the pending-node queue holds AST nodes
+instead of ``Varnode`` pointers and :meth:`PrintLanguage.recurse` dispatches on
+``node.kind`` through :meth:`PrintLanguage.push_ast_node` /
+:meth:`PrintLanguage.push_node_explicit`, which play the roles of
+``TypeOp::push`` and ``pushVnExplicit``.
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
-from html import escape as html_escape
-import re
-from typing import TYPE_CHECKING, Iterable, Mapping, TypeAlias
+from enum import IntEnum
+from typing import Any, Optional
 
-from .c_ast import (
-    CBinary,
-    CCall,
-    CCharacter,
-    CCast,
-    CCompoundLiteral,
-    CConditional,
-    CExpression,
-    CFloat,
-    CIdentifier,
-    CIndex,
-    CInteger,
-    CMember,
-    CParenthesized,
-    CRawExpression,
-    CSizeof,
-    CString,
-    CUnary,
-    CTypeName,
+from .emit import (
+    Emit,
+    EmitError,
+    EmitPrettyPrint,
+    SyntaxHighlight,
 )
 
-if TYPE_CHECKING:
-    from .c_ast import CEmitter
-    from .sleigh import SleighVarnode
-    from .ssa import SSAFunction, SSAOperand, SSAOperation, SSAValue
+
+class Modifier(IntEnum):
+    """``PrintLanguage::modifiers`` -- context sensitive printing modifiers."""
+
+    force_hex = 1
+    force_dec = 2
+    bestfit = 4
+    force_scinote = 8
+    force_pointer = 0x10
+    print_load_value = 0x20
+    print_store_value = 0x40
+    no_branch = 0x80
+    only_branch = 0x100
+    comma_separate = 0x200
+    flat = 0x400
+    falsebranch = 0x800
+    nofallthru = 0x1000
+    negatetoken = 0x2000
+    hide_thisparam = 0x4000
+    pending_brace = 0x8000
 
 
-class OpTokenKind(Enum):
-    """Operator forms represented by Ghidra's ``OpToken::tokentype``."""
+class TagType(IntEnum):
+    """``PrintLanguage::tagtype`` -- the possible kinds of :class:`Atom`."""
 
-    BINARY = "binary"
-    UNARY_PREFIX = "unary_prefix"
-    POST_SURROUND = "postsurround"
-    PRE_SURROUND = "presurround"
-    SPACE = "space"
-    HIDDEN_FUNCTION = "hiddenfunction"
-    POSTFIX = "postfix"
-    CONDITIONAL = "conditional"
-    GROUP = "group"
+    syntax = 0
+    vartoken = 1
+    functoken = 2
+    optoken = 3
+    typetoken = 4
+    fieldtoken = 5
+    bitfieldtoken = 6
+    casetoken = 7
+    blanktoken = 8
 
 
-@dataclass(frozen=True, slots=True)
+class NamespaceStrategy(IntEnum):
+    """``PrintLanguage::namespace_strategy``."""
+
+    MINIMAL_NAMESPACES = 0
+    NO_NAMESPACES = 1
+    ALL_NAMESPACES = 2
+
+
+class OpTokenType(IntEnum):
+    """``OpToken::tokentype``."""
+
+    binary = 0
+    unary_prefix = 1
+    postsurround = 2
+    presurround = 3
+    space = 4
+    hiddenfunction = 5
+
+
+class CommentType(IntEnum):
+    """Subset of Ghidra's ``Comment::comment_type`` used by the printers."""
+
+    warning = 1
+    warningheader = 2
+    user1 = 4
+    user2 = 8
+    user3 = 0x10
+    header = 0x20
+    body = warning | user1 | user2 | user3
+
+
+@dataclass
 class OpToken:
-    """Printing and precedence metadata for one language operator."""
+    """A token representing an operator in the high-level language."""
 
     print1: str
     print2: str = ""
-    stage: int = 2
+    stage: int = 0
     precedence: int = 0
     associative: bool = False
-    kind: OpTokenKind = OpTokenKind.BINARY
+    type: OpTokenType = OpTokenType.binary
     spacing: int = 0
     bump: int = 0
-    name: str = ""
-    force_parentheses: bool = False
-
-    def __post_init__(self) -> None:
-        if self.stage < 1:
-            raise ValueError("an operator token must consume at least one stage")
-        if self.spacing < 0 or self.bump < 0:
-            raise ValueError("operator spacing and bump must be non-negative")
+    negate: Optional["OpToken"] = None
 
 
-@dataclass(frozen=True, slots=True)
-class PrintToken:
-    """One output token (the Python counterpart of Ghidra's ``Atom``)."""
+@dataclass
+class Atom:
+    """A single non-operator token emitted by the decompiler."""
 
-    text: str
-    kind: str = "syntax"
-    metadata: object | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PcodeTokenMetadata:
-    """Source coordinates retained for a p-code-derived output token."""
-
-    address: int | None = None
-    sequence: int | None = None
-    opcode: str | None = None
-    space: str | None = None
-    offset: int | None = None
-    size: int | None = None
-    symbol: str | None = None
+    name: str
+    type: TagType
+    highlight: SyntaxHighlight
+    op: Any = None
+    varnode: Any = None
+    function: Any = None
+    datatype: Any = None
+    offset: int = 0
+    int_value: int = 0
 
 
-@dataclass(frozen=True, slots=True)
-class PcodeExpression:
-    """A tiny expression node that keeps p-code dispatch separate from C AST."""
-
-    token: OpToken
-    children: tuple[PrintToken | PcodeExpression, ...]
-    metadata: PcodeTokenMetadata | None = None
-
-
-@dataclass(slots=True)
+@dataclass
 class ReversePolish:
-    """An active operator entry mirroring ``PrintLanguage::ReversePolish``."""
+    """An entry on the reverse polish notation (RPN) stack."""
 
-    token: OpToken
+    tok: OpToken
     visited: int = 0
-    parenthesized: bool = False
-    metadata: PcodeTokenMetadata | None = None
+    paren: bool = False
+    op: Any = None
+    id: int = 0
+    id2: int = 0
 
 
-class RpnTokenStack:
-    """Incremental precedence-aware token emitter using an operator stack."""
+@dataclass
+class NodePending:
+    """A pending data-flow node waiting to be placed on the RPN stack."""
 
-    def __init__(self) -> None:
-        self.stack: list[ReversePolish] = []
-        self.tokens: list[PrintToken] = []
-        self.push_trace: list[tuple[str, str]] = []
+    node: Any
+    op: Any
+    nodemod: int
 
-    @property
-    def depth(self) -> int:
-        return len(self.stack)
 
-    @property
-    def source(self) -> str:
-        return "".join(token.text for token in self.tokens)
+@dataclass(frozen=True)
+class Comment:
+    """A comment attached to an address, mirroring Ghidra's ``Comment``."""
 
-    def clear(self) -> None:
-        self.stack.clear()
-        self.tokens.clear()
-        self.push_trace.clear()
+    type: int
+    address: Any
+    text: str
+    emitted: bool = False
 
-    def push_operator(
-        self,
-        token: OpToken,
-        *,
-        metadata: PcodeTokenMetadata | None = None,
-    ) -> None:
-        if self.stack:
-            previous = self.stack[-1].token
-            self._emit_operator(self.stack[-1])
-            parenthesized = token.force_parentheses or self._parentheses(token)
-            if (
-                not parenthesized
-                and previous.kind is OpTokenKind.UNARY_PREFIX
-                and token.kind is OpTokenKind.UNARY_PREFIX
-                and previous.print1 + token.print1 in {"++", "--", "&&"}
-            ):
-                self._spaces(1)
+    def set_emitted(self, val: bool) -> None:
+        object.__setattr__(self, "emitted", val)
+
+
+def mostsigbit_set(val: int) -> int:
+    """Index of the most significant set bit, or -1 (``mostsigbit_set``)."""
+    if val == 0:
+        return -1
+    return val.bit_length() - 1
+
+
+class PrintLanguageCapability:
+    """Registry entry for a high-level language back-end."""
+
+    thelist: list["PrintLanguageCapability"] = []
+
+    def __init__(self, name: str, factory, isdefault: bool = False) -> None:
+        self.name = name
+        self.factory = factory
+        self.isdefault = isdefault
+        self.initialize()
+
+    def initialize(self) -> None:
+        if self.isdefault:
+            PrintLanguageCapability.thelist.insert(0, self)
         else:
-            parenthesized = token.force_parentheses
-        if parenthesized:
-            self._append("(", "punctuation", metadata)
-        self.stack.append(
-            ReversePolish(token, parenthesized=parenthesized, metadata=metadata)
-        )
-        self.push_trace.append(("operator", token.name or token.print1))
+            PrintLanguageCapability.thelist.append(self)
 
-    def push_atom(self, atom: PrintToken | str) -> None:
-        if isinstance(atom, str):
-            atom = PrintToken(atom)
-        self.push_trace.append(("atom", atom.text))
-        if not self.stack:
-            self._emit_atom(atom)
-            return
+    def build_language(self, arch: Any) -> "PrintLanguage":
+        return self.factory(arch, self.name)
 
-        self._emit_operator(self.stack[-1])
-        self._emit_atom(atom)
-        while self.stack:
-            entry = self.stack[-1]
-            entry.visited += 1
-            if entry.visited != entry.token.stage:
-                break
-            self._emit_operator(entry)
-            if entry.parenthesized:
-                self._append(")", "punctuation", entry.metadata)
-            self.stack.pop()
+    @classmethod
+    def get_default(cls) -> "PrintLanguageCapability":
+        if not cls.thelist:
+            raise EmitError("No print languages registered")
+        return cls.thelist[0]
 
-    def finish(self) -> str:
-        if self.stack:
-            pending = ", ".join(
-                entry.token.name or entry.token.print1 or entry.token.kind.value
-                for entry in self.stack
-            )
-            raise ValueError(f"unfinished RPN operator stack: {pending}")
-        return self.source
+    @classmethod
+    def find_capability(cls, name: str) -> Optional["PrintLanguageCapability"]:
+        for plc in cls.thelist:
+            if plc.name == name:
+                return plc
+        return None
 
-    def _append(
-        self,
-        text: str,
-        kind: str,
-        metadata: PcodeTokenMetadata | None = None,
+
+class PrintLanguage(ABC):
+    """Base class API for emitting a high-level language."""
+
+    OPEN_PAREN = "("
+    CLOSE_PAREN = ")"
+
+    # Re-exported so callers can write PrintLanguage.force_hex like the C++ enum.
+    force_hex = Modifier.force_hex.value
+    force_dec = Modifier.force_dec.value
+    bestfit = Modifier.bestfit.value
+    force_scinote = Modifier.force_scinote.value
+    force_pointer = Modifier.force_pointer.value
+    print_load_value = Modifier.print_load_value.value
+    print_store_value = Modifier.print_store_value.value
+    no_branch = Modifier.no_branch.value
+    only_branch = Modifier.only_branch.value
+    comma_separate = Modifier.comma_separate.value
+    flat = Modifier.flat.value
+    falsebranch = Modifier.falsebranch.value
+    nofallthru = Modifier.nofallthru.value
+    negatetoken = Modifier.negatetoken.value
+    hide_thisparam = Modifier.hide_thisparam.value
+    pending_brace = Modifier.pending_brace.value
+
+    syntax = TagType.syntax
+    vartoken = TagType.vartoken
+    functoken = TagType.functoken
+    optoken = TagType.optoken
+    typetoken = TagType.typetoken
+    fieldtoken = TagType.fieldtoken
+    bitfieldtoken = TagType.bitfieldtoken
+    casetoken = TagType.casetoken
+    blanktoken = TagType.blanktoken
+
+    MINIMAL_NAMESPACES = NamespaceStrategy.MINIMAL_NAMESPACES
+    NO_NAMESPACES = NamespaceStrategy.NO_NAMESPACES
+    ALL_NAMESPACES = NamespaceStrategy.ALL_NAMESPACES
+
+    def __init__(self, arch: Any, name: str) -> None:
+        self.arch = arch
+        self.cast_strategy: Any = None
+        self.name = name
+        self.curscope: Any = None
+        self.emit: Emit = EmitPrettyPrint()
+        self.modstack: list[int] = []
+        self.scopestack: list[Any] = []
+        self.revpol: list[ReversePolish] = []
+        self.nodepend: list[NodePending] = []
+        self.pending = 0
+        self.reset_defaults_internal()
+
+    # -- configuration ---------------------------------------------------
+    def set_line_comment_indent(self, val: int) -> None:
+        if val < 0 or val >= self.emit.get_max_line_size():
+            raise EmitError("Bad comment indent value")
+        self.line_commentindent = val
+
+    def set_comment_delimeter(
+        self, start: str, stop: str, usecommentfill: bool
     ) -> None:
-        if text:
-            self.tokens.append(PrintToken(text, kind, metadata))
+        self.commentstart = start
+        self.commentend = stop
+        if usecommentfill:
+            self.emit.set_comment_fill(start)
+        else:
+            self.emit.set_comment_fill(" " * len(start))
 
-    def _spaces(
-        self, count: int, metadata: PcodeTokenMetadata | None = None
-    ) -> None:
-        self._append(" " * count, "space", metadata)
+    def set_output_stream(self, stream) -> None:
+        self.emit.set_output_stream(stream)
 
-    def _emit_atom(self, atom: PrintToken) -> None:
-        if atom.text:
-            self.tokens.append(atom)
+    def get_output_stream(self):
+        return self.emit.get_output_stream()
 
-    def _emit_operator(self, entry: ReversePolish) -> None:
-        token = entry.token
-        metadata = entry.metadata
-        visited = entry.visited
-        if token.kind is OpTokenKind.BINARY:
-            if visited != 1:
-                return
-            self._spaces(token.spacing, metadata)
-            self._append(token.print1, "operator", metadata)
-            self._spaces(token.spacing, metadata)
-        elif token.kind is OpTokenKind.UNARY_PREFIX:
-            if visited != 0:
-                return
-            self._append(token.print1, "operator", metadata)
-            self._spaces(token.spacing, metadata)
-        elif token.kind is OpTokenKind.POST_SURROUND:
-            if visited == 0:
-                return
-            if visited == 1:
-                self._spaces(token.spacing, metadata)
-                self._append(token.print1, "punctuation", metadata)
-                self._spaces(0, metadata)
+    def set_max_line_size(self, val: int) -> None:
+        self.emit.set_max_line_size(val)
+
+    def get_max_line_size(self) -> int:
+        return self.emit.get_max_line_size()
+
+    def set_indent_increment(self, val: int) -> None:
+        self.emit.set_indent_increment(val)
+
+    def get_indent_increment(self) -> int:
+        return self.emit.get_indent_increment()
+
+    def get_line_comment_indent(self) -> int:
+        return self.line_commentindent
+
+    def get_instruction_comment(self) -> int:
+        return self.instr_comment_type
+
+    def set_instruction_comment(self, val: int) -> None:
+        self.instr_comment_type = val
+
+    def get_header_comment(self) -> int:
+        return self.head_comment_type
+
+    def set_header_comment(self, val: int) -> None:
+        self.head_comment_type = val
+
+    def set_namespace_strategy(self, strat: NamespaceStrategy) -> None:
+        self.namespc_strategy = strat
+
+    def emits_markup(self) -> bool:
+        return self.emit.emits_markup()
+
+    def set_markup(self, val: bool) -> None:
+        self.emit.set_markup(val)
+
+    def set_packed_output(self, val: bool) -> None:
+        self.emit.set_packed_output(val)
+
+    def set_flat(self, val: bool) -> None:
+        if val:
+            self.mods |= Modifier.flat.value
+        else:
+            self.mods &= ~Modifier.flat.value
+
+    # -- printing context ------------------------------------------------
+    def is_set(self, m: int) -> bool:
+        return (self.mods & m) != 0
+
+    def push_scope(self, sc: Any) -> None:
+        self.scopestack.append(sc)
+        self.curscope = sc
+
+    def pop_scope(self) -> None:
+        self.scopestack.pop()
+        self.curscope = self.scopestack[-1] if self.scopestack else None
+
+    def push_mod(self) -> None:
+        self.modstack.append(self.mods)
+
+    def pop_mod(self) -> None:
+        self.mods = self.modstack[-1]
+        self.modstack.pop()
+
+    def set_mod(self, m: int) -> None:
+        self.mods |= m
+
+    def unset_mod(self, m: int) -> None:
+        self.mods &= ~m
+
+    def is_stack_empty(self) -> bool:
+        return not self.nodepend and not self.revpol
+
+    def is_mod_stack_empty(self) -> bool:
+        return not self.modstack
+
+    # -- RPN machinery ---------------------------------------------------
+    def push_op(self, tok: OpToken, op: Any = None) -> None:
+        """Push an operator token onto the RPN stack."""
+        if self.pending < len(self.nodepend):
+            self.recurse()
+
+        if not self.revpol:
+            paren = False
+            id = self.emit.open_group()
+        else:
+            self.emit_op(self.revpol[-1])
+            paren = self.parentheses(tok)
+            if paren:
+                id = self.emit.open_paren(self.OPEN_PAREN)
             else:
-                self._append(token.print2, "punctuation", metadata)
-        elif token.kind is OpTokenKind.PRE_SURROUND:
-            if visited == 0:
-                self._append(token.print1, "punctuation", metadata)
-            elif visited != 2:
-                self._append(token.print2, "punctuation", metadata)
-                self._spaces(token.spacing, metadata)
-        elif token.kind is OpTokenKind.SPACE:
-            if visited == 1:
-                self._spaces(token.spacing, metadata)
-        elif token.kind is OpTokenKind.HIDDEN_FUNCTION:
-            return
-        elif token.kind is OpTokenKind.POSTFIX:
-            if visited == 1:
-                self._spaces(token.spacing, metadata)
-                self._append(token.print1, "operator", metadata)
-        elif token.kind is OpTokenKind.CONDITIONAL:
-            if visited == 1:
-                self._spaces(token.spacing, metadata)
-                self._append("?", "operator", metadata)
-                self._spaces(token.spacing, metadata)
-            elif visited == 2:
-                self._spaces(token.spacing, metadata)
-                self._append(":", "operator", metadata)
-                self._spaces(token.spacing, metadata)
-        elif token.kind is OpTokenKind.GROUP:
-            return
+                id = self.emit.open_group()
+        self.revpol.append(
+            ReversePolish(tok=tok, visited=0, paren=paren, op=op, id=id, id2=0)
+        )
 
-    def _parentheses(self, new_token: OpToken) -> bool:
-        top = self.stack[-1]
-        current = top.token
-        stage = top.visited
+    def push_atom(self, atom: Atom) -> None:
+        """Push a single token (an Atom) onto the RPN stack."""
+        if self.pending < len(self.nodepend):
+            self.recurse()
 
-        if current.kind in {OpTokenKind.SPACE, OpTokenKind.BINARY}:
-            if current.precedence > new_token.precedence:
-                return True
-            if current.precedence < new_token.precedence:
-                return False
-            if current.associative and current is new_token:
-                return False
-            if (
-                new_token.kind is OpTokenKind.POST_SURROUND
-                and stage == 0
-            ):
-                return False
-            return True
-        if current.kind is OpTokenKind.UNARY_PREFIX:
-            if current.precedence > new_token.precedence:
-                return True
-            if current.precedence < new_token.precedence:
-                return False
-            return new_token.kind not in {
-                OpTokenKind.UNARY_PREFIX,
-                OpTokenKind.PRE_SURROUND,
-            }
-        if current.kind is OpTokenKind.POST_SURROUND:
-            if stage == 1:
-                return False
-            if current.precedence > new_token.precedence:
-                return True
-            if current.precedence < new_token.precedence:
-                return False
-            return new_token.kind not in {
-                OpTokenKind.POST_SURROUND,
-                OpTokenKind.BINARY,
-            }
-        if current.kind is OpTokenKind.PRE_SURROUND:
-            if stage == 0:
-                return False
-            if current.precedence > new_token.precedence:
-                return True
-            if current.precedence < new_token.precedence:
-                return False
-            return new_token.kind not in {
-                OpTokenKind.UNARY_PREFIX,
-                OpTokenKind.PRE_SURROUND,
-            }
-        if current.kind is OpTokenKind.HIDDEN_FUNCTION:
-            if stage == 0 and len(self.stack) > 1:
-                previous = self.stack[-2].token
-                if previous.kind not in {
-                    OpTokenKind.BINARY,
-                    OpTokenKind.UNARY_PREFIX,
-                }:
-                    return False
-                if previous.precedence < new_token.precedence:
-                    return False
-            return True
-        if current.kind is OpTokenKind.CONDITIONAL:
-            if current.precedence > new_token.precedence:
-                return True
-            if current.precedence < new_token.precedence:
-                return False
-            # C's false arm is right-associative; a nested condition is not.
-            return not (
-                stage == 2 and new_token.kind is OpTokenKind.CONDITIONAL
+        if not self.revpol:
+            self.emit_atom(atom)
+        else:
+            self.emit_op(self.revpol[-1])
+            self.emit_atom(atom)
+            while self.revpol:
+                top = self.revpol[-1]
+                top.visited += 1
+                if top.visited == top.tok.stage:
+                    self.emit_op(self.revpol[-1])
+                    if self.revpol[-1].paren:
+                        self.emit.close_paren(self.CLOSE_PAREN, self.revpol[-1].id)
+                    else:
+                        self.emit.close_group(self.revpol[-1].id)
+                    self.revpol.pop()
+                else:
+                    break
+
+    def push_node(self, node: Any, op: Any, m: int) -> None:
+        """Queue an expression node (``pushVn``).
+
+        Inputs of a single operator must be queued in reverse order, exactly as
+        the C++ code documents for ``pushVn``.
+        """
+        self.nodepend.append(NodePending(node, op, m))
+
+    def push_node_explicit(self, node: Any, op: Any) -> None:
+        """Push a leaf node (``pushVnExplicit``)."""
+        if node is None:
+            self.push_atom(Atom("", TagType.blanktoken, SyntaxHighlight.no_color))
+            return
+        if is_annotation(node):
+            self.push_annotation(node, op)
+            return
+        if is_constant(node):
+            ct = self.node_type_read_facing(node, op)
+            self.push_constant(
+                constant_value(node),
+                ct,
+                TagType.vartoken,
+                node,
+                op,
+                display_format(ct),
             )
-        if current.kind is OpTokenKind.GROUP:
-            return False
-        if current.kind is OpTokenKind.POSTFIX:
-            if current.precedence > new_token.precedence:
+            return
+        self.push_symbol_detail(node, op, True)
+
+    def push_symbol_detail(self, node: Any, op: Any, is_read: bool) -> None:
+        """Push tokens for a node known to match (part of) a symbol."""
+        symbol = node_symbol(node)
+        if symbol is None:
+            self.push_unnamed_location(
+                node_address(node), node_size(node), node, op
+            )
+            return
+        symboloff = node_symbol_offset(node)
+        if symboloff == -1:
+            if not symbol_needs_resolution(symbol):
+                self.push_symbol(symbol, node, op)
+                return
+            symboloff = 0
+        size = node_size(node)
+        if symboloff + size <= symbol_size(symbol):
+            inslot = node_slot(node, op) if is_read else -1
+            self.push_partial_symbol(symbol, symboloff, size, node, op, inslot, is_read)
+        else:
+            self.push_mismatch_symbol(symbol, symboloff, size, node, op)
+
+    def parentheses(self, op2: OpToken) -> bool:
+        """Decide whether ``op2`` needs parentheses inside the current token."""
+        top = self.revpol[-1]
+        top_token = top.tok
+        stage = top.visited
+        if top_token.type in (OpTokenType.space, OpTokenType.binary):
+            if top_token.precedence > op2.precedence:
                 return True
-            if current.precedence < new_token.precedence:
+            if top_token.precedence < op2.precedence:
                 return False
-            return new_token.kind not in {
-                OpTokenKind.POST_SURROUND,
-                OpTokenKind.BINARY,
-            }
+            if top_token.associative and top_token is op2:
+                return False
+            if op2.type == OpTokenType.postsurround and stage == 0:
+                return False
+            return True
+        if top_token.type == OpTokenType.unary_prefix:
+            if top_token.precedence > op2.precedence:
+                return True
+            if top_token.precedence < op2.precedence:
+                return False
+            if op2.type in (OpTokenType.unary_prefix, OpTokenType.presurround):
+                return False
+            return True
+        if top_token.type == OpTokenType.postsurround:
+            if stage == 1:
+                return False  # Inside the surround
+            if top_token.precedence > op2.precedence:
+                return True
+            if top_token.precedence < op2.precedence:
+                return False
+            if op2.type in (OpTokenType.postsurround, OpTokenType.binary):
+                return False
+            return True
+        if top_token.type == OpTokenType.presurround:
+            if stage == 0:
+                return False  # Inside the surround
+            if top_token.precedence > op2.precedence:
+                return True
+            if top_token.precedence < op2.precedence:
+                return False
+            if op2.type in (OpTokenType.unary_prefix, OpTokenType.presurround):
+                return False
+            return True
+        if top_token.type == OpTokenType.hiddenfunction:
+            if stage == 0 and len(self.revpol) > 1:
+                prev_token = self.revpol[-2].tok
+                if prev_token.type not in (
+                    OpTokenType.binary,
+                    OpTokenType.unary_prefix,
+                ):
+                    return False
+                if prev_token.precedence < op2.precedence:
+                    return False
+            return True
         return True
 
+    def emit_op(self, entry: ReversePolish) -> None:
+        """Send an operator token from the RPN stack to the emitter."""
+        tok = entry.tok
+        if tok.type == OpTokenType.binary:
+            if entry.visited != 1:
+                return
+            self.emit.spaces(tok.spacing, tok.bump)
+            self.emit.tag_op(tok.print1, SyntaxHighlight.no_color, entry.op)
+            self.emit.spaces(tok.spacing, tok.bump)
+        elif tok.type == OpTokenType.unary_prefix:
+            if entry.visited != 0:
+                return
+            self.emit.tag_op(tok.print1, SyntaxHighlight.no_color, entry.op)
+            self.emit.spaces(tok.spacing, tok.bump)
+        elif tok.type == OpTokenType.postsurround:
+            if entry.visited == 0:
+                return
+            if entry.visited == 1:
+                self.emit.spaces(tok.spacing, tok.bump)
+                entry.id2 = self.emit.open_paren(tok.print1)
+                self.emit.spaces(0, tok.bump)
+            else:
+                self.emit.close_paren(tok.print2, entry.id2)
+        elif tok.type == OpTokenType.presurround:
+            if entry.visited == 2:
+                return
+            if entry.visited == 0:
+                entry.id2 = self.emit.open_paren(tok.print1)
+            else:
+                self.emit.close_paren(tok.print2, entry.id2)
+                self.emit.spaces(tok.spacing, tok.bump)
+        elif tok.type == OpTokenType.space:
+            if entry.visited != 1:
+                return
+            self.emit.spaces(tok.spacing, tok.bump)
+        # hiddenfunction never directly prints anything
 
-# The values mirror the corresponding OpToken constants in printc.cc.
-_ASSIGNMENT_OPERATORS = frozenset(
-    {"=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "|=", "^="}
-)
-_BINARY_TOKENS: dict[str, OpToken] = {}
-for _operator, _precedence, _associative in (
-    ("*", 54, True),
-    ("/", 54, False),
-    ("%", 54, False),
-    ("+", 50, True),
-    ("-", 50, False),
-    ("<<", 46, False),
-    (">>", 46, False),
-    ("<", 42, False),
-    ("<=", 42, False),
-    (">", 42, False),
-    (">=", 42, False),
-    ("==", 38, False),
-    ("!=", 38, False),
-    ("&", 34, True),
-    ("^", 30, True),
-    ("|", 26, True),
-    ("&&", 22, False),
-    ("^^", 20, False),
-    ("||", 18, False),
-    ("=", 14, False),
-    ("*=", 14, False),
-    ("/=", 14, False),
-    ("%=", 14, False),
-    ("+=", 14, False),
-    ("-=", 14, False),
-    ("<<=", 14, False),
-    (">>=", 14, False),
-    ("&=", 14, False),
-    ("|=", 14, False),
-    ("^=", 14, False),
-    (",", 2, True),
-):
-    _BINARY_TOKENS[_operator] = OpToken(
-        _operator,
-        stage=2,
-        precedence=_precedence,
-        associative=_associative,
-        kind=OpTokenKind.BINARY,
-        spacing=0 if _operator == "," else 1,
-        bump=5 if _operator in _ASSIGNMENT_OPERATORS else 0,
-        name=_operator,
-    )
-
-_MEMBER_TOKENS = {
-    ".": OpToken(
-        ".", stage=2, precedence=66, associative=True, kind=OpTokenKind.BINARY, name="."
-    ),
-    "->": OpToken(
-        "->", stage=2, precedence=66, associative=True, kind=OpTokenKind.BINARY, name="->"
-    ),
-}
-
-_UNARY_PRECEDENCE = 62
-_POSTFIX_PRECEDENCE = 66
-_CALL_TOKEN = OpToken(
-    "(", ")", 2, 66, False, OpTokenKind.POST_SURROUND, 0, 10, "call"
-)
-_INDEX_TOKEN = OpToken(
-    "[", "]", 2, 66, False, OpTokenKind.POST_SURROUND, 0, 0, "index"
-)
-_CAST_TOKEN = OpToken(
-    "(", ")", 2, 62, False, OpTokenKind.PRE_SURROUND, 0, 0, "cast"
-)
-_CONDITIONAL_TOKEN = OpToken(
-    "?", ":", 3, 16, False, OpTokenKind.CONDITIONAL, 1, 0, "conditional"
-)
-
-
-_PendingExpression: TypeAlias = CExpression | PrintToken | PcodeExpression
-
-
-class PrintLanguageRpn:
-    """RPN token printer for C AST expressions and SSA-linked p-code values.
-
-    ``CEmitter(expression_mode="rpn")`` uses this class for both AST emission
-    and direct p-code operation/value rendering, without replacing the AST API.
-    """
-
-    def __init__(self, emitter: CEmitter) -> None:
-        self.emitter = emitter
-        self.stack = RpnTokenStack()
-        self._pending: list[_PendingExpression] = []
-
-    @property
-    def last_tokens(self) -> tuple[PrintToken, ...]:
-        return tuple(self.stack.tokens)
-
-    @property
-    def last_push_trace(self) -> tuple[tuple[str, str], ...]:
-        return tuple(self.stack.push_trace)
-
-    def emit_expression(self, expression: CExpression) -> str:
-        self.stack.clear()
-        self._pending.clear()
-        self._pending.append(expression)
-        self.recurse()
-        return self.stack.finish()
-
-    def emit_ssa_value(
-        self,
-        function: SSAFunction,
-        value_id: int,
-        *,
-        symbols: PcodeSymbolResolver | None = None,
-    ) -> str:
-        """Print a value by walking its SLEIGH ``PcodeOp``/``Varnode`` graph."""
-        builder = _PcodeExpressionBuilder(function, symbols or PcodeSymbolResolver())
-        return self._emit_pcode_node(builder.value(value_id))
-
-    def emit_ssa_operand(
-        self,
-        function: SSAFunction,
-        operand: SSAOperand,
-        *,
-        varnode: SleighVarnode | None = None,
-        symbols: PcodeSymbolResolver | None = None,
-    ) -> str:
-        """Render a whole p-code varnode operand, combining byte SSA slices."""
-        builder = _PcodeExpressionBuilder(function, symbols or PcodeSymbolResolver())
-        return self._emit_pcode_node(builder.operand(operand, varnode=varnode))
-
-    def emit_ssa_operation(
-        self,
-        function: SSAFunction,
-        operation: int | SSAOperation,
-        *,
-        symbols: PcodeSymbolResolver | None = None,
-        resolve_definitions: bool = True,
-    ) -> str:
-        """Dispatch one SSA-linked p-code operation, including opaque fallbacks."""
-        builder = _PcodeExpressionBuilder(
-            function,
-            symbols or PcodeSymbolResolver(),
-            resolve_definitions=resolve_definitions,
-        )
-        if isinstance(operation, int):
-            operation_index = operation
-            operation = next(
-                (item for item in function.operations if item.index == operation_index),
-                None,
+    def emit_atom(self, atom: Atom) -> None:
+        """Send the given Atom to the low-level emitter with its markup."""
+        if atom.type == TagType.syntax:
+            self.emit.print(atom.name, atom.highlight)
+        elif atom.type == TagType.vartoken:
+            self.emit.tag_variable(
+                atom.name, atom.highlight, atom.varnode, atom.op
             )
-            if operation is None:
-                raise KeyError(
-                    f"no SSA p-code operation with index {operation_index}"
-                )
-        return self._emit_pcode_node(builder.operation(operation))
+        elif atom.type == TagType.functoken:
+            self.emit.tag_func_name(
+                atom.name, atom.highlight, atom.function, atom.op
+            )
+        elif atom.type == TagType.optoken:
+            self.emit.tag_op(atom.name, atom.highlight, atom.op)
+        elif atom.type == TagType.typetoken:
+            self.emit.tag_type(atom.name, atom.highlight, atom.datatype)
+        elif atom.type == TagType.fieldtoken:
+            self.emit.tag_field(
+                atom.name, atom.highlight, atom.datatype, atom.offset, atom.op
+            )
+        elif atom.type == TagType.bitfieldtoken:
+            self.emit.tag_bit_field(
+                atom.name, atom.highlight, atom.datatype, atom.offset, atom.op
+            )
+        elif atom.type == TagType.casetoken:
+            self.emit.tag_case_label(
+                atom.name, atom.highlight, atom.op, atom.int_value
+            )
+        # blanktoken prints nothing
 
-    def _emit_pcode_node(self, expression: PcodeExpression | PrintToken) -> str:
-        self.stack.clear()
-        self._pending.clear()
-        self._pending.append(expression)
-        self.recurse()
-        return self.stack.finish()
+    @staticmethod
+    def unicode_needs_escape(codepoint: int) -> bool:
+        """Separate clearly printable codepoints from escaped ones."""
+        if codepoint < 0x20:  # C0 Control characters
+            return True
+        if codepoint < 0x7F:  # Printable ASCII
+            if codepoint in (92, ord('"'), ord("'")):
+                return True
+            return False
+        if codepoint < 0x100:
+            if codepoint > 0xA0:  # Printable codepoints A1-FF
+                return False
+            return True  # Delete + C1 Control characters
+        if codepoint >= 0x2FA20:  # Up to last currently defined language
+            return True
+        if codepoint < 0x2000:
+            if 0x180B <= codepoint <= 0x180E:
+                return True  # Mongolian separators
+            if codepoint == 0x61C:
+                return True  # arabic letter mark
+            if codepoint == 0x1680:
+                return True  # ogham space mark
+            return False
+        if codepoint < 0x3000:
+            if codepoint < 0x2010:
+                return True  # white space and separators
+            if 0x2028 <= codepoint <= 0x202F:
+                return True
+            if codepoint in (0x205F, 0x2060):
+                return True
+            if 0x2066 <= codepoint <= 0x206F:
+                return True  # bidirectional markers
+            return False
+        if codepoint < 0xE000:
+            if codepoint == 0x3000:
+                return True  # ideographic space
+            if codepoint >= 0xD7FC:
+                return True  # unassigned + surrogates
+            return False
+        if codepoint < 0xF900:
+            return True  # private use
+        if 0xFE00 <= codepoint <= 0xFE0F:
+            return True  # variation selectors
+        if codepoint == 0xFEFF:
+            return True  # zero width non-breaking space
+        if 0xFFF0 <= codepoint <= 0xFFFF:
+            if codepoint in (0xFFFC, 0xFFFD):
+                return False
+            return True  # interlinear specials
+        return False
 
-    def emit_html(self) -> str:
-        """Render the last token stream with semantic markup classes."""
-        chunks: list[str] = []
-        for token in self.stack.tokens:
-            text = html_escape(token.text, quote=False)
-            if token.kind in {"space", "blank"}:
-                chunks.append(text)
-                continue
-            kind = re.sub(r"[^a-z0-9_-]", "-", token.kind.lower()) or "syntax"
-            title = ""
-            if isinstance(token.metadata, PcodeTokenMetadata):
-                details = []
-                if token.metadata.opcode:
-                    details.append(token.metadata.opcode)
-                if token.metadata.address is not None:
-                    details.append(f"0x{token.metadata.address:x}")
-                if token.metadata.sequence is not None:
-                    details.append(f"seq {token.metadata.sequence}")
-                if details:
-                    title = f' title="{html_escape(", ".join(details), quote=True)}"'
-            chunks.append(f'<span class="pcode-{kind}"{title}>{text}</span>')
-        return "".join(chunks)
+    def escape_character_data(
+        self,
+        out,
+        buf: bytes,
+        count: int,
+        charsize: int,
+        bigend: bool,
+    ) -> bool:
+        """Emit a byte buffer as escaped unicode characters."""
+        i = 0
+        codepoint = 0
+        while i < count:
+            codepoint, skip = _get_codepoint(buf, i, count, charsize, bigend)
+            if codepoint == 0 or codepoint == -1:
+                break
+            self.print_unicode(out, codepoint)
+            i += skip
+        return codepoint == 0
 
     def recurse(self) -> None:
-        """Drain pending expression nodes in stack order, as ``PrintLanguage`` does."""
-        while self._pending:
-            expression = self._pending.pop()
-            if isinstance(expression, PrintToken):
-                self.stack.push_atom(expression)
-            elif isinstance(expression, PcodeExpression):
-                self.stack.push_operator(expression.token, metadata=expression.metadata)
-                self._queue_children(*expression.children)
+        """Emit any complete sub-expressions still on the RPN stack."""
+        modsave = self.mods
+        last_pending = self.pending
+        self.pending = len(self.nodepend)
+        while last_pending < self.pending:
+            entry = self.nodepend[-1]
+            node = entry.node
+            op = entry.op
+            self.mods = entry.nodemod
+            self.nodepend.pop()
+            self.pending -= 1
+            if is_implied(node):
+                if has_implied_field(node):
+                    self.push_implied_field(node, op)
+                else:
+                    self.push_ast_node(node, op)
             else:
-                self._push_expression(expression)
+                self.push_node_explicit(node, op)
+            self.pending = len(self.nodepend)
+        self.mods = modsave
 
-    def _queue_children(self, *children: _PendingExpression) -> None:
-        self._pending.extend(reversed(children))
+    def op_binary(self, tok: OpToken, node: Any) -> None:
+        """Push a binary operator plus both of its input expressions."""
+        if self.is_set(Modifier.negatetoken.value):
+            tok = tok.negate
+            self.unset_mod(Modifier.negatetoken.value)
+            if tok is None:
+                raise EmitError("Could not find fliptoken")
+        self.push_op(tok, node)
+        args = node_args(node)
+        # implied nodes are pushed in reverse order for efficiency
+        self.push_node(args[1], node, self.mods)
+        self.push_node(args[0], node, self.mods)
 
-    def _push_expression(self, expression: CExpression) -> None:
-        if isinstance(expression, CBinary):
-            token = _BINARY_TOKENS.get(expression.operator)
-            if token is None:
-                self.stack.push_atom(self._direct_atom(expression, "raw"))
-                return
-            self.stack.push_operator(token)
-            self._queue_children(expression.left, expression.right)
-            return
-        if isinstance(expression, CConditional):
-            self.stack.push_operator(_CONDITIONAL_TOKEN)
-            self._queue_children(
-                expression.condition, expression.if_true, expression.if_false
-            )
-            return
-        if isinstance(expression, CUnary):
-            if expression.postfix:
-                token = OpToken(
-                    expression.operator,
-                    stage=1,
-                    precedence=_POSTFIX_PRECEDENCE,
-                    kind=OpTokenKind.POSTFIX,
-                    name=f"post{expression.operator}",
+    def op_unary(self, tok: OpToken, node: Any) -> None:
+        """Push a unary operator plus its input expression."""
+        self.push_op(tok, node)
+        self.push_node(node_args(node)[0], node, self.mods)
+
+    def get_pending(self) -> int:
+        return self.pending
+
+    def reset_defaults_internal(self) -> None:
+        self.mods = 0
+        self.head_comment_type = CommentType.header | CommentType.warningheader
+        self.line_commentindent = 20
+        self.namespc_strategy = NamespaceStrategy.MINIMAL_NAMESPACES
+        self.instr_comment_type = CommentType.user2 | CommentType.warning
+
+    def emit_line_comment(self, indent: int, comm: Comment) -> None:
+        """Emit one comment line using the language's delimiters."""
+        text = comm.text
+        address = comm.address
+        spc = address_space(address)
+        off = address_offset(address)
+        if indent < 0:
+            indent = self.line_commentindent
+        self.emit.tag_line(indent)
+        id = self.emit.start_comment()
+        # The comment delimiters are not printed as comment tags, so that they
+        # won't get filled.
+        self.emit.tag_comment(self.commentstart, SyntaxHighlight.comment_color, spc, off)
+        pos = 0
+        while pos < len(text):
+            tok = text[pos]
+            pos += 1
+            if tok in (" ", "\t"):
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    if tok not in (" ", "\t"):
+                        break
+                    count += 1
+                    pos += 1
+                self.emit.spaces(count)
+            elif tok == "\n":
+                self.emit.tag_line()
+            elif tok == "\r":
+                continue
+            elif tok == "{" and pos < len(text) and text[pos] == "@":
+                # Comment annotation: treat as a single token
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    count += 1
+                    pos += 1
+                    if tok == "}":
+                        break
+                annote = text[pos - count : pos]
+                self.emit.tag_comment(
+                    annote, SyntaxHighlight.comment_color, spc, off
                 )
             else:
-                token = OpToken(
-                    expression.operator,
-                    stage=1,
-                    precedence=_UNARY_PRECEDENCE,
-                    kind=OpTokenKind.UNARY_PREFIX,
-                    name=f"pre{expression.operator}",
-                )
-            self.stack.push_operator(token)
-            self._queue_children(expression.operand)
-            return
-        if isinstance(expression, CParenthesized):
-            token = OpToken(
-                "(",
-                ")",
-                stage=1,
-                precedence=100,
-                kind=OpTokenKind.GROUP,
-                name="explicit-group",
-                force_parentheses=True,
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    if tok.isspace():
+                        break
+                    count += 1
+                    pos += 1
+                sub = text[pos - count : pos]
+                self.emit.tag_comment(sub, SyntaxHighlight.comment_color, spc, off)
+        if len(self.commentend) != 0:
+            self.emit.tag_comment(
+                self.commentend, SyntaxHighlight.comment_color, spc, off
             )
-            self.stack.push_operator(token)
-            self._queue_children(expression.value)
-            return
-        if isinstance(expression, CCast):
-            self.stack.push_operator(_CAST_TOKEN)
-            type_name = self.emitter._direct_emitter._emit_type_name(
-                expression.type_name, expression.type_ast
-            )
-            self.stack.push_atom(PrintToken(type_name, "type", expression.type_ast))
-            self._queue_children(expression.value)
-            return
-        if isinstance(expression, CSizeof):
-            if isinstance(expression.operand, CTypeName):
-                operand = self.emitter._direct_emitter._emit_type_specifier(
-                    expression.operand
-                )
-                pending: _PendingExpression = PrintToken(
-                    operand, "type", expression.operand
-                )
-            else:
-                pending = expression.operand
-            token = OpToken(
-                f"{expression.operator}(",
-                ")",
-                stage=1,
-                precedence=_UNARY_PRECEDENCE,
-                kind=OpTokenKind.PRE_SURROUND,
-                name=expression.operator,
-            )
-            self.stack.push_operator(token)
-            self._queue_children(pending)
-            return
-        if isinstance(expression, CMember):
-            token = _MEMBER_TOKENS["->" if expression.pointer else "."]
-            self.stack.push_operator(token)
-            self._queue_children(
-                expression.value, PrintToken(expression.member, "field")
-            )
-            return
-        if isinstance(expression, CIndex):
-            self.stack.push_operator(_INDEX_TOKEN)
-            self._queue_children(expression.value, expression.index)
-            return
-        if isinstance(expression, CCall):
-            self.stack.push_operator(_CALL_TOKEN)
-            if expression.arguments:
-                arguments = expression.arguments[0]
-                for argument in expression.arguments[1:]:
-                    arguments = CBinary(",", arguments, argument)
-                self._queue_children(expression.function, arguments)
-            else:
-                self._queue_children(
-                    expression.function, PrintToken("", "blank")
-                )
-            return
-        if isinstance(expression, CCompoundLiteral):
-            self.stack.push_atom(self._direct_atom(expression, "literal"))
-            return
-        if isinstance(expression, CIdentifier):
-            self.stack.push_atom(PrintToken(expression.name, "identifier"))
-            return
-        if isinstance(expression, (CInteger, CFloat, CString, CCharacter)):
-            self.stack.push_atom(self._direct_atom(expression, "literal"))
-            return
-        if isinstance(expression, CRawExpression):
-            self.stack.push_atom(PrintToken(expression.source, "raw"))
-            return
-        self.stack.push_atom(self._direct_atom(expression, "raw"))
+        self.emit.stop_comment(id)
+        comm.set_emitted(True)
 
-    def _direct_atom(self, expression: CExpression, kind: str) -> PrintToken:
-        return PrintToken(
-            self.emitter._direct_emitter._emit_expression_direct(expression), kind
-        )
+    def reset_defaults(self) -> None:
+        self.emit.reset_defaults()
+        self.reset_defaults_internal()
 
+    def clear(self) -> None:
+        self.emit.clear()
+        if self.modstack:
+            self.mods = self.modstack[0]
+            self.modstack.clear()
+        self.scopestack.clear()
+        self.curscope = None
+        self.revpol.clear()
+        self.pending = 0
+        self.nodepend.clear()
 
-class PcodeSymbolResolver:
-    """Resolve p-code storage and addresses to stable source-level token names."""
+    def set_integer_format(self, nm: str) -> None:
+        """Select the default integer format: "hex", "dec" or "best"."""
+        if nm[:3] == "hex":
+            mod = Modifier.force_hex.value
+        elif nm[:3] == "dec":
+            mod = Modifier.force_dec.value
+        elif nm[:4] == "best":
+            mod = 0
+        else:
+            raise EmitError("Unknown integer format option: " + nm)
+        self.mods &= ~(Modifier.force_hex.value | Modifier.force_dec.value)
+        self.mods |= mod
 
-    _C_KEYWORDS = frozenset(
-        {
-            "auto", "break", "case", "char", "const", "continue", "default",
-            "do", "double", "else", "enum", "extern", "float", "for",
-            "goto", "if", "inline", "int", "long", "register", "restrict",
-            "return", "short", "signed", "sizeof", "static", "struct",
-            "switch", "typedef", "union", "unsigned", "void", "volatile",
-            "while", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic",
-            "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local",
-        }
-    )
+    def unnamed_field(self, off: int, size: int) -> str:
+        return f"_{off:d}_{size:d}_"
 
-    def __init__(
+    @staticmethod
+    def most_natural_base(val: int) -> int:
+        """Count '0'/'9' digits base 10 and '0'/'f' digits base 16."""
+        countdec = 0
+        tmp = val
+        if tmp == 0:
+            return 10
+        setdig = tmp % 10
+        if setdig in (0, 9):
+            countdec += 1
+            tmp //= 10
+            while tmp != 0:
+                dig = tmp % 10
+                if dig == setdig:
+                    countdec += 1
+                else:
+                    break
+                tmp //= 10
+        if countdec == 0:
+            return 16
+        if countdec == 1:
+            if tmp > 1 or setdig == 9:
+                return 16
+        elif countdec == 2:
+            if tmp > 10:
+                return 16
+        elif countdec in (3, 4):
+            if tmp > 100:
+                return 16
+        else:
+            if tmp > 1000:
+                return 16
+
+        counthex = 0
+        tmp = val
+        setdig = tmp & 0xF
+        if setdig in (0, 0xF):
+            counthex += 1
+            tmp >>= 4
+            while tmp != 0:
+                dig = tmp & 0xF
+                if dig == setdig:
+                    counthex += 1
+                else:
+                    break
+                tmp >>= 4
+        return 10 if countdec > counthex else 16
+
+    @staticmethod
+    def format_binary(out, val: int) -> None:
+        """Print a string of '0'/'1' characters representing the value."""
+        pos = mostsigbit_set(val)
+        if pos < 0:
+            out.write("0")
+            return
+        if pos <= 7:
+            pos = 7
+        elif pos <= 15:
+            pos = 15
+        elif pos <= 31:
+            pos = 31
+        else:
+            pos = 63
+        mask = 1 << pos
+        while mask != 0:
+            out.write("1" if (mask & val) != 0 else "0")
+            mask >>= 1
+
+    # -- abstract API ----------------------------------------------------
+    @abstractmethod
+    def initialize_from_architecture(self) -> None:
+        ...
+
+    @abstractmethod
+    def adjust_type_operators(self) -> None:
+        ...
+
+    @abstractmethod
+    def set_comment_style(self, nm: str) -> None:
+        ...
+
+    @abstractmethod
+    def doc_type_definitions(self, typegrp: Any) -> None:
+        ...
+
+    @abstractmethod
+    def doc_all_globals(self) -> None:
+        ...
+
+    @abstractmethod
+    def doc_single_global(self, sym: Any) -> None:
+        ...
+
+    @abstractmethod
+    def doc_function(self, fd: Any) -> None:
+        ...
+
+    @abstractmethod
+    def print_unicode(self, out, onechar: int) -> None:
+        ...
+
+    @abstractmethod
+    def push_type(self, ct: Any) -> None:
+        ...
+
+    @abstractmethod
+    def push_constant(
         self,
-        *,
-        address_names: Mapping[int, str] | None = None,
-        register_names: Mapping[tuple[str, int, int], str] | None = None,
-        storage_names: Mapping[tuple[str, int], str] | None = None,
-        value_names: Mapping[int, str] | None = None,
-        function_addresses: Iterable[int] = (),
-        raw_register_names: bool = False,
+        val: int,
+        ct: Any,
+        tag: TagType,
+        vn: Any,
+        op: Any,
+        display_format: int,
     ) -> None:
-        self.address_names = dict(address_names or {})
-        self.register_names = dict(register_names or {})
-        self.storage_names = dict(storage_names or {})
-        self.value_names = dict(value_names or {})
-        self.function_addresses = frozenset(function_addresses)
-        self.raw_register_names = raw_register_names
+        ...
 
-    @staticmethod
-    def _identifier(name: str, prefix: str = "sym") -> str:
-        result = re.sub(r"[^A-Za-z0-9_]", "_", name)
-        if not result or result[0].isdigit():
-            result = f"{prefix}_{result}"
-        if result in PcodeSymbolResolver._C_KEYWORDS:
-            result = f"sym_{result}"
-        return result
+    @abstractmethod
+    def push_equate(self, val: int, sz: int, sym: Any, vn: Any, op: Any) -> bool:
+        ...
 
-    @staticmethod
-    def _with_symbol(
-        metadata: PcodeTokenMetadata | None, name: str
-    ) -> PcodeTokenMetadata:
-        if metadata is None:
-            return PcodeTokenMetadata(symbol=name)
-        return PcodeTokenMetadata(
-            metadata.address,
-            metadata.sequence,
-            metadata.opcode,
-            metadata.space,
-            metadata.offset,
-            metadata.size,
-            name,
-        )
+    @abstractmethod
+    def push_annotation(self, vn: Any, op: Any) -> None:
+        ...
 
-    def resolve_address(
-        self,
-        address: int,
-        *,
-        function: bool = False,
-        metadata: PcodeTokenMetadata | None = None,
-    ) -> PrintToken:
-        symbol = self.address_names.get(address)
-        if symbol:
-            kind = "function" if function or address in self.function_addresses else "global"
-            name = self._identifier(symbol)
-        elif function or address in self.function_addresses:
-            kind = "function"
-            name = f"FUN_{address:X}"
-        else:
-            kind = "constant"
-            name = f"0x{address:x}"
-        return PrintToken(name, kind, self._with_symbol(metadata, name))
+    @abstractmethod
+    def push_symbol(self, sym: Any, vn: Any, op: Any) -> None:
+        ...
 
-    def resolve_varnode(
-        self,
-        varnode: SleighVarnode,
-        *,
-        instruction_address: int | None = None,
-        metadata: PcodeTokenMetadata | None = None,
-        value_id: int | None = None,
-        function: bool = False,
-    ) -> PrintToken:
-        if value_id is not None and value_id in self.value_names:
-            name = self._identifier(self.value_names[value_id])
-            return PrintToken(name, "variable", self._with_symbol(metadata, name))
-        key = (varnode.space, varnode.offset, varnode.size)
-        if key in self.register_names:
-            name = self._identifier(self.register_names[key])
-            return PrintToken(name, "variable", self._with_symbol(metadata, name))
-        if varnode.space == "const":
-            value = varnode.offset & ((1 << max(varnode.size_bits, 1)) - 1)
-            return PrintToken(str(value), "constant", metadata)
-        if varnode.space == "ram":
-            return self.resolve_address(
-                varnode.offset, function=function, metadata=metadata
-            )
-        storage_name = self._storage_range_name(
-            varnode.space, varnode.offset, varnode.size
-        )
-        if storage_name:
-            name = self._identifier(storage_name)
-            return PrintToken(name, "variable", self._with_symbol(metadata, name))
-        if varnode.space == "register":
-            display = varnode.display.lower() or f"reg_{varnode.offset:x}"
-            raw_name = display if self.raw_register_names else f"in_{display}"
-            name = self._identifier(raw_name)
-            return PrintToken(name, "variable", self._with_symbol(metadata, name))
-        if varnode.space == "unique":
-            scope = instruction_address if instruction_address is not None else 0
-            name = f"unique_{scope:X}_{varnode.offset:X}"
-            return PrintToken(name, "variable", self._with_symbol(metadata, name))
-        name = self._identifier(f"{varnode.space}_{varnode.offset:X}")
-        return PrintToken(name, "variable", self._with_symbol(metadata, name))
+    @abstractmethod
+    def push_unnamed_location(self, addr: Any, size: int, vn: Any, op: Any) -> None:
+        ...
 
-    def resolve_value(
-        self,
-        value: SSAValue,
-        *,
-        metadata: PcodeTokenMetadata | None = None,
-    ) -> PrintToken:
-        if value.identifier in self.value_names:
-            name = self._identifier(self.value_names[value.identifier])
-        elif value.kind == "input" and value.storage is not None:
-            name = self._storage_name(value.storage.space, value.storage.offset)
-            if name is None:
-                name = self._identifier(value.name, "value")
-        else:
-            name = self._identifier(value.name, "value")
-        kind = "constant" if value.kind == "constant" else "variable"
-        return PrintToken(name, kind, self._with_symbol(metadata, name))
-
-    def resolve_storage_range(
-        self,
-        space: str,
-        offset: int,
-        size: int,
-        *,
-        metadata: PcodeTokenMetadata | None = None,
-    ) -> PrintToken | None:
-        name = self._storage_range_name(space, offset, size)
-        if name is None:
-            return None
-        name = self._identifier(name)
-        return PrintToken(name, "variable", self._with_symbol(metadata, name))
-
-    def _storage_name(self, space: str, offset: int) -> str | None:
-        if (space, offset) in self.storage_names:
-            return self.storage_names[(space, offset)]
-        candidates = [
-            (size, name)
-            for (candidate_space, start, size), name in self.register_names.items()
-            if candidate_space == space and start <= offset < start + size
-        ]
-        if candidates:
-            return min(candidates, key=lambda item: item[0])[1]
-        return None
-
-    def _storage_range_name(self, space: str, offset: int, size: int) -> str | None:
-        names = [self._storage_name(space, offset + index) for index in range(size)]
-        if names and names[0] is not None and all(name == names[0] for name in names):
-            return names[0]
-        return None
-
-
-class _PcodeExpressionBuilder:
-    """Walk SSA-resolved operands back to their originating SLEIGH p-code ops."""
-
-    _BINARY_OPERATORS = {
-        "INT_ADD": "+",
-        "INT_SUB": "-",
-        "INT_MULT": "*",
-        "INT_DIV": "/",
-        "INT_SDIV": "/",
-        "INT_REM": "%",
-        "INT_SREM": "%",
-        "INT_AND": "&",
-        "INT_OR": "|",
-        "INT_XOR": "^",
-        "INT_LEFT": "<<",
-        "INT_RIGHT": ">>",
-        "INT_SRIGHT": ">>",
-        "INT_EQUAL": "==",
-        "INT_NOTEQUAL": "!=",
-        "INT_LESS": "<",
-        "INT_LESSEQUAL": "<=",
-        "INT_SLESS": "<",
-        "INT_SLESSEQUAL": "<=",
-        "BOOL_AND": "&&",
-        "BOOL_OR": "||",
-        "BOOL_XOR": "^^",
-        "FLOAT_ADD": "+",
-        "FLOAT_SUB": "-",
-        "FLOAT_MULT": "*",
-        "FLOAT_DIV": "/",
-        "FLOAT_EQUAL": "==",
-        "FLOAT_NOTEQUAL": "!=",
-        "FLOAT_LESS": "<",
-        "FLOAT_LESSEQUAL": "<=",
-    }
-    _UNARY_OPERATORS = {
-        "INT_2COMP": "-",
-        "INT_NEGATE": "~",
-        "BOOL_NEGATE": "!",
-        "FLOAT_NEG": "-",
-    }
-    _FLOAT_FUNCTIONS = {
-        "FLOAT_ABS": "fabs",
-        "FLOAT_CEIL": "ceil",
-        "FLOAT_FLOOR": "floor",
-        "FLOAT_ROUND": "round",
-        "FLOAT_SQRT": "sqrt",
-        "FLOAT_TRUNC": "trunc",
-        "FLOAT_NAN": "isnan",
-    }
-
-    def __init__(
-        self,
-        function: SSAFunction,
-        symbols: PcodeSymbolResolver,
-        *,
-        resolve_definitions: bool = True,
+    @abstractmethod
+    def push_partial_symbol(
+        self, sym: Any, off: int, sz: int, vn: Any, op: Any, slot: int, allow_cast: bool
     ) -> None:
-        self.function = function
-        self.symbols = symbols
-        self.resolve_definitions = resolve_definitions
-        self.values = function.value_by_id
-        self.operations_by_output = {
-            operation.output_value: operation
-            for operation in function.operations
-            if operation.output_value is not None
-        }
-        self.call_operations_by_location = {
-            (operation.instruction_address, operation.sequence): operation
-            for operation in function.operations
-            if operation.opcode in {"CALL", "CALLIND"}
-        }
-        self.phis_by_output = {
-            phi.output_value: phi for phi in function.phis
-        }
-        self._active: set[int] = set()
-        self._memo: dict[int, PrintToken | PcodeExpression] = {}
-        self._nodes_built = 0
+        ...
 
-    def value(self, value_id: int) -> PrintToken | PcodeExpression:
-        self._nodes_built += 1
-        if (
-            value_id in self._active
-            or len(self._active) >= 128
-            or self._nodes_built > 4096
-        ):
-            value = self.values[value_id]
-            return self.symbols.resolve_value(value)
-        if value_id in self._memo:
-            return self._memo[value_id]
-        value = self.values[value_id]
-        metadata = self._value_metadata(value)
-        self._active.add(value_id)
-        try:
-            if value.kind == "slice" and value.source is not None:
-                result = self._slice_value(value, metadata)
-            elif (
-                value.kind == "call_return"
-                and value.instruction_address is not None
-                and value.operation_sequence is not None
-                and (call := self.call_operations_by_location.get(
-                    (value.instruction_address, value.operation_sequence)
-                )) is not None
-            ):
-                result = self.operation(call)
-            elif value_id in self.phis_by_output:
-                result = self._phi_value(value, metadata)
-            elif value_id in self.operations_by_output:
-                result = self.operation(self.operations_by_output[value_id])
-            else:
-                result = self.symbols.resolve_value(value, metadata=metadata)
-        finally:
-            self._active.remove(value_id)
-        self._memo[value_id] = result
-        return result
+    @abstractmethod
+    def push_mismatch_symbol(
+        self, sym: Any, off: int, sz: int, vn: Any, op: Any
+    ) -> None:
+        ...
 
-    def operand(
-        self,
-        operand: SSAOperand,
-        *,
-        varnode: SleighVarnode | None = None,
-    ) -> PrintToken | PcodeExpression:
-        return self._operand_node(operand, varnode, None)
+    @abstractmethod
+    def push_implied_field(self, vn: Any, op: Any) -> None:
+        ...
 
-    def operation(self, operation: SSAOperation) -> PrintToken | PcodeExpression:
-        opcode = operation.opcode.upper()
-        metadata = self._operation_metadata(operation)
-        if opcode == "IMARK":
-            return PrintToken("", "blank", metadata)
-        pcode = operation.pcode
-        input_nodes = tuple(
-            self._operand_node(
-                operand,
-                pcode.inputs[index] if pcode is not None and index < len(pcode.inputs) else None,
-                operation,
-                call_target=(index == 0 and opcode in {"CALL", "CALLIND"}),
+    @abstractmethod
+    def push_ast_node(self, node: Any, op: Any) -> None:
+        """Push a compound AST node (``TypeOp::push`` in Ghidra)."""
+
+    @abstractmethod
+    def node_type_read_facing(self, node: Any, op: Any) -> Any:
+        ...
+
+    @abstractmethod
+    def get_scope_delimiter(self) -> str:
+        ...
+
+    # Block emission (``emitBlock*`` in Ghidra); each derived printer walks the
+    # structured control-flow graph produced by ``block.py``/``collapse.py``.
+    @abstractmethod
+    def emit_block_basic(self, bb: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_graph(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_copy(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_goto(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_ls(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_condition(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_if(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_while_do(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_do_while(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_inf_loop(self, bl: Any) -> None:
+        ...
+
+    @abstractmethod
+    def emit_block_switch(self, bl: Any) -> None:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# AST node accessors.  The decompiler backend's ``_Expr`` nodes are the
+# "Varnode/PcodeOp" of MiniGhidraPy; these helpers keep PrintLanguage free of
+# direct imports of the (private) backend types while reproducing the C++
+# predicates that drive printing.
+# ---------------------------------------------------------------------------
+
+
+def node_kind(node: Any) -> str:
+    return str(getattr(node, "kind", ""))
+
+
+def node_value(node: Any) -> Any:
+    return getattr(node, "value", None)
+
+
+def node_args(node: Any) -> tuple:
+    return tuple(getattr(node, "args", ()) or ())
+
+
+def node_bits(node: Any) -> int:
+    return int(getattr(node, "bits", 0) or 0)
+
+
+def node_size(node: Any) -> int:
+    """Byte size of the value the node holds (``Varnode::getSize``)."""
+    return max(1, node_bits(node) // 8)
+
+
+def is_implied(node: Any) -> bool:
+    """Every normalized AST node prints as the expression producing its value.
+
+    Ghidra separates \e implied from \e explicit Varnodes.  The AST backend
+    hands the printer whole expression nodes, so anything carrying a ``kind`` is
+    dispatched through :meth:`PrintLanguage.push_ast_node` (the role of
+    ``TypeOp::push``); only nodes pushed explicitly as symbol leaves go through
+    :meth:`PrintLanguage.push_node_explicit`.
+    """
+    return bool(node_kind(node))
+
+
+def has_implied_field(node: Any) -> bool:
+    """Union field selection needs an explicit member token."""
+    return node_kind(node) == "implied_field"
+
+
+def is_annotation(node: Any) -> bool:
+    return bool(getattr(node, "annotation", False))
+
+
+def is_constant(node: Any) -> bool:
+    return node_kind(node) in {"const", "fp_const", "imm"}
+
+
+def constant_value(node: Any) -> int:
+    direct = getattr(node, "int_value", None)
+    if isinstance(direct, int) and not isinstance(direct, bool):
+        return direct
+    value = node_value(node)
+    if isinstance(value, float):
+        import struct
+
+        bits = node_bits(node)
+        if bits == 32:
+            return struct.unpack("<I", struct.pack("<f", value))[0]
+        if bits == 64:
+            return struct.unpack("<Q", struct.pack("<d", value))[0]
+        return int(value)
+    return int(value or 0)
+
+
+def node_symbol(node: Any) -> Any:
+    return getattr(node, "symbol", None)
+
+
+def node_symbol_offset(node: Any) -> int:
+    value = getattr(node, "symbol_offset", None)
+    return -1 if value is None else int(value)
+
+
+def node_address(node: Any) -> Any:
+    return getattr(node, "address", None)
+
+
+def node_slot(node: Any, op: Any) -> int:
+    value = getattr(node, "slot", None)
+    return -1 if value is None else int(value)
+
+
+def symbol_size(symbol: Any) -> int:
+    ctype = getattr(symbol, "ctype", None)
+    size = getattr(ctype, "size", None) if ctype is not None else None
+    if size is None:
+        size = getattr(symbol, "size", 0)
+    return int(size or 0)
+
+
+def symbol_needs_resolution(symbol: Any) -> bool:
+    ctype = getattr(symbol, "ctype", None)
+    if ctype is None:
+        return False
+    return bool(getattr(ctype, "needs_resolution", False))
+
+
+def address_space(address: Any) -> Any:
+    if address is None:
+        return "ram"
+    return getattr(address, "space", address)
+
+
+def address_offset(address: Any) -> int:
+    if address is None:
+        return 0
+    offset = getattr(address, "offset", None)
+    return int(address if offset is None else offset)
+
+
+def display_format(ctype: Any) -> int:
+    value = getattr(ctype, "display_format", None)
+    return 0 if value is None else int(value)
+
+
+
+
+def _get_codepoint(
+    buf: bytes, i: int, count: int, charsize: int, bigend: bool
+) -> tuple[int, int]:
+    """Decode one codepoint (``StringManager::getCodepoint``) for UTF8/16/32."""
+    remaining = count - i
+    if remaining <= 0:
+        return -1, charsize
+    if charsize == 1:
+        byte = buf[i]
+        if byte < 0x80:
+            return byte, 1
+        if 0xC0 <= byte < 0xE0 and remaining >= 2:
+            return ((byte & 0x1F) << 6) | (buf[i + 1] & 0x3F), 2
+        if 0xE0 <= byte < 0xF0 and remaining >= 3:
+            return (
+                ((byte & 0x0F) << 12)
+                | ((buf[i + 1] & 0x3F) << 6)
+                | (buf[i + 2] & 0x3F),
+                3,
             )
-            for index, operand in enumerate(operation.inputs)
-        )
-        if opcode in self._BINARY_OPERATORS and len(input_nodes) >= 2:
-            operator = self._BINARY_OPERATORS[opcode]
-            token = _BINARY_TOKENS.get(operator)
-            if token is not None:
-                return PcodeExpression(token, input_nodes[:2], metadata)
-        if opcode in self._UNARY_OPERATORS and input_nodes:
-            token = OpToken(
-                self._UNARY_OPERATORS[opcode],
-                stage=1,
-                precedence=_UNARY_PRECEDENCE,
-                kind=OpTokenKind.UNARY_PREFIX,
-                name=opcode.lower(),
+        if byte >= 0xF0 and remaining >= 4:
+            return (
+                ((byte & 0x07) << 18)
+                | ((buf[i + 1] & 0x3F) << 12)
+                | ((buf[i + 2] & 0x3F) << 6)
+                | (buf[i + 3] & 0x3F),
+                4,
             )
-            return PcodeExpression(token, (input_nodes[0],), metadata)
-        if opcode in {"COPY", "INDIRECT"} and input_nodes:
-            return input_nodes[0]
-        if opcode in {
-            "INT_ZEXT",
-            "INT_SEXT",
-            "INT_TRUNC",
-            "FLOAT_INT2FLOAT",
-            "FLOAT_FLOAT2FLOAT",
-            "FLOAT_TRUNC",
-        } and input_nodes:
-            if opcode == "FLOAT_INT2FLOAT" or opcode == "FLOAT_FLOAT2FLOAT":
-                type_name = self._float_type(self._output_bits(operation))
-            elif opcode == "FLOAT_TRUNC":
-                type_name = self._integer_type(self._output_bits(operation), signed=True)
-            else:
-                type_name = self._integer_type(
-                    self._output_bits(operation), signed=opcode == "INT_SEXT"
-                )
-            return self._cast(type_name, input_nodes[0], metadata)
-        if opcode == "PTRADD" and len(input_nodes) >= 2:
-            scale = (
-                input_nodes[2]
-                if len(input_nodes) > 2
-                else PrintToken("1", "constant")
-            )
-            scaled_index = self._binary("*", input_nodes[1], scale, metadata)
-            return self._binary("+", input_nodes[0], scaled_index, metadata)
-        if opcode == "PTRSUB" and len(input_nodes) >= 2:
-            return self._binary("+", input_nodes[0], input_nodes[1], metadata)
-        if opcode == "PIECE" and len(input_nodes) >= 2:
-            low_bits = (
-                pcode.inputs[1].size_bits
-                if pcode is not None and len(pcode.inputs) > 1
-                else max(self._output_bits(operation) // 2, 8)
-            )
-            type_name = self._integer_type(self._output_bits(operation), signed=False)
-            high = self._cast(type_name, input_nodes[0], metadata)
-            shifted = self._binary(
-                "<<", high, PrintToken(str(low_bits), "constant", metadata), metadata
-            )
-            low = self._cast(type_name, input_nodes[1], metadata)
-            return self._binary("|", shifted, low, metadata)
-        if opcode == "SUBPIECE" and len(input_nodes) >= 2:
-            offset = (
-                operation.inputs[1].constant
-                if operation.inputs[1].kind == "constant"
-                else 0
-            )
-            value = input_nodes[0]
-            if offset:
-                value = self._binary(
-                    ">>",
-                    value,
-                    PrintToken(str(offset * 8), "constant", metadata),
-                    metadata,
-                )
-            return self._cast(
-                self._integer_type(self._output_bits(operation), signed=False),
-                value,
-                metadata,
-            )
-        if opcode == "LOAD" and len(input_nodes) >= 2:
-            type_name = self._integer_type(self._output_bits(operation), signed=False)
-            pointer = self._cast(f"{type_name} *", input_nodes[1], metadata)
-            return PcodeExpression(
-                OpToken(
-                    "*",
-                    stage=1,
-                    precedence=_UNARY_PRECEDENCE,
-                    kind=OpTokenKind.UNARY_PREFIX,
-                    name="load",
-                ),
-                (pointer,),
-                metadata,
-            )
-        if opcode == "STORE" and len(input_nodes) >= 3:
-            bits = pcode.inputs[2].size_bits if pcode is not None else 8
-            pointer = self._cast(
-                f"{self._integer_type(bits, signed=False)} *", input_nodes[1], metadata
-            )
-            destination = PcodeExpression(
-                OpToken(
-                    "*",
-                    stage=1,
-                    precedence=_UNARY_PRECEDENCE,
-                    kind=OpTokenKind.UNARY_PREFIX,
-                    name="store",
-                ),
-                (pointer,),
-                metadata,
-            )
-            return self._binary("=", destination, input_nodes[2], metadata)
-        if opcode in {"CALL", "CALLIND"} and input_nodes:
-            target = input_nodes[0]
-            if opcode == "CALLIND":
-                target = PcodeExpression(
-                    OpToken(
-                        "*",
-                        stage=1,
-                        precedence=_UNARY_PRECEDENCE,
-                        kind=OpTokenKind.UNARY_PREFIX,
-                        name="callind",
-                    ),
-                    (target,),
-                    metadata,
-                )
-            return self._call(target, input_nodes[1:], metadata)
-        if opcode == "CALLOTHER":
-            userop = pcode.inputs[0].offset if pcode and pcode.inputs else operation.sequence
-            name = PrintToken(f"userop_{userop:x}", "fallback", metadata)
-            return self._call(name, input_nodes[1:], metadata)
-        if opcode in self._FLOAT_FUNCTIONS and input_nodes:
-            name = PrintToken(self._FLOAT_FUNCTIONS[opcode], "function", metadata)
-            return self._call(name, input_nodes[:1], metadata)
-        if opcode in {"POPCOUNT", "LZCOUNT"} and input_nodes:
-            name = PrintToken(f"pcode_{opcode.lower()}", "fallback", metadata)
-            return self._call(name, input_nodes[:1], metadata)
-        return self._fallback(operation, input_nodes, metadata)
-
-    def _operand_node(
-        self,
-        operand: SSAOperand,
-        varnode: SleighVarnode | None,
-        operation: SSAOperation | None,
-        *,
-        call_target: bool = False,
-    ) -> PrintToken | PcodeExpression:
-        metadata = (
-            self._operation_metadata(operation, varnode)
-            if operation is not None
-            else PcodeTokenMetadata(
-                space=varnode.space if varnode is not None else None,
-                offset=varnode.offset if varnode is not None else None,
-                size=varnode.size if varnode is not None else None,
-            )
-        )
-        if operand.kind == "constant":
-            return PrintToken(str(operand.constant or 0), "constant", metadata)
-        if operand.kind == "address" and operand.address is not None:
-            return self.symbols.resolve_address(
-                operand.address, function=call_target, metadata=metadata
-            )
-        if operand.kind == "memory" and operand.address is not None:
-            address = self.symbols.resolve_address(operand.address, metadata=metadata)
-            type_name = self._integer_type(operand.size_bits, signed=False)
-            pointer = self._cast(f"{type_name} *", address, metadata)
-            return PcodeExpression(
-                OpToken(
-                    "*",
-                    stage=1,
-                    precedence=_UNARY_PRECEDENCE,
-                    kind=OpTokenKind.UNARY_PREFIX,
-                    name="memory",
-                ),
-                (pointer,),
-                metadata,
-            )
-        if not self.resolve_definitions and varnode is not None:
-            return self.symbols.resolve_varnode(
-                varnode,
-                instruction_address=(
-                    operation.instruction_address if operation is not None else None
-                ),
-                metadata=metadata,
-                function=call_target,
-            )
-        if not operand.values:
-            if varnode is not None:
-                return self.symbols.resolve_varnode(
-                    varnode,
-                    instruction_address=(
-                        operation.instruction_address if operation is not None else None
-                    ),
-                    metadata=metadata,
-                    function=call_target,
-                )
-            return PrintToken("unknown", "fallback", metadata)
-        if varnode is not None and self._is_unmodified_input(operand.values, varnode):
-            return self.symbols.resolve_varnode(
-                varnode,
-                instruction_address=(
-                    operation.instruction_address if operation is not None else None
-                ),
-                metadata=metadata,
-                function=call_target,
-            )
-        storage_range = self._input_storage_range(operand.values)
-        if storage_range is not None:
-            symbol = self.symbols.resolve_storage_range(
-                *storage_range, metadata=metadata
-            )
-            if symbol is not None:
-                return symbol
-        call = self._collapsible_call_return(operand.values, operand.size_bits)
-        if call is not None:
-            return self.operation(call)
-        slice_range = self._collapsible_slice_range(
-            operand.values, operand.size_bits
-        )
-        if slice_range is not None:
-            source_id, offset_bits = slice_range
-            source = self.value(source_id)
-            if offset_bits:
-                source = self._binary(
-                    ">>",
-                    source,
-                    PrintToken(str(offset_bits), "constant", metadata),
-                    metadata,
-                )
-            if (
-                offset_bits
-                or self.values[source_id].size_bits != operand.size_bits
-            ):
-                source = self._cast(
-                    self._integer_type(operand.size_bits, signed=False),
-                    source,
-                    metadata,
-                )
-            return source
-        if len(operand.values) == 1:
-            return self.value(operand.values[0])
-        if operand.size_bits <= 64 and len(operand.values) * 8 == operand.size_bits:
-            return self._compose_bytes(operand.values, operand.size_bits, metadata)
-        return self._call(
-            PrintToken("pcode_join_values", "fallback", metadata),
-            tuple(self.value(value_id) for value_id in operand.values),
-            metadata,
-        )
-
-    def _input_storage_range(
-        self, value_ids: tuple[int, ...]
-    ) -> tuple[str, int, int] | None:
-        values = [self.values[value_id] for value_id in value_ids]
-        if not values or any(value.kind != "input" or value.storage is None for value in values):
-            return None
-        first = values[0].storage
-        assert first is not None
-        if any(
-            value.storage is None
-            or value.storage.space != first.space
-            or value.storage.scope_address != first.scope_address
-            or value.storage.offset != first.offset + index
-            for index, value in enumerate(values)
-        ):
-            return None
-        return first.space, first.offset, len(values)
-
-    def _is_unmodified_input(
-        self, value_ids: tuple[int, ...], varnode: SleighVarnode
-    ) -> bool:
-        if varnode.space in {"const", "ram"}:
-            return False
-        if len(value_ids) != varnode.size:
-            return False
-        for index, value_id in enumerate(value_ids):
-            value = self.values[value_id]
-            if value.kind != "input" or value.storage is None:
-                return False
-            if (
-                value.storage.space != varnode.space
-                or value.storage.offset != varnode.offset + index
-            ):
-                return False
-            if varnode.space == "unique" and value.storage.scope_address is not None:
-                # A unique-space input is local to the current instruction.
-                if value.instruction_address not in {None, value.storage.scope_address}:
-                    return False
-        return True
-
-    def _collapsible_call_return(
-        self, value_ids: tuple[int, ...], size_bits: int
-    ) -> SSAOperation | None:
-        if not value_ids or len(value_ids) * 8 != size_bits:
-            return None
-        values = [self.values[value_id] for value_id in value_ids]
-        first = values[0]
-        if (
-            first.kind != "call_return"
-            or first.instruction_address is None
-            or first.operation_sequence is None
-            or first.storage is None
-        ):
-            return None
-        if any(
-            value.kind != "call_return"
-            or value.instruction_address != first.instruction_address
-            or value.operation_sequence != first.operation_sequence
-            or value.storage is None
-            or value.storage.space != first.storage.space
-            or value.storage.offset != first.storage.offset + index
-            for index, value in enumerate(values)
-        ):
-            return None
-        return self.call_operations_by_location.get(
-            (first.instruction_address, first.operation_sequence)
-        )
-
-    def _collapsible_slice_range(
-        self, value_ids: tuple[int, ...], size_bits: int
-    ) -> tuple[int, int] | None:
-        if not value_ids or len(value_ids) * 8 != size_bits:
-            return None
-        values = [self.values[value_id] for value_id in value_ids]
-        source = values[0].source
-        if (
-            source is None
-            or any(value.kind != "slice" or value.source != source for value in values)
-        ):
-            return None
-        source_value = self.values.get(source)
-        offset = values[0].offset_bits
-        if (
-            source_value is None
-            or offset < 0
-            or offset + size_bits > source_value.size_bits
-            or any(
-                value.offset_bits != offset + index * 8
-                for index, value in enumerate(values)
-            )
-        ):
-            return None
-        return source, offset
-
-    def _compose_bytes(
-        self,
-        value_ids: tuple[int, ...],
-        size_bits: int,
-        metadata: PcodeTokenMetadata,
-    ) -> PrintToken | PcodeExpression:
-        if size_bits > 64:
-            return self._call(
-                PrintToken("pcode_join_bytes", "fallback", metadata),
-                tuple(self.value(value_id) for value_id in value_ids),
-                metadata,
-            )
-        target_type = self._integer_type(size_bits, signed=False)
-        wide_type = "uint64_t"
-        result: PrintToken | PcodeExpression | None = None
-        for index, value_id in enumerate(value_ids):
-            byte = self._cast(wide_type, self.value(value_id), metadata)
-            if index:
-                byte = self._binary(
-                    "<<",
-                    byte,
-                    PrintToken(str(index * 8), "constant", metadata),
-                    metadata,
-                )
-            result = byte if result is None else self._binary("|", result, byte, metadata)
-        assert result is not None
-        return self._cast(target_type, result, metadata)
-
-    def _slice_value(
-        self, value: SSAValue, metadata: PcodeTokenMetadata
-    ) -> PrintToken | PcodeExpression:
-        assert value.source is not None
-        source = self.value(value.source)
-        if value.offset_bits:
-            source = self._binary(
-                ">>",
-                source,
-                PrintToken(str(value.offset_bits), "constant", metadata),
-                metadata,
-            )
-        return self._cast(
-            self._integer_type(value.size_bits, signed=False), source, metadata
-        )
-
-    def _phi_value(
-        self, value: SSAValue, metadata: PcodeTokenMetadata
-    ) -> PrintToken | PcodeExpression:
-        phi = self.phis_by_output[value.identifier]
-        incoming = [self.value(value_id) for _, value_id in phi.incoming]
-        if not incoming:
-            return self.symbols.resolve_value(value, metadata=metadata)
-        return self._call(PrintToken("phi", "function", metadata), tuple(incoming), metadata)
-
-    def _fallback(
-        self,
-        operation: SSAOperation,
-        input_nodes: tuple[PrintToken | PcodeExpression, ...],
-        metadata: PcodeTokenMetadata,
-    ) -> PrintToken | PcodeExpression:
-        if operation.opcode == "IMARK":
-            return PrintToken("", "blank", metadata)
-        name = self.symbols._identifier(f"pcode_{operation.opcode.lower()}", "pcode")
-        return self._call(PrintToken(name, "fallback", metadata), input_nodes, metadata)
-
-    @staticmethod
-    def _binary(
-        operator: str,
-        left: PrintToken | PcodeExpression,
-        right: PrintToken | PcodeExpression,
-        metadata: PcodeTokenMetadata | None,
-    ) -> PcodeExpression:
-        return PcodeExpression(_BINARY_TOKENS[operator], (left, right), metadata)
-
-    @staticmethod
-    def _cast(
-        type_name: str,
-        value: PrintToken | PcodeExpression,
-        metadata: PcodeTokenMetadata | None,
-    ) -> PcodeExpression:
-        return PcodeExpression(
-            _CAST_TOKEN,
-            (PrintToken(type_name, "type", metadata), value),
-            metadata,
-        )
-
-    @staticmethod
-    def _call(
-        function: PrintToken | PcodeExpression,
-        arguments: tuple[PrintToken | PcodeExpression, ...],
-        metadata: PcodeTokenMetadata | None,
-    ) -> PcodeExpression:
-        if not arguments:
-            argument_node: PrintToken | PcodeExpression = PrintToken("", "blank", metadata)
-        else:
-            argument_node = arguments[0]
-            for argument in arguments[1:]:
-                argument_node = _PcodeExpressionBuilder._binary(
-                    ",", argument_node, argument, metadata
-                )
-        return PcodeExpression(_CALL_TOKEN, (function, argument_node), metadata)
-
-    def _operation_metadata(
-        self,
-        operation: SSAOperation,
-        varnode: SleighVarnode | None = None,
-    ) -> PcodeTokenMetadata:
-        return PcodeTokenMetadata(
-            address=operation.instruction_address,
-            sequence=operation.sequence,
-            opcode=operation.opcode,
-            space=varnode.space if varnode is not None else None,
-            offset=varnode.offset if varnode is not None else None,
-            size=varnode.size if varnode is not None else None,
-        )
-
-    @staticmethod
-    def _value_metadata(value: SSAValue) -> PcodeTokenMetadata | None:
-        if value.instruction_address is None and value.opcode is None:
-            return None
-        return PcodeTokenMetadata(
-            address=value.instruction_address,
-            sequence=value.operation_sequence,
-            opcode=value.opcode,
-            space=value.storage.space if value.storage is not None else None,
-            offset=value.storage.offset if value.storage is not None else None,
-            size=max(value.size_bits // 8, 1),
-        )
-
-    def _output_bits(self, operation: SSAOperation) -> int:
-        if operation.output_value is not None:
-            return max(self.values[operation.output_value].size_bits, 8)
-        if operation.pcode is not None and operation.pcode.output is not None:
-            return max(operation.pcode.output.size_bits, 8)
-        return 32
-
-    @staticmethod
-    def _integer_type(bits: int, *, signed: bool) -> str:
-        width = next((width for width in (8, 16, 32, 64) if bits <= width), bits)
-        if width not in {8, 16, 32, 64}:
-            return f"{'' if signed else 'u'}int{width}_t"
-        return f"{'int' if signed else 'uint'}{width}_t"
-
-    @staticmethod
-    def _float_type(bits: int) -> str:
-        if bits <= 32:
-            return "float"
-        if bits <= 64:
-            return "double"
-        return "long double"
+        return -1, 1
+    if remaining < charsize:
+        return -1, charsize
+    raw = buf[i : i + charsize]
+    value = int.from_bytes(raw, "big" if bigend else "little")
+    if charsize == 2 and 0xD800 <= value <= 0xDBFF and remaining >= 4:
+        low = int.from_bytes(buf[i + 2 : i + 4], "big" if bigend else "little")
+        if 0xDC00 <= low <= 0xDFFF:
+            return 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00), 4
+    return value, charsize

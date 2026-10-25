@@ -10,6 +10,7 @@ Una herramienta pequeña, escrita en Python, para explorar estáticamente ejecut
 - Descubrimiento heurístico de funciones (punto de entrada, símbolos, destinos de llamadas, firmas x86, inicios Mach-O `LC_FUNCTION_STARTS`, rangos `.pdata`/`UNWIND_INFO` de PE x64 y callbacks TLS de PE), thunks de salto directos/PLT, marcado de funciones conocidas `no-return` e inferencia conservadora por evidencias de llamadas/wrappers.
 - Estimación de la purga de pila a partir de `ret`/`ret imm16` cuando los retornos recuperados coinciden; perfiles ABI y un motor de tipos/prototipos explícitos cubren convenciones x86/x86-64, clases de agregados, argumentos por referencia, retornos ocultos y promociones variádicas.
 - Referencias cruzadas a llamadas/saltos, memoria y operandos escalares; detección conservadora de tablas de punteros a código y destinos CFG de saltos indirectos; traducción real SLEIGH/p-code por instrucción para x86/x86-64, además de pseudocódigo semántico experimental con perfiles ABI, propagación simbólica de registros/pila, expresiones aritméticas simplificadas, condiciones, uniones CFG mediante `phi(...)` y estructuración conservadora de `if`/`if-else` y `do/while` sencillos.
+- Motor de impresión portado desde Ghidra (`Emit`, `EmitMarkup`, `EmitPrettyPrint`, `PrintLanguage` y `PrintC`): emisión directa de una función completa con resolución de símbolos/tipos, pretty printing de Oppen con ancho máximo configurable y markup XML `<clang_document>` con los elementos y colores originales.
 - Búsqueda de texto/bytes, etiquetas y comentarios guardados en un proyecto JSON, y parcheo seguro a un **archivo de salida** (el original no se modifica).
 - Consola interactiva y una interfaz gráfica Tkinter opcional para recorrer funciones, cadenas, imports/exports, desensamblado, pseudocódigo y bloques.
 
@@ -44,6 +45,9 @@ strings password
 xrefs 0x401000
 disasm 0x401000 80
 pseudo main
+emit main
+emit main --markup --width 100
+emit main --flat --labels join --hex
 graph main cfg.dot
 rename 0x401000 mi_funcion
 comment 0x401000 "validacion de entrada"
@@ -70,7 +74,7 @@ minighidra firmware.bin --raw-arch x86_64 --base 0x400000
 
 ## Portado desde Ghidra
 
-Esta iteración incorpora detección conservadora de prólogos x86/x86-64, inicios Mach-O `LC_FUNCTION_STARTS`, PE x64 `.pdata`/`UNWIND_INFO` y callbacks TLS, referencias escalares, tablas absolutas de punteros, resolución de saltos de tabla, catálogos `no-return`, purga de pila desde `ret`, thunks PLT, perfiles ABI, un registro explícito de tipos C, distribución tipada de prototipos y el prototipo de pseudocódigo semántico. Los modelos SysV AMD64 y Windows x64 contemplan agregados en registros/pila, sret y `varargs`; en x86 se cubren las reglas Cspec aplicables a los modelos cdecl, stdcall, fastcall, thiscall y regparm. Las fuentes revisadas, las reglas trasladadas y las diferencias con el motor original están documentadas en [`PORTING_NOTES.md`](PORTING_NOTES.md). El renderer textual de `SemanticDecompiler` emite las expresiones mediante una pila de tokens RPN (`PrintLanguageRpn`), con precedencias y paréntesis explícitos; `CEmitter(expression_mode="direct")` sigue disponible como alternativa para emitir desde el AST.
+Esta iteración incorpora detección conservadora de prólogos x86/x86-64, inicios Mach-O `LC_FUNCTION_STARTS`, PE x64 `.pdata`/`UNWIND_INFO` y callbacks TLS, referencias escalares, tablas absolutas de punteros, resolución de saltos de tabla, catálogos `no-return`, purga de pila desde `ret`, thunks PLT, perfiles ABI, un registro explícito de tipos C, distribución tipada de prototipos, el prototipo de pseudocódigo semántico y el motor de impresión de Ghidra (`prettyprint.hh/.cc`, `printlanguage.hh/.cc` y `printc.hh/.cc`): la jerarquía `Emit` con markup XML y pretty printing, la pila RPN de `PrintLanguage` y el back-end C `PrintC`, que emite una función completa (cabecera, prototipo, declaraciones y cuerpo estructurado) sobre el AST del backend. Los modelos SysV AMD64 y Windows x64 contemplan agregados en registros/pila, sret y `varargs`; en x86 se cubren las reglas Cspec aplicables a los modelos cdecl, stdcall, fastcall, thiscall y regparm. Las fuentes revisadas, las reglas trasladadas y las diferencias con el motor original están documentadas en [`PORTING_NOTES.md`](PORTING_NOTES.md). El renderer textual de `SemanticDecompiler` emite las expresiones mediante una pila de tokens RPN propia (`PrintLanguageRpn`, en `minighidra/printlanguage_rpn.py`), con precedencias y paréntesis explícitos; `CEmitter(expression_mode="direct")` sigue disponible como alternativa para emitir desde el AST. Ambos caminos conviven: el AST C tipado alimenta el pseudocódigo del backend y el motor `Emit`/`PrintC` de Ghidra consume los artefactos estructurales de `decompile_artifacts()`.
 
 ## Tipos y prototipos x86/x86-64
 
@@ -135,9 +139,40 @@ El modo `analyze(justproto=True, input_names=...)` limita medidas a los formales
 
 Con una firma fijada, el pseudocódigo usa los tipos/nombres y ubicaciones ABI para sus parámetros, modela argumentos agregados directos cuando están en registros y no imprime el puntero ABI oculto de un `sret` como argumento de fuente. La recuperación de los tipos efectivos de argumentos `...` desde binario y la materialización de todos los retornos agregados en el cuerpo siguen siendo aproximaciones.
 
+## Motor de impresión (Emit/PrintC)
+
+`minighidra/emit.py`, `minighidra/printlanguage.py`, `minighidra/printc.py` y `minighidra/printdoc.py` portan el motor de impresión del decompiler de Ghidra. La emisión es directa y cubre la función completa: comentarios de cabecera, prototipo (tipo de retorno, convención, nombre y parámetros), declaraciones de locales y cuerpo estructurado (`if`/`else`, `while`, `do/while`, `switch`, `goto`/etiquetas), todo a través de la pila RPN de `PrintLanguage` y del algoritmo de pretty printing de Oppen.
+
+El backend normal del decompiler **sigue usando su AST**: `SemanticDecompiler` continúa propagando valores y construyendo expresiones `_Expr`, y `pseudo` no cambia. `decompile_artifacts()` expone de forma aditiva la firma resuelta, las sentencias por bloque con su dirección de instrucción, los terminadores estructurados (condición, destinos, casos de switch, tail calls), las llamadas con sus argumentos y el grafo colapsado; `printdoc.py` resuelve con eso cada símbolo (parámetro, local, global) y cada tipo contra el registro C del analizador.
+
+```python
+from minighidra import Analyzer, BinaryImage
+
+analyzer = Analyzer(BinaryImage.load("./programa"))
+function = analyzer.functions[0x401000]
+
+print(analyzer.print_function(function))                      # texto con pretty printing
+print(analyzer.print_function(function, markup=True))         # XML <clang_document>
+print(analyzer.print_function(function, max_line_size=72))    # ajusta a 72 columnas
+print(analyzer.print_function(function, flat=True))           # etiquetas + goto, sin estructurar
+print(analyzer.print_function(function, integer_format="hex", comment_style="cplusplus"))
+```
+
+En consola:
+
+```text
+emit main
+emit main --markup --output main.xml
+emit main --width 72 --indent 4
+emit main --flat --labels join
+emit main --no-casts --hex --comments cplusplus --brace same_line
+```
+
+El markup reproduce el vocabulario original de `EmitMarkup`: `<clang_document>`, `<function>`, `<funcproto>`, `<return_type>`, `<vardecl>`, `<block blockref>`, `<statement opref>`, `<variable varref opref color>`, `<op>`, `<funcname>`, `<type id>`, `<field name off>`, `<comment space off>`, `<label>`, `<value>`, `<syntax open|close>` y `<break indent>`, con los colores de `syntax_highlight` (parámetros `0x6`, variables `0x4`, globales `0x7`, tipos `0x2`, funciones `0x3`, constantes `0x5`, comentarios `0x1`). Las opciones del emisor están expuestas en `PrintC` (`set_no_cast_printing`, `set_integer_format`, `set_comment_style`, `set_brace_format_*`, `set_flat`, `set_markup`, `set_max_line_size`, `set_indent_increment`, `set_label_mode`) y coinciden con las de Ghidra; `set_packed_output(True)` lanza `EmitError` porque el marshaling binario `PackedEncode` no está portado.
+
 ## Límites conocidos
 
-Esto es una **primera versión funcional**, no tiene paridad con Ghidra. El pseudocódigo aplica un subconjunto de decompilación semántica (propaga registros y slots de pila, simplifica operaciones enteras, expresa condiciones de flags y resuelve algunos `phi(...)` de unión como asignaciones dentro de `if`/`if-else`). El estructurador acepta diamantes forward sencillos con brazos privados de un bloque y join común, ramas privadas que terminan en retorno/trap, y el patrón `do/while` de un bloque con una arista a sí mismo y salida forward. En los bucles conserva los `phi` internos, sin normalizar variables de iteración; los `while` con cabecera/cuerpo separados, loops de varios bloques, `break`/`continue`, backedges complejos, destinos compartidos, saltos irregulares o merges no demostrables conservan etiquetas y `goto` como fallback. Deja comentarios para instrucciones no soportadas. El fallback SLEIGH consume un subconjunto de ops enteros, booleanos y float single/double, registros/flags/memoria y algunas ramificaciones internas acotadas (incluidos los bucles p-code de `BSF`/`BSR` y selecciones como `MINSS`). El núcleo SSA/heritage descrito arriba procesa operaciones p-code y sus ramas, pero no implementa todos los opcodes ni los guards, joins de pila, refinamientos de rangos, análisis de aliasing/calls ni pases iterativos del motor C++. El registro C y el resolvedor de prototipos cubren layouts ABI concretos, pero no la recuperación de tipos desde DWARF/PDB, aliasing/bitfields completos ni la inferencia completa de parámetros; la inferencia automática sigue siendo heurística. La precedencia/emisión de expresiones usa un port parcial de la pila RPN de `PrintLanguage`/`PrintC`. Hay además una ruta directa de inspección/emisión por operación y valor que recorre el SSA enlazado a `PcodeOp`/`Varnode`; no sustituye aún el renderer de la función completa. La resolución de símbolos usa la información disponible en MiniGhidraPy, el markup HTML aporta clases semánticas propias y los opcodes no cubiertos conservan un fallback genérico, no la semántica específica de todos los fallbacks de Ghidra. Por tanto no se promete pseudocódigo idéntico ni semántica completa para cualquier instrucción. Tampoco hay depurador, emulación, análisis dinámico, scripting/plugin API, colaboración ni soporte de otras arquitecturas. El desensamblador está limitado a x86 de 32 bits y x86-64. La importación de formatos depende de las capacidades de LIEF instalado.
+Esto es una **primera versión funcional**, no tiene paridad con Ghidra. El pseudocódigo aplica un subconjunto de decompilación semántica (propaga registros y slots de pila, simplifica operaciones enteras, expresa condiciones de flags y resuelve algunos `phi(...)` de unión como asignaciones dentro de `if`/`if-else`). El estructurador acepta diamantes forward sencillos con brazos privados de un bloque y join común, ramas privadas que terminan en retorno/trap, y el patrón `do/while` de un bloque con una arista a sí mismo y salida forward. En los bucles conserva los `phi` internos, sin normalizar variables de iteración; los `while` con cabecera/cuerpo separados, loops de varios bloques, `break`/`continue`, backedges complejos, destinos compartidos, saltos irregulares o merges no demostrables conservan etiquetas y `goto` como fallback. Deja comentarios para instrucciones no soportadas. El fallback SLEIGH consume un subconjunto de ops enteros, booleanos y float single/double, registros/flags/memoria y algunas ramificaciones internas acotadas (incluidos los bucles p-code de `BSF`/`BSR` y selecciones como `MINSS`). El núcleo SSA/heritage descrito arriba procesa operaciones p-code y sus ramas, pero no implementa todos los opcodes ni los guards, joins de pila, refinamientos de rangos, análisis de aliasing/calls ni pases iterativos del motor C++. El registro C y el resolvedor de prototipos cubren layouts ABI concretos, pero no la recuperación de tipos desde DWARF/PDB, aliasing/bitfields completos ni la inferencia completa de parámetros; la inferencia automática sigue siendo heurística. La precedencia/emisión de expresiones del renderer del backend usa un port parcial de la pila RPN de `PrintLanguage`/`PrintC` (`printlanguage_rpn.py`), y hay además una ruta directa de inspección/emisión por operación y valor que recorre el SSA enlazado a `PcodeOp`/`Varnode`; no sustituye aún el renderer de la función completa. El motor de impresión de Ghidra (`Emit`/`PrintLanguage`/`PrintC`) sí está portado y emite una función completa con markup y pretty printing, pero trabaja sobre el AST del backend: las expresiones compuestas de x87, MMX/SSE y otros kinds no escalares se emiten como texto opaco del renderer anterior (sin markup por token), los casts provienen de los anchos/signos del AST y no de la propagación de tipos de Ghidra, y no hay `PackedEncode`, `EquateSymbol`, bitfields, árbol de namespaces, `for` loops ni `CommentSorter` completo. La resolución de símbolos usa la información disponible en MiniGhidraPy, el markup HTML aporta clases semánticas propias y los opcodes no cubiertos conservan un fallback genérico, no la semántica específica de todos los fallbacks de Ghidra. Por tanto no se promete pseudocódigo idéntico al de Ghidra ni semántica completa para cualquier instrucción. Tampoco hay depurador, emulación, análisis dinámico, scripting/plugin API, colaboración ni soporte de otras arquitecturas. El desensamblador está limitado a x86 de 32 bits y x86-64. La importación de formatos depende de las capacidades de LIEF instalado.
 
 ## Pruebas
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, TypeAlias
 
 if TYPE_CHECKING:
-    from .printlanguage import PcodeSymbolResolver, PrintLanguageRpn
+    from .printlanguage_rpn import PcodeSymbolResolver, PrintLanguageRpn
     from .sleigh import SleighVarnode
     from .ssa import SSAFunction, SSAOperand, SSAOperation
 
@@ -700,7 +700,7 @@ class CEmitter:
         if self.expression_mode != "rpn":
             raise ValueError("p-code token emission requires expression_mode='rpn'")
         if self._rpn_expression_printer is None:
-            from .printlanguage import PrintLanguageRpn
+            from .printlanguage_rpn import PrintLanguageRpn
 
             self._rpn_expression_printer = PrintLanguageRpn(self)
         return self._rpn_expression_printer
