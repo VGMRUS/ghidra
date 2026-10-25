@@ -7269,6 +7269,10 @@ class RuleBitFieldIn(Rule):
                 "INT_MULT", "SUBPIECE")
 
     def apply_op(self, op: Any, data: Any) -> int:
+        from minighidra.bitfield import BitFieldPullTransform
+        in_vn = op.inputs[0] if op.inputs else -1
+        if in_vn < 0: return 0
+        # No bitfield types currently
         return 0
 
 class RuleBitFieldLoad(Rule):
@@ -7281,6 +7285,8 @@ class RuleBitFieldLoad(Rule):
         return ("LOAD",)
 
     def apply_op(self, op: Any, data: Any) -> int:
+        from minighidra.bitfield import BitFieldPullTransform
+        if not op.inputs: return 0
         return 0
 
 class RuleBitFieldOut(Rule):
@@ -7290,9 +7296,13 @@ class RuleBitFieldOut(Rule):
         super().__init__(group, 0, "bitfieldout")
 
     def get_op_list(self) -> tuple[str, ...]:
-        return ("STORE", "COPY", "INT_ADD", "INT_AND", "INT_OR", "INT_XOR")
+        from minighidra.bitfield import BitFieldInsertTransform
+        return BitFieldInsertTransform.ALLOWED_FINAL_WRITES
 
     def apply_op(self, op: Any, data: Any) -> int:
+        from minighidra.bitfield import BitFieldInsertTransform
+        out_vn = op.output
+        if out_vn is None: return 0
         return 0
 
 class RuleBitFieldStore(Rule):
@@ -7305,26 +7315,163 @@ class RuleBitFieldStore(Rule):
         return ("STORE",)
 
     def apply_op(self, op: Any, data: Any) -> int:
+        from minighidra.bitfield import BitFieldInsertTransform
+        if len(op.inputs) < 3: return 0
         return 0
 class RuleInsertAbsorb(Rule):
     """Delegate to absorb subpieces/right-shifts nested in an INSERT. 
-    Simulates Ghidra's RuleInsertAbsorb by trimming zero SUBPIECE offsets."""
+    Simulates Ghidra's RuleInsertAbsorb by trimming zero SUBPIECE offsets and evaluating nested right-shifts/ands."""
     def __init__(self, group: str) -> None:
         super().__init__(group, 0, "insert_absorb")
-    def get_op_list(self) -> list[str]:
-        return ["INSERT"] # In minighidra we use INSERT if we have it, else CALLOTHER
-    def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
+
+    def get_op_list(self) -> tuple[str, ...]:
+        return ("INSERT",)
+
+    @classmethod
+    def left_shift_varnode(cls, data: Any, vn: int, sa: int) -> int:
+        if vn < 0: return -1
+        mult_op = data.get_def(vn)
+        if not mult_op: return -1
+        mult_val_vn = mult_op.inputs[1]
+        if not data.is_constant(mult_val_vn): return -1
+        mult_val = data.get_constant_value(mult_val_vn)
+        
+        match_val = 0
+        if mult_op.opcode == "INT_MULT":
+            match_val = 1 << sa
+        elif mult_op.opcode == "INT_LEFT":
+            match_val = sa
+        else:
+            return -1
+            
+        if mult_val != match_val: return -1
+        return mult_op.inputs[0]
+
+    def absorb_and(self, data: Any, and_op: Any, insert_op: Any) -> int:
+        cvn = and_op.inputs[1]
+        if not data.is_constant(cvn): return 0
+        val = data.get_constant_value(cvn)
+        
+        # getLSBMask roughly translates to 2^bitsize - 1
+        bit_size = data.get_constant_value(insert_op.inputs[3])
+        mask = (1 << bit_size) - 1
+        
+        if (mask & val) != mask: return 0
+        data.op_set_input(insert_op, and_op.inputs[0], 1)
+        data.op_destroy(and_op)
+        return 1
+
+    def absorb_right_left(self, data: Any, next_op: Any, right_op: Any, insert_op: Any) -> int:
+        left_op = None
+        if next_op.opcode == "INT_LEFT":
+            left_op = next_op
+        elif next_op.opcode == "SUBPIECE":
+            if data.get_constant_value(next_op.inputs[1]) != 0: return 0
+            subin = next_op.inputs[0]
+            left_op = data.get_def(subin)
+            if not left_op or left_op.opcode != "INT_LEFT": return 0
+        else:
+            return 0
+            
+        lsa = data.get_constant_value(left_op.inputs[1]) if data.is_constant(left_op.inputs[1]) else -1
+        if lsa < 0: return 0
+        rsa = data.get_constant_value(right_op.inputs[1]) if data.is_constant(right_op.inputs[1]) else -1
+        if rsa < 0: return 0
+        
+        if lsa != rsa: return 0
+        bit_size = data.get_constant_value(insert_op.inputs[3])
+        insert_sz_bits = data.nodes[insert_op.inputs[1]].size_bits
+        if bit_size > insert_sz_bits - lsa: return 0
+        
+        data.op_set_input(insert_op, left_op.inputs[0], 1)
+        data.op_destroy(right_op)
+        return 1
+
+    def absorb_shift_add(self, data: Any, right_op: Any, add_op: Any, insert_op: Any) -> int:
+        sa = data.get_constant_value(right_op.inputs[1])
+        if sa <= 0 or sa >= 64: return 0
+        
+        vn0 = self.left_shift_varnode(data, add_op.inputs[0], sa)
+        if vn0 < 0: return 0
+        
+        vn1 = -1
+        add_vn1 = add_op.inputs[1]
+        if data.is_constant(add_vn1):
+            add_val = data.get_constant_value(add_vn1)
+            shifted_add = add_val >> sa
+            if (shifted_add << sa) != add_val: return 0
+            vn1 = data.new_constant(data.nodes[vn0].size_bits // 8, shifted_add)
+        else:
+            vn1 = self.left_shift_varnode(data, add_vn1, sa)
+            if vn1 < 0: return 0
+            
+        bit_size = data.get_constant_value(insert_op.inputs[3])
+        vn0_sz_bits = data.nodes[vn0].size_bits
+        if bit_size > vn0_sz_bits - sa: return 0
+        
+        data.op_set_opcode(right_op, "INT_ADD")
+        data.op_set_input(right_op, vn0, 0)
+        data.op_set_input(right_op, vn1, 1)
+        data.op_destroy(add_op)
+        return 1
+
+    def absorb_nested_and(self, data: Any, base_op: Any, insert_op: Any) -> int:
+        # Check lone descend: if uses of base_op output is just insert_op
+        if base_op.output is None: return 0
+        uses = data.get_uses(base_op.output)
+        if len(uses) != 1 or uses[0] != insert_op: return 0
+        
+        for slot in range(2):
+            vn = base_op.inputs[slot]
+            if vn < 0: continue
+            and_op = data.get_def(vn)
+            if not and_op or and_op.opcode != "INT_AND": continue
+            cvn = and_op.inputs[1]
+            if not data.is_constant(cvn): continue
+            
+            mask = data.get_constant_value(cvn)
+            # basic coveringmask logic for bitsize
+            bit_size = data.get_constant_value(insert_op.inputs[3])
+            c_mask = (1 << mask.bit_length()) - 1
+            if mask != c_mask: continue
+            if (mask & 1) == 0: continue
+            
+            count = mask.bit_length()
+            if count < bit_size: continue
+            
+            data.op_set_input(base_op, and_op.inputs[0], slot)
+            data.op_destroy(and_op)
+            return 1
+            
+        return 0
+
+    def apply_op(self, op: Any, data: Any) -> int:
         if len(op.inputs) < 2: return 0
         in_vn = op.inputs[1]
         in_op = data.get_def(in_vn)
         if not in_op: return 0
         
-        if in_op.opcode == "SUBPIECE":
+        opc = in_op.opcode
+        if opc == "SUBPIECE":
             if data.get_constant_value(in_op.inputs[1]) == 0:
                 data.op_set_input(op, in_op.inputs[0], 1)
+                data.op_destroy(in_op)
                 return 1
-                
-        # Omitted full nested absorption for INT_AND, INT_RIGHT, etc.
+        elif opc in ("INT_RIGHT", "INT_SRIGHT"):
+            if not data.is_constant(in_op.inputs[1]): return 0
+            vn = in_op.inputs[0]
+            next_op = data.get_def(vn)
+            if not next_op: return 0
+            nopc = next_op.opcode
+            if nopc == "INT_ADD":
+                return self.absorb_shift_add(data, in_op, next_op, op)
+            elif nopc in ("INT_LEFT", "SUBPIECE"):
+                return self.absorb_right_left(data, next_op, in_op, op)
+        elif opc == "INT_AND":
+            return self.absorb_and(data, in_op, op)
+        elif opc in ("INT_ADD", "INT_OR", "INT_XOR", "INT_MULT"):
+            return self.absorb_nested_and(data, in_op, op)
+            
         return 0
 
 class RulePullAbsorb(Rule):
