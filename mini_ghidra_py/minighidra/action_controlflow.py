@@ -53,7 +53,22 @@ class ActionForceGoto(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        if hasattr(data, "project_state") and hasattr(data.project_state, "forcegoto"):
+            for pcop, pcdest in data.project_state.forcegoto.items():
+                if hasattr(data, "ssa_function"):
+                    for bb in data.ssa_function.blocks:
+                        if not hasattr(bb, "ops"): continue
+                        last_op = bb.ops[-1] if bb.ops else None
+                        if last_op and last_op.addr == pcop:
+                            for j, out_addr in enumerate(bb.successors):
+                                out_bl = next((b for b in data.ssa_function.blocks if b.start == out_addr), None)
+                                if out_bl and hasattr(out_bl, "ops"):
+                                    out_last = out_bl.ops[-1] if out_bl.ops else None
+                                    if out_last and out_last.addr == pcdest:
+                                        bb.goto_branch = j
+                                        self.count += 1
+                                        break
+        return self.count
 
 class ActionRestrictLocal(Action):
     """Restricts scopes of local variables prior to dead code removal."""
