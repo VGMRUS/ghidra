@@ -13,7 +13,7 @@ class FloatingEdge:
         return self.destnode
 
 class BlockTrace:
-    pass
+    pass # Parity forward declaration
 
 class BranchPoint:
     def __init__(self, parenttrace: Optional[BlockTrace] = None):

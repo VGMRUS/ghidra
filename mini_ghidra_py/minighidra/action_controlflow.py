@@ -335,10 +335,12 @@ class ActionDeindirect(Action):
                     node = data.nodes[vn]
                 else:
                     break
-                    
+            
+            # Simplified external ref and const pointer resolution matching Ghidra's deindirect logic
             if node.kind == "const":
                 data.op_set_opcode(op, "CALL")
                 self.count += 1
+            # External symbol / function ptr prototype matching skipped in minighidra port
                 
         return self.count
 
@@ -397,7 +399,42 @@ class ActionNodeJoin(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        if not hasattr(data, "structure"): return 0
+        graph = data.structure
+        if not graph.blocks: return 0
+
+        from minighidra.nodejoin import ConditionalJoin
+        condjoin = ConditionalJoin(data)
+        
+        for bb in graph.blocks:
+            if bb.type != "basic" or len(bb.out_edges) != 2: continue
+            out1 = bb.out_edges[0]
+            out2 = bb.out_edges[1]
+            
+            # Simple check since out_edges are just start addrs of blocks usually in block.py, 
+            # we would map them to actual blocks.
+            b_out1 = next((b for b in graph.blocks if b.start == out1), None)
+            b_out2 = next((b for b in graph.blocks if b.start == out2), None)
+            if not b_out1 or not b_out2: continue
+            
+            leastout = b_out1 if len(b_out1.in_edges) < len(b_out2.in_edges) else b_out2
+            inslot = 0 if leastout == b_out1 else 1 # simplified rev index
+            
+            if len(leastout.in_edges) == 1: continue
+            
+            for j in range(len(leastout.in_edges)):
+                if j == inslot: continue
+                in_addr = leastout.in_edges[j]
+                bb2 = next((b for b in graph.blocks if b.start == in_addr), None)
+                if not bb2: continue
+                
+                if condjoin.match(bb, bb2):
+                    self.count += 1
+                    condjoin.execute()
+                    condjoin.clear()
+                    break
+
+        return self.count
 
 class ActionShadowVar(Action):
     """Identifies shadow variables across paths for more advanced aliasing."""

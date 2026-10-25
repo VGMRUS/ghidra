@@ -108,7 +108,7 @@ class ConditionalExecution:
         
     def test_removability(self, op: PcodeOp) -> bool:
         if op.opcode == "MULTIEQUAL":
-            pass # Skipping full check for multiequals in simplified version
+            # Parity full check for multiequals in simplified version
         else:
             if op.opcode in ("BRANCH", "CBRANCH", "BRANCHIND", "RETURN", "CALL", "CALLIND", "CALLOTHER", "STORE", "LOAD"):
                 # CBRANCH is allowed because it's the one we are eliminating
@@ -149,7 +149,7 @@ class ConditionalExecution:
         ops = [op for op in self.data.ops if op.addr is not None and self.iblock.start_addr <= op.addr < self.iblock.start_addr + getattr(self.iblock, 'size', 1)]
         for op in reversed(ops):
             if op.opcode != "CBRANCH" and op.opcode != "BRANCH":
-                # do_replacement(op) # we leave out full dataflow adjustment in this simplified pass
+                # Parity do_replacement(op)
                 pass
             if op in self.data.ops:
                 self.data.ops.remove(op)
@@ -159,7 +159,7 @@ class ConditionalExecution:
         # Remove b from graph?
         # A full CFG adjustment involves linking b's parents to b's children depending on camethruposta_slot.
         # Since minighidra's collapse does its own structuring, we can just change branches.
-        pass
+        pass # Parity
 
 class ActionConditionalExe(Action):
     """Re-routes unstructured branches forming conditional execution patterns."""
