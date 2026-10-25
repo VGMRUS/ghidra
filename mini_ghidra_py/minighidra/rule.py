@@ -15,14 +15,14 @@ class Rule:
 
     def get_op_list(self) -> tuple[str, ...]:
         """Return the list of P-code operations this rule applies to."""
-        raise NotImplementedError
+        return ()
 
     def apply_op(self, op: PcodeOp, data: PcodeLikeGraph) -> int:
         """Attempt to apply this rule to a specific PcodeOp.
         
         Returns > 0 if a change was made, 0 otherwise.
         """
-        raise NotImplementedError
+        return 0
 
 
 class RuleOrConsume(Rule):

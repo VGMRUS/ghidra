@@ -275,7 +275,7 @@ class ParamList:
     list_type = ParamListType.STANDARD
 
     def allocate_status(self) -> list[int]:
-        raise NotImplementedError
+        return []
 
     def assign_map(
         self,
@@ -284,10 +284,10 @@ class ParamList:
         types: TypeDatabase | None = None,
         status: list[int] | None = None,
     ) -> tuple[FunctionParameter, ...]:
-        raise NotImplementedError
+        return ()
 
     def fillin_map(self, active: ParamActive) -> None:
-        raise NotImplementedError
+        pass
 
     def check_join(
         self,
@@ -296,21 +296,20 @@ class ParamList:
         lo_location: StorageLocation,
         lo_size: int,
     ) -> bool:
-        raise NotImplementedError
+        return False
 
     def check_split(
         self, location: StorageLocation, size: int, split_point: int
     ) -> bool:
-        raise NotImplementedError
+        return False
 
     def possible_param(self, location: StorageLocation, size: int) -> bool:
-        raise NotImplementedError
+        return False
 
     def possible_param_with_slot(
         self, location: StorageLocation, size: int
     ) -> tuple[int, int] | None:
-        raise NotImplementedError
-
+        return None
 
 class ParamListStandard(ParamList):
     """Ordered resource groups with no-hole, exclusion, and stack-spill rules."""
