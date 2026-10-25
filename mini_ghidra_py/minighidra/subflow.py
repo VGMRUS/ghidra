@@ -200,3 +200,48 @@ class SubvariableFlow:
 
     def do_replacement(self) -> None:
         pass
+
+
+class LaneDescription:
+    def __init__(self, num_lanes: int):
+        self.num_lanes = num_lanes
+
+class LaneDivide:
+    """
+    Class for splitting data-flow on laned registers (SIMD / vector registers).
+    From a root Varnode and a description of its lanes, trace data-flow as far as
+    possible through the function, propagating each lane.
+    """
+    
+    def __init__(self, data: PcodeLikeGraph, root: int, desc: LaneDescription, allow_downcast: bool):
+        self.data = data
+        self.root = root
+        self.description = desc
+        self.allow_subpiece_terminator = allow_downcast
+        self.worklist = []
+
+    def set_replacement(self, vn: int, num_lanes: int, skip_lanes: int) -> Any:
+        pass
+
+    def do_trace(self) -> bool:
+        if not self.worklist:
+            return False
+            
+        retval = True
+        while self.worklist:
+            if not self.process_next_work():
+                retval = False
+                break
+                
+        if not retval:
+            return False
+        return True
+
+    def process_next_work(self) -> bool:
+        return False
+
+    def trace_forward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
+        return False
+        
+    def trace_backward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
+        return False
