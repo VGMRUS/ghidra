@@ -14,7 +14,17 @@ from .action import (
     ActionReturnRecovery,
 )
 from .analysis import Analyzer
-from .decompiler import SemanticDecompiler
+from .decompiler import DecompileArtifacts, SemanticDecompiler
+from .emit import (
+    BraceStyle,
+    Emit,
+    EmitMarkup,
+    EmitNoMarkup,
+    EmitPrettyPrint,
+    SyntaxHighlight,
+    TokenSplit,
+    XmlEncoder,
+)
 from .function_starts import FunctionStartCandidate
 from .image import BinaryImage, LoadError
 from .model import Function, FunctionParameter, FunctionSignature
@@ -50,6 +60,27 @@ from .paramlist import (
     ScoreProtoModel,
     TrialMapResult,
 )
+from .printc import PrintC
+from .printdoc import (
+    PrintableFunction,
+    PrintAddress,
+    PrintExpr,
+    PrintStatement,
+    PrintSymbol,
+    PrintTerminator,
+    PrintType,
+    SymbolTable,
+    TypeResolver,
+    build_printable_function,
+)
+from .printlanguage import (
+    Atom,
+    Comment,
+    Modifier,
+    OpToken,
+    PrintLanguage,
+    PrintLanguageCapability,
+)
 from .project import ProjectState
 from .prototype import PrototypeLayout, PrototypeResolver
 from .sleigh import SleighInstruction, SleighPcodeOp, SleighTranslator, SleighVarnode
@@ -78,7 +109,9 @@ from .typesys import (
 __all__ = [
     "MEMORY_LOCATION",
     "Analyzer",
+    "Atom",
     "BinaryImage",
+    "BraceStyle",
     "CField",
     "CType",
     "CallSpecs",
@@ -87,7 +120,13 @@ __all__ = [
     "ActionActiveReturn",
     "ActionReturnRecovery",
     "CallingConvention",
+    "Comment",
     "CspecModelRule",
+    "DecompileArtifacts",
+    "Emit",
+    "EmitMarkup",
+    "EmitNoMarkup",
+    "EmitPrettyPrint",
     "Function",
     "FunctionParameter",
     "FunctionSignature",
@@ -95,7 +134,9 @@ __all__ = [
     "InstructionDataFlow",
     "JoinRecord",
     "LoadError",
+    "Modifier",
     "NoReturnCatalog",
+    "OpToken",
     "ParamActive",
     "ParamDirection",
     "ParamEntry",
@@ -117,6 +158,16 @@ __all__ = [
     "PcodeLikeGraph",
     "Primitive",
     "PrimitiveExtractor",
+    "PrintC",
+    "PrintLanguage",
+    "PrintLanguageCapability",
+    "PrintAddress",
+    "PrintExpr",
+    "PrintStatement",
+    "PrintSymbol",
+    "PrintTerminator",
+    "PrintType",
+    "PrintableFunction",
     "ProjectState",
     "ProtoModelMerged",
     "PrototypeLayout",
@@ -138,9 +189,15 @@ __all__ = [
     "SleighTranslator",
     "SleighVarnode",
     "StorageLocation",
+    "SymbolTable",
+    "SyntaxHighlight",
+    "TokenSplit",
     "TrialMapResult",
     "TypeDatabase",
     "TypeKind",
+    "TypeResolver",
+    "XmlEncoder",
+    "build_printable_function",
     "calling_convention_by_name",
     "calling_convention_for",
     "construct_float_extension_location",
