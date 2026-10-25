@@ -241,10 +241,71 @@ class LaneDivide:
         return False
 
     def trace_forward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
-        return False
+        vn = rvn.vn if hasattr(rvn, 'vn') else -1
+        if vn < 0: return False
+        
+        for op in self.data.get_uses(vn):
+            opc = op.opcode
+            if opc == "SUBPIECE":
+                # handle out_lanes calculation
+                pass
+            elif opc == "PIECE":
+                pass
+            elif opc in ("INT_NEGATE", "COPY"):
+                pass
+            elif opc in ("INT_AND", "INT_OR", "INT_XOR"):
+                pass
+            elif opc == "MULTIEQUAL":
+                pass
+            elif opc == "STORE":
+                pass
+            elif opc == "INT_ZEXT":
+                pass
+            elif opc == "INT_RIGHT":
+                pass
+            elif opc == "INT_LEFT":
+                pass
+            else:
+                return False
+                
+        return True
         
     def trace_backward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
-        return False
+        op = self.data.get_def(rvn.vn) if hasattr(rvn, 'vn') else None
+        if not op:
+            return True
+            
+        opc = op.opcode
+        if opc in ("INT_NEGATE", "COPY"):
+            in_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in_vars: return False
+        elif opc in ("INT_AND", "INT_OR", "INT_XOR"):
+            in0_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in0_vars: return False
+            in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
+            if not in1_vars: return False
+        elif opc == "MULTIEQUAL":
+            pass
+        elif opc == "INDIRECT":
+            pass
+        elif opc == "SUBPIECE":
+            in_vn = op.inputs[0]
+            # missing description.extension
+            pass
+        elif opc == "PIECE":
+            pass
+        elif opc == "LOAD":
+            pass
+        elif opc == "INT_ZEXT":
+            pass
+        elif opc == "INT_RIGHT":
+            pass
+        elif opc == "INT_LEFT":
+            pass
+        else:
+            return False
+            
+        return True
 
 
 class SplitDatatype:
