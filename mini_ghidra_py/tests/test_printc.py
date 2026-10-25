@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import re
 import tempfile
 import unittest
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
+from types import SimpleNamespace
 
 from minighidra import (
     Analyzer,
@@ -16,10 +18,25 @@ from minighidra import (
     TypeResolver,
     build_printable_function,
 )
-from minighidra.decompiler import SemanticDecompiler
-from minighidra.emit import BraceStyle, EmitMarkup
+from minighidra.decompiler import SemanticDecompiler, _Expr
+from minighidra.emit import BraceStyle, EmitMarkup, SyntaxHighlight
+from minighidra.marshal import ELEM_CLANG_DOCUMENT, PackedDecode
 from minighidra.model import Function
-from minighidra.printdoc import PrintExpr, PrintSymbol, SymbolTable
+from minighidra.printc import (
+    _expr_mentions,
+    _for_loop_form,
+    _opaque_segments,
+    _split_opaque,
+    _split_phi_inputs,
+)
+from minighidra.printdoc import (
+    ExpressionConverter,
+    PrintExpr,
+    PrintOp,
+    PrintStatement,
+    PrintSymbol,
+    SymbolTable,
+)
 from minighidra.printlanguage import Modifier, OpTokenType, TagType
 from minighidra.typesys import TypeDatabase
 
@@ -552,11 +569,39 @@ class FunctionPrintingTests(unittest.TestCase):
 
     def test_structured_loop_negates_the_exit_condition(self) -> None:
         analyzer, function = self._analyze(LOOP_SAMPLE)
-        text = analyzer.print_function(function, max_line_size=200)
-        self.assertIn("while (", text)
+        text = analyzer.print_function(function, max_line_size=400)
         # jge exits the loop, so the printed condition must be the negation.
         self.assertIn("< (int32_t)10", text)
         self.assertNotIn(">= (int32_t)10", text)
+
+    def test_loop_variable_is_recovered_as_a_for_loop(self) -> None:
+        analyzer, function = self._analyze(LOOP_SAMPLE)
+        text = analyzer.print_function(function, max_line_size=400)
+        # emitForLoop: the merge at the loop head becomes the three ;-separated
+        # parts of a `for` header instead of a comma separated while condition.
+        self.assertIn("for (phi_rax_loc_401009 = 0;", text)
+        self.assertIn("; phi_rax_loc_401009 =", text)
+        self.assertNotIn("phi(", text)
+        self.assertNotIn("while (", text)
+
+    def test_for_loops_can_be_disabled(self) -> None:
+        analyzer, function = self._analyze(LOOP_SAMPLE)
+        text = analyzer.print_function(
+            function, max_line_size=400, for_loops=False
+        )
+        # Architecture::analyze_for_loops off: plain while syntax, and the merge
+        # statements move into the body instead of the condition.
+        self.assertIn("while ((int32_t)", text)
+        self.assertIn("phi_rax_loc_401009 = phi(0,", text)
+        self.assertNotIn("for (", text)
+
+    def test_merge_statements_move_into_the_loop_body(self) -> None:
+        analyzer, function = self._analyze(LOOP_SAMPLE)
+        text = analyzer.print_function(function, max_line_size=400, for_loops=False)
+        body = text.split("while (", 1)[1]
+        condition, rest = body.split(") {", 1)
+        self.assertNotIn("phi(", condition)
+        self.assertIn("phi(", rest)
 
     def test_options_reach_the_emitter(self) -> None:
         analyzer, function = self._analyze(CALL_SAMPLE)
@@ -667,7 +712,12 @@ class ConsoleEmitTests(unittest.TestCase):
 
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            self.assertTrue(console.execute("emit 0x401000 --width 200"))
+            self.assertTrue(console.execute("emit 0x401000 --width 400"))
+        self.assertIn("for (phi_rax_loc_401009 = 0;", buffer.getvalue())
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            console.execute("emit 0x401000 --width 400 --no-for-loops")
         self.assertIn("while (", buffer.getvalue())
 
         buffer = io.StringIO()
@@ -676,6 +726,35 @@ class ConsoleEmitTests(unittest.TestCase):
             console.execute(f"emit entry --markup --output {output}")
         self.assertIn("Emisión guardada en", buffer.getvalue())
         self.assertEqual(ElementTree.fromstring(output.read_text()).tag, "clang_document")
+
+        # --packed writes Ghidra's binary marshaling format.
+        buffer = io.StringIO()
+        packed_path = root / "out.packed"
+        with redirect_stdout(buffer):
+            console.execute(f"emit entry --packed --output {packed_path}")
+        data = packed_path.read_bytes()
+        self.assertIn(f"({len(data)} bytes)", buffer.getvalue())
+        self.assertTrue(data)
+        self.assertNotIn(0, data)  # every byte of the format is non-zero
+        decoder = PackedDecode()
+        decoder.ingest_stream(data)
+        self.assertEqual(decoder.open_element(), ELEM_CLANG_DOCUMENT.id)
+
+        # Without --output the bytes are dumped instead of written raw.
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            console.execute("emit entry --packed")
+        shown = buffer.getvalue()
+        self.assertIn("PackedEncode:", shown)
+        rows = re.findall(r"^[0-9a-f]{8}  (.+?)  \|", shown, re.MULTILINE)
+        self.assertTrue(rows)
+        dumped = bytes.fromhex("".join(rows).replace(" ", ""))
+        # Paren ids come from a process wide counter (TokenSplit::countbase), so
+        # two separate emissions differ in those bytes; everything else matches.
+        self.assertEqual(len(dumped), len(data))
+        decoder = PackedDecode()
+        decoder.ingest_stream(dumped)
+        self.assertEqual(decoder.open_element(), ELEM_CLANG_DOCUMENT.id)
 
         with self.assertRaises(ValueError):
             console.execute("emit")
@@ -697,6 +776,382 @@ class MarkupEmitterTests(unittest.TestCase):
         self.assertIn("<clang_document>", stream.getvalue())
         self.assertIn("<syntax>x</syntax>", stream.getvalue())
         self.assertTrue(emit.emits_markup())
+
+
+class FloatingPointNodeTests(unittest.TestCase):
+    """The x87/scalar SSE forms of the backend become real expression nodes."""
+
+    def render(
+        self, build, width: int = 200, markup: bool = False, catalog_text="(rendered)"
+    ):
+        printer, stream = _printer(markup=markup, width=width)
+        symbols = _symbols(printer)
+        expression = build(symbols)
+        catalog = {} if catalog_text is None else {catalog_text: expression}
+        converter = ExpressionConverter(printer.resolver, symbols, 64, catalog)
+        node = converter.convert(expression)
+        _emit_expression(printer, node)
+        return node, stream.getvalue().strip()
+
+    @staticmethod
+    def _var(name: str, bits: int = 64):
+        return _Expr("var", name, (), bits)
+
+    def test_float_arithmetic_uses_the_c_operator_tokens(self) -> None:
+        for operation, expected in (
+            ("add", "+"),
+            ("sub", "-"),
+            ("mul", "*"),
+            ("div", "/"),
+        ):
+            with self.subTest(operation=operation):
+                node, text = self.render(
+                    lambda _s, op=operation: _Expr(
+                        "fp_op", op, (self._var("a"), self._var("b")), 64
+                    )
+                )
+                self.assertEqual(node.kind, "op")
+                self.assertEqual(node.name, f"f{operation[:3]}")
+                self.assertEqual(node.ctype.name, "double")
+                self.assertIn(f"a {expected} b", text)
+
+    def test_float_comparisons_do_not_get_integer_casts(self) -> None:
+        for operation, expected in (
+            ("eq", "=="),
+            ("ne", "!="),
+            ("lt", "<"),
+            ("le", "<="),
+        ):
+            with self.subTest(operation=operation):
+                node, text = self.render(
+                    lambda _s, op=operation: _Expr(
+                        "fp_compare", op, (self._var("a"), self._var("b")), 1
+                    )
+                )
+                self.assertEqual(node.kind, "op")
+                self.assertIn(f"a {expected} b", text)
+                self.assertNotIn("(int", text)
+                self.assertNotIn("(uint", text)
+
+    def test_float_unary_forms(self) -> None:
+        node, text = self.render(
+            lambda _s: _Expr("fp_unary", "neg", (self._var("a"),), 64)
+        )
+        self.assertEqual(node.kind, "unary")
+        self.assertEqual(text, "-a;")
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_unary", "sqrt", (self._var("a"),), 80)
+        )
+        self.assertEqual(node.kind, "func")
+        self.assertEqual(node.name, "sqrtl")
+        self.assertEqual(text, "sqrtl(a);")
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_unary", "exp2m1", (self._var("a"),), 80)
+        )
+        self.assertEqual(node.kind, "op")
+        self.assertIn("exp2l(a)", text)
+        self.assertIn("1.0L", text)
+
+    def test_float_conversions(self) -> None:
+        node, text = self.render(
+            lambda _s: _Expr("fp_cast", 64, (self._var("a"),), 64)
+        )
+        self.assertEqual(node.kind, "cast")
+        self.assertEqual(text, "(double)a;")
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_from_int", None, (self._var("a", 32),), 80)
+        )
+        self.assertEqual(node.kind, "cast")
+        self.assertEqual(node.ctype.name, "long double")
+        self.assertIn("(long double)", text)
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_to_int", (32, False), (self._var("a"),), 32)
+        )
+        self.assertEqual(node.kind, "cast")
+        self.assertEqual(text, "(int32_t)nearbyintl(a);")
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_to_int", (32, True), (self._var("a"),), 32)
+        )
+        self.assertEqual(text, "(int32_t)truncl(a);")
+
+    def test_float_loads_and_the_nan_test(self) -> None:
+        node, text = self.render(
+            lambda _s: _Expr("fp_load", (64, False), (self._var("p"),), 64)
+        )
+        self.assertEqual(node.kind, "load_typed")
+        self.assertEqual(node.ctype.name, "double")
+        self.assertIn("*(double *)", text)
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_int_load", (32, True), (self._var("p"),), 80)
+        )
+        self.assertEqual(node.kind, "cast")
+        self.assertIn("(long double)", text)
+        self.assertIn("*(int32_t *)", text)
+
+        node, text = self.render(
+            lambda _s: _Expr("fp_nan", None, (self._var("a"),), 1)
+        )
+        self.assertEqual(node.kind, "func")
+        self.assertEqual(text, "isnan(a);")
+
+    def test_x87_two_operand_instructions(self) -> None:
+        cases = {
+            "fpatan": "atan2l(a,b);",
+            "fprem": "fmodl(a,b);",
+            "fprem1": "remainderl(a,b);",
+            "fyl2x": "a * log2l(b);",
+        }
+        for operation, expected in cases.items():
+            with self.subTest(operation=operation):
+                _node, text = self.render(
+                    lambda _s, op=operation: _Expr(
+                        "fp_func", op, (self._var("a"), self._var("b")), 80
+                    )
+                )
+                self.assertEqual(text, expected)
+
+        _node, text = self.render(
+            lambda _s: _Expr(
+                "fp_func", "fscale", (self._var("a"), self._var("b")), 80
+            )
+        )
+        self.assertEqual(text, "a * exp2l(truncl(b));")
+
+    def test_float_jump_conditions_rebuild_the_parity_test(self) -> None:
+        node, text = self.render(
+            lambda _s: _Expr(
+                "fp_condition", "jae", (self._var("a"), self._var("b")), 1
+            )
+        )
+        self.assertEqual(node.kind, "op")
+        self.assertEqual(node.name, "land")
+        self.assertIn("isnan(a)", text)
+        self.assertIn("isnan(b)", text)
+        self.assertIn("||", text)
+        self.assertIn("&&", text)
+        self.assertIn("a >= b", text)
+        self.assertTrue(text.startswith("!"))
+
+        _node, text = self.render(
+            lambda _s: _Expr("fp_condition", "jp", (self._var("a"), self._var("b")), 1)
+        )
+        self.assertEqual(text, "isnan(a) || isnan(b);")
+
+        _node, text = self.render(
+            lambda _s: _Expr(
+                "fp_condition", "jnp", (self._var("a"), self._var("b")), 1
+            )
+        )
+        self.assertEqual(text, "!(isnan(a) || isnan(b));")
+
+        _node, text = self.render(
+            lambda _s: _Expr("fp_condition", "jbe", (self._var("a"), self._var("b")), 1)
+        )
+        self.assertIn("a <= b", text)
+
+    def test_concat_becomes_a_shift_and_or_tree(self) -> None:
+        node, text = self.render(
+            lambda _s: _Expr(
+                "concat", 32, (self._var("high", 32), self._var("low", 32)), 64
+            )
+        )
+        self.assertEqual(node.kind, "op")
+        self.assertEqual(node.name, "or")
+        self.assertIn("<<", text)
+        self.assertIn("|", text)
+        self.assertIn("(uint64_t)", text)
+        self.assertIn("(uint32_t)", text)
+
+    def test_wide_simd_forms_stay_opaque_but_keep_their_text(self) -> None:
+        # Without a catalog entry the placeholder name is kept.
+        node, text = self.render(
+            lambda _s: _Expr("simd_float", 64, (self._var("x"),), 64),
+            width=200,
+            catalog_text=None,
+        )
+        self.assertEqual(node.kind, "opaque")
+        self.assertIn("unknown_expr_simd_float", text)
+
+        # With one, the exact rendering of the backend is emitted verbatim.
+        rendered = "((union { uint64_t i; double f; }){ .i = (uint64_t)(x) }).f"
+        printer, stream = _printer(width=400)
+        symbols = _symbols(printer)
+        expression = _Expr("simd_float", 64, (_Expr("var", "x", (), 64),), 64)
+        converter = ExpressionConverter(
+            printer.resolver, symbols, 64, {rendered: expression}
+        )
+        node = converter.convert(expression)
+        self.assertEqual(node.kind, "opaque")
+        self.assertEqual(node.text, rendered)
+        _emit_expression(printer, node)
+        self.assertIn(rendered, stream.getvalue())
+
+    def test_modelled_forms_are_marked_up_token_by_token(self) -> None:
+        _node, markup = self.render(
+            lambda _s: _Expr(
+                "fp_condition", "jb", (self._var("a"), self._var("b")), 1
+            ),
+            markup=True,
+        )
+        root = ElementTree.fromstring(markup)
+        operators = {element.text for element in root.iter("op")}
+        self.assertTrue({"||", "&&", "<"} & operators)
+        # PrintC::opFunc pushes the name as an operator token (optoken), not as
+        # a funcname, exactly like the C++ code.
+        self.assertIn("isnan", operators)
+        self.assertNotIn("<", {element.text for element in root.iter("funcname")})
+
+
+class OpaqueTokenTests(unittest.TestCase):
+    """Opaque text is split into C tokens instead of one unbreakable blob."""
+
+    SAMPLES = (
+        "((union { uint64_t i; double f; }){ .i = (uint64_t)(x) }).f",
+        "(((uint64_t)(a) << 32) | (uint32_t)(b))",
+        'call("text, with spaces", 0x1f, -3)',
+        "isnan(a) || isnan(b)",
+        "a->b.c[3] = *p++;",
+        "x",
+        "",
+    )
+
+    def test_splitting_never_loses_a_character(self) -> None:
+        for text in self.SAMPLES:
+            with self.subTest(text=text):
+                pieces = _split_opaque(text)
+                self.assertEqual("".join(piece for _kind, piece in pieces), text)
+
+    def test_segments_keep_the_text_and_merge_whitespace_left(self) -> None:
+        for text in self.SAMPLES:
+            with self.subTest(text=text):
+                segments = _opaque_segments(text)
+                self.assertEqual("".join(piece for piece, _hl in segments), text)
+                # Only a leading run can start with whitespace.
+                for piece, _highlight in segments[1:]:
+                    self.assertFalse(piece.startswith((" ", "\t", "\n")))
+
+    def test_a_break_is_never_placed_after_a_dot(self) -> None:
+        segments = _opaque_segments("{ .i = x }.field->other")
+        self.assertIn(".i", [piece.strip() for piece, _hl in segments])
+        self.assertIn(".field", [piece.strip() for piece, _hl in segments])
+        self.assertIn("->other", [piece.strip() for piece, _hl in segments])
+
+    def test_identifiers_numbers_and_types_get_their_own_colour(self) -> None:
+        printer, _stream = _printer()
+        symbols = _symbols(printer)
+        inner = _Expr("var", "local_10", (), 64)
+        symbol = symbols.anonymous("local_10", 64)
+        expression = _Expr("simd_float", 64, (inner,), 64)
+        text = "((union { uint64_t i; double f; }){ .i = (uint64_t)(local_10) }).f"
+        converter = ExpressionConverter(
+            printer.resolver, symbols, 64, {text: expression}
+        )
+        node = converter.convert(expression)
+        self.assertEqual(node.kind, "opaque")
+        self.assertEqual(node.text, text)
+
+        document = SimpleNamespace(symbols={"local_10": symbol})
+        highlights = {
+            piece.strip(): highlight
+            for piece, highlight in _opaque_segments(node.text, document)
+        }
+        self.assertEqual(highlights["uint64_t"], SyntaxHighlight.type_color)
+        self.assertEqual(highlights["double"], SyntaxHighlight.type_color)
+        self.assertEqual(highlights["union"], SyntaxHighlight.keyword_color)
+        self.assertEqual(highlights["local_10"], SyntaxHighlight.var_color)
+        self.assertEqual(highlights[".i"], SyntaxHighlight.no_color)
+
+    def test_opaque_markup_emits_one_element_per_token(self) -> None:
+        printer, stream = _printer(markup=True, width=400)
+        text = "((union { uint64_t i; double f; }){ .i = (uint64_t)(x) }).f"
+        node = PrintExpr(kind="opaque", text=text)
+        _emit_expression(printer, node)
+        root = ElementTree.fromstring(stream.getvalue())
+        syntax = [element.text or "" for element in root.iter("syntax")]
+        self.assertEqual("".join(syntax), text + ";")
+        self.assertGreater(len(syntax), 10)
+        colours = {
+            (element.text or ""): element.attrib.get("color")
+            for element in root.iter("syntax")
+        }
+        self.assertEqual(colours["uint64_t"], "0x2")  # type_color
+
+    def test_a_long_opaque_expression_wraps_instead_of_overflowing(self) -> None:
+        printer, stream = _printer(width=60)
+        text = (
+            "((((__uint128_t)(old_destination) >> 64) << 64) | "
+            "(__uint128_t)(((union { double f; uint64_t i; })"
+            "{ .f = (double)(raw_result) }).i)) + "
+            "((((__uint128_t)(other_destination) >> 64) << 64) | "
+            "(__uint128_t)(((union { double f; uint64_t i; })"
+            "{ .f = (double)(other_result) }).i))"
+        )
+        _emit_expression(printer, PrintExpr(kind="opaque", text=text))
+        rendered = stream.getvalue()
+        lines = [line for line in rendered.splitlines() if line.strip()]
+        self.assertGreater(len(lines), 2)
+        for line in lines:
+            self.assertLessEqual(len(line.rstrip()), 80)
+        # Removing the inserted breaks gives the original text back.
+        joined = "".join(line.strip() for line in lines)
+        self.assertEqual(
+            "".join(joined.split()), "".join((text + ";").split())
+        )
+
+
+class ForLoopHelperTests(unittest.TestCase):
+    def test_expr_mentions_walks_casts_and_opaque_text(self) -> None:
+        variable = PrintExpr(kind="var", name="loop_i")
+        self.assertTrue(_expr_mentions(variable, "loop_i"))
+        self.assertFalse(_expr_mentions(variable, "loop_j"))
+        cast = PrintExpr(kind="cast", args=(variable,))
+        self.assertTrue(_expr_mentions(cast, "loop_i"))
+        opaque = PrintExpr(kind="opaque", text="(loop_i + 1) * 2")
+        self.assertTrue(_expr_mentions(opaque, "loop_i"))
+        self.assertFalse(_expr_mentions(opaque, "loop_i2"))
+        self.assertFalse(_expr_mentions(None, "loop_i"))
+
+    def test_split_phi_inputs_finds_the_iterator(self) -> None:
+        loop = PrintExpr(kind="var", name="i")
+        statement = PrintStatement(
+            kind="phi",
+            op=PrintOp(op_time=1),
+            out_name="i",
+            values=(
+                PrintExpr(kind="const", int_value=0),
+                PrintExpr(kind="op", name="add", args=(loop, PrintExpr(kind="const", int_value=1))),
+            ),
+        )
+        init, iterate = _split_phi_inputs(statement, "i")
+        self.assertEqual(init.kind, "const")
+        self.assertEqual(iterate.kind, "op")
+
+        # Neither input reads the variable: no iterator statement can be formed.
+        plain = PrintStatement(
+            kind="phi",
+            op=PrintOp(op_time=2),
+            out_name="i",
+            values=(
+                PrintExpr(kind="const", int_value=0),
+                PrintExpr(kind="const", int_value=1),
+            ),
+        )
+        self.assertEqual(_split_phi_inputs(plain, "i"), (None, None))
+
+    def test_for_loops_can_be_switched_off(self) -> None:
+        printer, _stream = _printer()
+        self.assertTrue(printer.analyze_for_loops)
+        printer.set_analyze_for_loops(False)
+        self.assertFalse(printer.analyze_for_loops)
+        self.assertIsNone(_for_loop_form(printer, None))
+        printer.reset_defaults()
+        self.assertTrue(printer.analyze_for_loops)
 
 
 if __name__ == "__main__":  # pragma: no cover

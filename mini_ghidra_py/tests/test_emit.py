@@ -185,9 +185,48 @@ class EmitMarkupTests(unittest.TestCase):
         self.assertIn('<break indent="2"/>', self.stream.getvalue())
         self.assertIn('<break indent="0"/>', self.stream.getvalue())
 
-    def test_packed_output_is_rejected(self) -> None:
-        with self.assertRaises(EmitError):
-            self.emit.set_packed_output(True)
+    def test_packed_output_switches_the_codec(self) -> None:
+        from minighidra.marshal import (
+            ATTRIB_CONTENT,
+            ELEM_CLANG_DOCUMENT,
+            ELEM_SYNTAX,
+            PackedDecode,
+        )
+
+        # The text stream stays untouched: the packed bytes live in the encoder.
+        self.emit.set_packed_output(True)
+        self.emit.begin_document()
+        self.emit.print("uint32_t", SyntaxHighlight.type_color)
+        self.emit.end_document(0)
+        self.assertEqual(self.stream.getvalue(), "")
+        data = self.emit.get_packed_bytes()
+        self.assertTrue(data)
+        self.assertTrue(all(byte != 0 for byte in data))
+
+        decoder = PackedDecode()
+        decoder.ingest_stream(data)
+        self.assertEqual(decoder.open_element(), ELEM_CLANG_DOCUMENT.id)
+        self.assertEqual(decoder.open_element(), ELEM_SYNTAX.id)
+        self.assertEqual(decoder.read_unsigned_integer(), SyntaxHighlight.type_color)
+        self.assertEqual(decoder.read_string(ATTRIB_CONTENT), "uint32_t")
+        decoder.close_element(ELEM_SYNTAX.id)
+        decoder.close_element(ELEM_CLANG_DOCUMENT.id)
+
+        # Switching back restores the XML codec on the same stream.
+        self.emit.set_packed_output(False)
+        self.emit.begin_document()
+        self.emit.end_document(0)
+        self.assertIn("<clang_document/>", self.stream.getvalue())
+        self.assertEqual(self.emit.get_packed_bytes(), b"")
+
+    def test_packed_output_accepts_a_binary_stream(self) -> None:
+        stream = io.BytesIO()
+        self.emit.set_output_stream(stream)
+        self.emit.set_packed_output(True)
+        self.emit.begin_document()
+        self.emit.print("x")
+        self.emit.end_document(0)
+        self.assertEqual(stream.getvalue(), self.emit.get_packed_bytes())
 
 
 class CircularQueueTests(unittest.TestCase):
