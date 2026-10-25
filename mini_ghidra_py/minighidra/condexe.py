@@ -76,11 +76,7 @@ class ConditionalExecution:
             
         # Check for simple negate
         vn = self.cbranch.inputs[1]
-        def_op = None
-        for op in self.data.ops:
-            if op.output == vn:
-                def_op = op
-                break
+        def_op = self.data.get_def(vn)
         if def_op and def_op.opcode == "BOOL_NEGATE":
             if def_op.inputs[0] == init_cbranch.inputs[1]:
                 self.init2a_true = not self.init2a_true
@@ -93,11 +89,7 @@ class ConditionalExecution:
         ops = [o for o in self.data.ops if o.addr is not None and self.iblock.start_addr <= o.addr < self.iblock.start_addr + getattr(self.iblock, 'size', 1)]
         if op in ops: return True
         
-        writeOp = None
-        for o in self.data.ops:
-            if o.output == vn:
-                writeOp = o
-                break
+        writeOp = self.data.get_def(vn)
         if not writeOp: return False
         
         opc = writeOp.opcode
@@ -107,11 +99,7 @@ class ConditionalExecution:
                     return False
             
             invn = writeOp.inputs[0]
-            upop = None
-            for o in self.data.ops:
-                if o.output == invn:
-                    upop = o
-                    break
+            upop = self.data.get_def(invn)
             if upop:
                 if upop in ops and upop.opcode != "MULTIEQUAL":
                     return False
@@ -127,10 +115,9 @@ class ConditionalExecution:
                 if op.opcode != "CBRANCH": return False
             vn = op.output
             if vn is not None:
-                for readop in self.data.ops:
-                    if vn in readop.inputs:
-                        if not self.test_op_read(vn, readop):
-                            return False
+                for readop in self.data.get_uses(vn):
+                    if not self.test_op_read(vn, readop):
+                        return False
         return True
 
     def verify(self) -> bool:

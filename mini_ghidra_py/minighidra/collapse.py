@@ -298,15 +298,16 @@ class CollapseStructure:
     def update_loop_body(self) -> bool:
         from minighidra.tracedag import TraceDAG, FloatingEdge
         
-        # Simplified update_loop_body using TraceDAG to find unstructured gotos
-        # We process the whole graph to find edges that break DAG structure
         likelygoto = []
         tracer = TraceDAG(likelygoto)
         
         for bl in self.graph.blocks:
-            if not bl.in_edges:
+            if len(bl.in_edges) == 0 and len(bl.out_edges) > 0:
                 tracer.add_root(bl)
                 
+        if len(tracer.rootlist) == 0 and len(self.graph.blocks) > 0:
+            tracer.add_root(self.graph.blocks[0])
+            
         tracer.initialize()
         tracer.push_branches()
         
