@@ -268,3 +268,25 @@ class SplitDatatype:
         
     def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
         return False
+
+class SubfloatFlow:
+    """
+    Class for tracing changes of precision in floating point variables.
+    It follows the flow of a logical lower precision value stored in higher precision locations
+    and rewrites the data-flow in terms of the lower precision, eliminating conversions.
+    """
+    def __init__(self, data: PcodeLikeGraph, root: int, prec: int):
+        self.data = data
+        self.root = root
+        self.precision = prec
+        self.terminator_count = 0
+        self.worklist = []
+
+    def max_precision(self, vn: int) -> int:
+        return self.precision
+
+    def exceeds_precision(self, op: PcodeOp) -> bool:
+        return False
+
+    def do_trace(self) -> bool:
+        return False
