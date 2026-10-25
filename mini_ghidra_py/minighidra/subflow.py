@@ -308,19 +308,29 @@ class LaneDivide:
                 in_vars = self.set_replacement(inv, num_lanes, skip_lanes)
                 if not in_vars: return False
         elif opc == "INDIRECT":
-            pass
+            in_vars = self.set_replacement(op.inputs[0], num_lanes, skip_lanes)
+            if not in_vars: return False
         elif opc == "SUBPIECE":
-            pass
+            in_vn = op.inputs[0]
+            if not self.data.is_constant(op.inputs[1]): return False
+            # Omitted exact description.extension calculations
+            in_vars = self.set_replacement(in_vn, num_lanes, skip_lanes)
+            if not in_vars: return False
         elif opc == "PIECE":
-            pass
+            # Omitted: buildPiece checks
+            return False
         elif opc == "LOAD":
-            pass
+            # Omitted: buildLoad checks
+            return False
         elif opc == "INT_ZEXT":
-            pass
+            # Omitted: buildZext checks
+            return False
         elif opc == "INT_RIGHT":
-            pass
+            # Omitted: buildRightShift checks
+            return False
         elif opc == "INT_LEFT":
-            pass
+            # Omitted: buildLeftShift checks
+            return False
         else:
             return False
             

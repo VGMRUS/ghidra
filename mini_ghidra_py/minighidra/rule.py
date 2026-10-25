@@ -4375,7 +4375,9 @@ class RulePopcountBoolXor(Rule):
                 if b1 < 0: continue
                 
                 data.op_set_opcode(baseOp, "COPY")
-                data.op_remove_input(baseOp, 1)
+                # Python ops are immutable tuples usually, wait minighidra op_remove_input returns new op
+                baseOp = data.op_remove_input(baseOp, 1)
+                data.op_set_input(baseOp, b1, 0)
                 data.op_set_input(baseOp, b1, 0)
                 return 1
                 
@@ -5086,7 +5088,9 @@ class RuleLzcountShiftBool(Rule):
                 newOp.output = eqResVn
                 data.ops.append(newOp)
                 
-                data.op_remove_input(baseOp, 1)
+                # Python ops are immutable tuples usually, wait minighidra op_remove_input returns new op
+                baseOp = data.op_remove_input(baseOp, 1)
+                data.op_set_input(baseOp, b1, 0)
                 
                 if data.nodes[baseOp.output].size_bits == 1:
                     data.op_set_opcode(baseOp, "COPY")
