@@ -219,9 +219,22 @@ class LaneDivide:
         self.description = desc
         self.allow_subpiece_terminator = allow_downcast
         self.worklist = []
+        self.varmap = {}
 
     def set_replacement(self, vn: int, num_lanes: int, skip_lanes: int) -> Any:
-        pass
+        class DummyVar:
+            def __init__(self, vn, num_lanes, skip_lanes):
+                self.vn = vn
+                self.num_lanes = num_lanes
+                self.skip_lanes = skip_lanes
+        
+        key = (vn, num_lanes, skip_lanes)
+        if key in self.varmap:
+            return self.varmap[key]
+        rvn = DummyVar(vn, num_lanes, skip_lanes)
+        self.varmap[key] = rvn
+        self.worklist.append(rvn)
+        return rvn
 
     def do_trace(self) -> bool:
         if not self.worklist:
@@ -238,7 +251,10 @@ class LaneDivide:
         return True
 
     def process_next_work(self) -> bool:
-        return False
+        rvn = self.worklist.pop(-1)
+        if not self.trace_backward(rvn, rvn.num_lanes, rvn.skip_lanes):
+            return False
+        return self.trace_forward(rvn, rvn.num_lanes, rvn.skip_lanes)
 
     def trace_forward(self, rvn: Any, num_lanes: int, skip_lanes: int) -> bool:
         vn = rvn.vn if hasattr(rvn, 'vn') else -1
@@ -252,11 +268,14 @@ class LaneDivide:
             elif opc == "PIECE":
                 pass
             elif opc in ("INT_NEGATE", "COPY"):
-                pass
+                out_rvn = self.set_replacement(op.output, num_lanes, skip_lanes)
+                if not out_rvn: return False
             elif opc in ("INT_AND", "INT_OR", "INT_XOR"):
-                pass
+                out_rvn = self.set_replacement(op.output, num_lanes, skip_lanes)
+                if not out_rvn: return False
             elif opc == "MULTIEQUAL":
-                pass
+                out_rvn = self.set_replacement(op.output, num_lanes, skip_lanes)
+                if not out_rvn: return False
             elif opc == "STORE":
                 pass
             elif opc == "INT_ZEXT":
@@ -285,12 +304,12 @@ class LaneDivide:
             in1_vars = self.set_replacement(op.inputs[1], num_lanes, skip_lanes)
             if not in1_vars: return False
         elif opc == "MULTIEQUAL":
-            pass
+            for inv in op.inputs:
+                in_vars = self.set_replacement(inv, num_lanes, skip_lanes)
+                if not in_vars: return False
         elif opc == "INDIRECT":
             pass
         elif opc == "SUBPIECE":
-            in_vn = op.inputs[0]
-            # missing description.extension
             pass
         elif opc == "PIECE":
             pass
@@ -306,8 +325,6 @@ class LaneDivide:
             return False
             
         return True
-
-
 class SplitDatatype:
     """
     Helper engine to rewrite operations handling full structured types (like structs or arrays)
@@ -329,7 +346,6 @@ class SplitDatatype:
         
     def split_store(self, store_op: PcodeOp, out_type: Any) -> bool:
         return False
-
 class SubfloatFlow:
     """
     Class for tracing changes of precision in floating point variables.
