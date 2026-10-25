@@ -141,6 +141,23 @@ class TypeOpCompare(TypeOp):
         return None
 
 TYPE_OPS = {
+    "SUBPIECE": TypeOpSubpiece(),
+    "PIECE": TypeOpPiece(),
+    "PTRADD": TypeOpPtradd(),
+    "PTRSUB": TypeOpPtrsub(),
+    "INDIRECT": TypeOpIndirect(),
+    "CAST": TypeOpCast(),
+    "CALL": TypeOpCall(),
+    "CALLIND": TypeOpCall(),
+    "CALLOTHER": TypeOpCall(),
+    "RETURN": TypeOpReturn(),
+    "BRANCH": TypeOpBranch(),
+    "CBRANCH": TypeOpCbranch(),
+    "BRANCHIND": TypeOpBranchind(),
+    "INT_ZEXT": TypeOpMath(),
+    "INT_SEXT": TypeOpMath(),
+    "INT_2COMP": TypeOpMath(),
+    "INT_NEGATE": TypeOpMath(),
     "COPY": TypeOpCopy(),
     "MULTIEQUAL": TypeOpMultiEqual(),
     "INT_ADD": TypeOpIntAdd(),
@@ -167,3 +184,43 @@ TYPE_OPS = {
     "INT_LESSEQUAL": TypeOpCompare(),
     "INT_SLESSEQUAL": TypeOpCompare(),
 }
+
+class TypeOpIntSub(TypeOpIntAdd):
+    pass
+
+class TypeOpIntXor(TypeOpMath):
+    pass
+
+class TypeOpPiece(TypeOp):
+    pass
+
+class TypeOpSubpiece(TypeOp):
+    pass
+
+class TypeOpPtradd(TypeOp):
+    pass
+
+class TypeOpPtrsub(TypeOp):
+    pass
+
+class TypeOpIndirect(TypeOp):
+    pass
+
+class TypeOpCall(TypeOp):
+    pass
+
+class TypeOpReturn(TypeOp):
+    pass
+
+class TypeOpCast(TypeOp):
+    pass
+
+class TypeOpCbranch(TypeOp):
+    pass
+
+class TypeOpBranch(TypeOp):
+    pass
+
+class TypeOpBranchind(TypeOp):
+    pass
+

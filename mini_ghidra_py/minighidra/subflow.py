@@ -121,9 +121,8 @@ class SubvariableFlow:
     def trace_forward(self, rvn: ReplaceVarnode) -> bool:
         # Get all uses of rvn.vn
         uses = []
-        for op in self.data.ops:
-            if rvn.vn in op.inputs:
-                uses.append((op, list(op.inputs).index(rvn.vn)))
+        for op in self.data.get_uses(rvn.vn):
+            uses.append((op, list(op.inputs).index(rvn.vn)))
                 
         for op, slot in uses:
             outvn = op.output
