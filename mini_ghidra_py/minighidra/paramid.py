@@ -68,6 +68,7 @@ class PcodeVarnode:
     name: str
     size_bits: int
     kind: str
+    is_spacebase: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2875,6 +2876,26 @@ class PcodeLikeGraph:
         return None
 
     
+    def op_set_output(self, op: PcodeOp, new_out: int | None) -> PcodeOp:
+        self.clear_nzmask_cache()
+        new_op = object.__new__(PcodeOp)
+        new_op.__dict__.update(op.__dict__)
+        new_op.output = new_out
+        try:
+            idx = self.ops.index(op)
+            self.ops[idx] = new_op
+            
+            # Remove old definition
+            if op.output is not None and self._definitions.get(op.output) == idx:
+                del self._definitions[op.output]
+                
+            # Set new definition
+            if new_out is not None:
+                self._definitions[new_out] = idx
+        except ValueError:
+            pass
+        return new_op
+        
     def op_flip_in_place_test(self, op: PcodeOp, fliplist: list[PcodeOp], allow_op_removal: bool) -> int:
         if op.opcode == "CBRANCH":
             vn = op.inputs[1]

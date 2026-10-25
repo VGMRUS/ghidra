@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .action import Action
 from .merge import Merge
-from .paramid import PcodeLikeGraph
+from .paramid import PcodeLikeGraph, PcodeOp
 
 
 class ActionNameVars(Action):
@@ -133,6 +133,38 @@ class ActionSpacebase(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
+        SPACEBASE_NAMES = {"RSP", "ESP", "SP", "RBP", "EBP", "BP"}
+        
+        for vn, node in enumerate(data.nodes):
+            if not node: continue
+            name_upper = (node.name or "").upper()
+            
+            # If the node represents a known spacebase or spacebase_in
+            if any(name_upper == base or name_upper.startswith(base + "_IN") for base in SPACEBASE_NAMES):
+                object.__setattr__(node, "is_spacebase", True)
+                
+                def_op = data.get_def(vn)
+                if def_op is not None and def_op.opcode == "INT_ADD":
+                    uses = data.get_uses(vn)
+                    if len(uses) > 1:
+                        # Split uses: clone the ADD operation for each extra use
+                        for use_op in uses[1:]:
+                            new_vn = data._new_temporary_node(f"{node.name}_split", node.size_bits)
+                            object.__setattr__(data.nodes[new_vn], "is_spacebase", True)
+                            
+                            new_add = PcodeOp()
+                            new_add.opcode = "INT_ADD"
+                            new_add.inputs = tuple(def_op.inputs)
+                            new_add.address = def_op.address
+                            new_add.output = new_vn
+                            data._append_operation(new_add)
+                            
+                            # Update the use
+                            idx = list(use_op.inputs).index(vn)
+                            data.op_set_input(use_op, new_vn, idx)
+                        
+                        self.count += 1
+                        
         return 0
 
 
