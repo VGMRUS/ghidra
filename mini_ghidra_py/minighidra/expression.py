@@ -1,5 +1,5 @@
 from typing import Optional, List, Tuple
-from minighidra.model import PcodeOp, PcodeVarnode, PcodeLikeGraph
+from minighidra.paramid import PcodeOp, PcodeVarnode, PcodeLikeGraph
 
 class AdditiveEdge:
     def __init__(self, op: PcodeOp, slot: int, multop: Optional[PcodeOp]):
