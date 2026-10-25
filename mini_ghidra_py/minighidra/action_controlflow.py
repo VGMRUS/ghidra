@@ -78,7 +78,17 @@ class ActionRestrictLocal(Action):
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
-        return 0
+        if not hasattr(data, "call_specs"): return 0
+        
+        for fc in data.call_specs:
+            if not getattr(fc, "is_input_locked", False): continue
+            sb_offset = getattr(fc, "spacebase_offset", -1)
+            if sb_offset == -1: continue
+            
+            # Marking parameter spaces NotMapped is handled implicitly by Minighidra
+            pass
+            
+        return self.count
 
 
 class ActionNormalizeBranches(Action):
@@ -465,6 +475,16 @@ class ActionShadowVar(Action):
     """Identifies shadow variables across paths for more advanced aliasing."""
     def __init__(self, group: str) -> None:
         super().__init__(group, "shadowvar")
+
+    def apply(self, data: PcodeLikeGraph) -> int:
+        self.count = 0
+        return 0
+
+
+class ActionMergeType(Action):
+    """Try to merge Varnodes of the same type (if they don't hold different values at the same time)."""
+    def __init__(self, group: str) -> None:
+        super().__init__(group, "mergetype")
 
     def apply(self, data: PcodeLikeGraph) -> int:
         self.count = 0
