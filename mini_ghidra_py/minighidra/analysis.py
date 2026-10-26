@@ -58,6 +58,13 @@ _SCALAR_SENTINELS = frozenset(
     }
 )
 
+#: Indicador de no-retorno **ambiguo**: que el fall-through de una llamada sea
+#: la entrada de una función no prueba que la llamada no retorne. VC6 coloca el
+#: bloque de ``throw`` justo antes del prólogo real, así que el indicador se
+#: cumple también en llamadas que sí retornan (ver
+#: ``_discard_returning_noreturns``).
+_NORETURN_AMBIGUOUS_INDICATOR = "function entry at call fall-through"
+
 
 class Analyzer:
     """Build an in-memory static-analysis index for one :class:`BinaryImage`."""
@@ -106,6 +113,10 @@ class Analyzer:
         self.strings: list[StringEntry] = []
         self.noreturn_catalog = NoReturnCatalog.for_format(image.format)
         self.no_return_addresses: set[int] = set()
+        # Marcas del catálogo de nombres conocidos (`ExitProcess`, `abort`…).
+        # Nunca se auditan contra el cuerpo recuperado: una importación no tiene
+        # cuerpo en la imagen.
+        self._catalog_noreturns: set[int] = set()
         self.no_return_matches: dict[int, str] = {}
         self.no_return_evidence: dict[int, list[str]] = {}
         self.no_return_imports: list[tuple[object, str]] = []
@@ -116,6 +127,7 @@ class Analyzer:
         self._find_strings()
         self._find_function_seeds()
         self._mark_known_noreturns()
+        self._catalog_noreturns = set(self.no_return_addresses)
         self._recover_functions()
         self._discover_macho_function_starts()
         self._discover_pattern_function_starts()
@@ -133,6 +145,11 @@ class Analyzer:
         if self._promote_data_pointer_targets():
             self._recover_functions()
         self._infer_no_return_functions()
+        # Las llamadas no retornantes cierran el cuerpo en el sitio de llamada;
+        # lo que viene detrás puede ser la entrada real de una función que nadie
+        # más nombra (bloque de `throw` de VC6 colocado antes del prólogo).
+        if self._promote_noreturn_fallthroughs():
+            self._recover_functions()
         self._infer_stack_purge_sizes()
         self.instruction_addresses = sorted(self.instructions)
 
@@ -1031,6 +1048,50 @@ class Analyzer:
             wrappers_added = True
         if wrappers_added:
             self._recover_functions()
+        self._discard_returning_noreturns()
+
+    def _discard_returning_noreturns(self) -> None:
+        """Descarta marcas *inferidas* cuyo cuerpo recuperado contiene un ``ret``.
+
+        El indicador ``function entry at call fall-through`` es ambiguo: VC6
+        coloca el bloque de ``throw`` justo antes del prólogo de la función a la
+        que pertenece, de modo que el fall-through de ``call _CxxThrowException``
+        es una entrada de función legítima y la llamada **sí** retorna (al código
+        muerto del throw, o al bloque siguiente). En GXSCC.exe marcaba
+        ``0x41E748`` (``_CxxThrowException``, 154 sitios, cuerpo que termina en
+        ``ret``) y ``0x41EA1C`` (12 sitios, termina en ``ret 8``).
+
+        La auditoría sólo es válida con las marcas ya aplicadas: un cuerpo
+        recuperado sin ellas se pasa de largo y absorbe el ``ret`` de la función
+        vecina, lo que descartaría casi todas las marcas (probado: 383 → 2). Con
+        las marcas puestas, 380 de 383 cuerpos no tienen ``ret`` y sobreviven.
+
+        No veta la evidencia **fuerte** (trampa tras la llamada, fin del código
+        descodificado o propagación por wrappers): ahí el ``ret`` del cuerpo
+        puede ser código muerto o compartido, y Ghidra también agrega evidencia
+        en vez de descartarla. Sólo deshace el empate cuando la marca se apoya
+        únicamente en el indicador ambiguo.
+        """
+        dudosas = set()
+        for address in self.no_return_addresses - self._catalog_noreturns:
+            if not self._function_can_return(address):
+                continue
+            evidence = self.no_return_evidence.get(address, [])
+            if not evidence:
+                continue
+            if any(
+                not item.endswith(_NORETURN_AMBIGUOUS_INDICATOR) for item in evidence
+            ):
+                continue
+            dudosas.add(address)
+        if not dudosas:
+            return
+        for address in dudosas:
+            self.no_return_addresses.discard(address)
+            self.no_return_evidence[address].append(
+                "descartada: el cuerpo recuperado termina en `ret`"
+            )
+        self._recover_functions()
 
     def _infer_no_return_from_call_sites(self, threshold: int) -> bool:
         evidence: dict[int, dict[int, str]] = defaultdict(dict)
@@ -1060,13 +1121,64 @@ class Analyzer:
             added = True
         return added
 
+    def _function_can_return(self, address: int) -> bool:
+        """True si el cuerpo recuperado de ``address`` contiene un ``ret``.
+
+        Sólo se consulta para descartar marcas *inferidas* desde sitios de
+        llamada; las del catálogo (`ExitProcess`, `abort`…) no pasan por aquí.
+        """
+        function = self.functions.get(address)
+        if function is None or not function.instructions:
+            return False
+        return any(instruction.is_return for instruction in function.instructions)
+
+    def _promote_noreturn_fallthroughs(self) -> int:
+        """Siembra función en el fall-through de una llamada no retornante.
+
+        El seguimiento de flujo cierra el cuerpo en la llamada, que es correcto,
+        pero lo que viene detrás sigue siendo código: si ninguna llamada, salto
+        ni puntero lo nombra, queda desensamblado y fuera de toda función. Es el
+        caso del bloque de `throw` de VC6, que el compilador coloca justo antes
+        del prólogo real (en GXSCC.exe, 15.008 instrucciones huérfanas tras 696
+        llamadas, el 76 % de todo el código sin función). Ghidra incluye esas
+        direcciones en la función que arranca en el bloque de throw.
+
+        Se descarta el fall-through que ya pertenece a una función (por flujo o
+        por span) y el que es una trampa (relleno `int3` tras la llamada).
+        """
+        added = 0
+        for instruction in self.instructions.values():
+            if not self._call_is_noreturn(instruction):
+                continue
+            following = instruction.next_address
+            if following in self.function_seeds:
+                continue
+            candidate = self.instructions.get(following)
+            if candidate is None or candidate.is_trap:
+                continue
+            if candidate.mnemonic in {"call", "ret", "retn", "jmp"}:
+                continue
+            try:
+                self.function_at(following)
+            except ValueError:
+                pass
+            else:
+                continue
+            self._add_seed(
+                following,
+                self._name_by_address.get(following, ""),
+                "noreturn fall-through",
+            )
+            added += 1
+        return added
+
     def _call_site_nonreturn_indicator(self, call: Instruction) -> str | None:
         """Check a bounded fall-through chain for Ghidra-style warning signs."""
         address = call.next_address
         visited: set[int] = set()
         for _ in range(256):
             if address in self.function_seeds:
-                return "function entry at call fall-through"
+                return _NORETURN_AMBIGUOUS_INDICATOR
             if address in visited:
                 return None
             visited.add(address)

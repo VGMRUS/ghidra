@@ -539,7 +539,141 @@ Ghidra anota `0x42E2F7`…`0x42E61D` como dentro de `FUN_0042e275`.
 
 Auditoría de las 383 marcas *no retornantes*: 380 coherentes (ningún `ret` en el cuerpo); 2 con `ret`: `0x41E748` (correcta de todos modos) y **`0x41EA1C`** (24 instrucciones, termina en `ret 8`, 12 llamadas → **falso positivo**). Ambas se generaron con la evidencia `function entry at call fall-through`, que es justo la regla que la disposición de VC6 rompe.
 
-Corrección propuesta y **no aplicada** (exige repetir la validación completa): sembrar función en el *fall-through* de una llamada no retornante cuando está decodificado y no pertenece a nadie —la misma forma que la regla C2 de "salto tras `ret`"— y endurecer la inferencia *no-return* para descartar candidatas cuyo cuerpo termina en `ret`. Recuperaría ~15.000 instrucciones y acercaría el acuerdo de fronteras al de Ghidra.
+Corrección propuesta en su día y **aplicada en la sección siguiente** (con la validación completa repetida): sembrar función en el *fall-through* de una llamada no retornante cuando está decodificado y no pertenece a nadie —la misma forma que la regla C2 de "salto tras `ret`"— y endurecer la inferencia *no-return* para descartar candidatas cuyo cuerpo termina en `ret`.
 
 Como en el resto del proyecto: sólo análisis estático, el binario no se ejecuta nunca y su hash no cambia (`1eeeecf6…4992f7a` verificado antes y después), no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
 
+## Llamadas no retornantes: auditoría de evidencia ambigua y promoción del *fall-through* (2026-10-26)
+
+Aplica la corrección que la sección anterior dejaba propuesta. Dos cambios en
+`minighidra/analysis.py`, los dos medidos contra el listado real de Ghidra y
+contra `/bin/bash`:
+
+1. **`_discard_returning_noreturns()`** — descarta las marcas *inferidas* cuyo
+   cuerpo recuperado contiene un `ret`, pero **sólo** cuando toda su evidencia es
+   el indicador ambiguo `function entry at call fall-through`. El catálogo de
+   nombres conocidos (`ExitProcess`, `abort`…) no se audita: una importación no
+   tiene cuerpo en la imagen.
+2. **`_promote_noreturn_fallthroughs()`** — siembra función en el *fall-through*
+   de una llamada no retornante cuando está decodificado, no es una trampa, no
+   empieza por `call`/`ret`/`jmp` y no pertenece a ninguna función (por flujo ni
+   por span). Es la misma forma que la regla C2 de "salto tras `ret`". Se ejecuta
+   después de `_infer_no_return_functions()`, con el conjunto de marcas ya
+   estable, y relanza `_recover_functions()` si siembra algo.
+
+### Dos decisiones de diseño que la medición impuso
+
+- **La auditoría por cuerpo no puede hacerse durante la inferencia.** Los cuerpos
+  se recuperan *antes* de marcar, de modo que el recorrido atraviesa la llamada y
+  absorbe el `ret` de la función vecina: aplicada dentro de
+  `_infer_no_return_from_call_sites`, la regla descartaba **383 → 2** marcas (se
+  medía la cascada: al no marcar una, el cuerpo siguiente se alargaba aún más).
+  Con las marcas puestas, 380 de 383 cuerpos no tienen `ret` y sobreviven.
+- **El `ret` del cuerpo no veta la evidencia fuerte.** Los tres tests existentes
+  de inferencia dinámica usan un objetivo cuyo cuerpo es un `ret` desnudo con tres
+  trampas `INT3` tras las llamadas: allí la marca es correcta. La auditoría sólo
+  deshace el empate cuando la evidencia es *únicamente* la ambigua; una trampa, el
+  fin del código decodificado o la propagación por wrappers siguen ganando
+  (`test_strong_evidence_survives_a_returning_body`). Ghidra también agrega
+  evidencia en vez de descartarla.
+- El filtro de prólogo plausible (no sembrar un *fall-through* que empiece por
+  `call`/`ret`/`jmp`) **no cambia ninguna cifra del oráculo** (1.322/162/0 idéntico
+  con y sin él) y evita 17 funciones con entrada inverosímil; se mantiene por
+  coherencia con la regla C2.
+
+### Medición en GXSCC.exe (mismo oráculo antes y después)
+
+La herramienta versionada `tools/diff_asm.py` enriqueció además el oráculo: ahora
+también lee las líneas indentadas `0xADDR (FUN_x): …`, `0xADDR in FUN_x: …`,
+`0xADDR (?): …` y `0xADDR (in FUN_x)`, que son sitios de referencia con su función
+contenedora. Las direcciones anotadas pasan de 1.271 a **1.484** y los inicios de
+función citados por Ghidra de 230 a **281**. Todas las cifras de abajo usan ese
+oráculo enriquecido, con el código anterior y con el nuevo.
+
+| métrica | antes | después |
+| --- | --- | --- |
+| funciones recuperadas | 2.586 | **2.872** |
+| thunks | 357 | 359 |
+| instrucciones decodificadas | 94.774 | 94.774 |
+| marcas no retornantes | 383 | **381** (`0x41E748`, `0x41EA1C` fuera) |
+| semillas `noreturn fall-through` | — | **303** |
+| instrucciones fuera del span de toda función | 17.374 (18,33 %) | **4.299 (4,54 %)** |
+| huérfanas explicadas por cortes tras llamada | 15.008 (76,2 % de las huérfanas) | **44 (1,0 %)** |
+| función contenedora igual (span) | 1.241/1.484 (83,6 %) | **1.322/1.484 (89,1 %)** |
+| direcciones anotadas **sin** función | 145 | **0** |
+| direcciones anotadas en función distinta | 98 | 162 |
+| inicios citados por Ghidra recuperados | 216/230 (93,9 %) | **265/281 (94,3 %)** |
+| líneas `XR()` coincidentes | 22/24 | 17/24 |
+| texto idéntico tras normalizar | 25.893/25.896 (99,99 %) | 25.893/25.896 (99,99 %) |
+
+El desensamblado no cambia: las 3 diferencias residuales siguen siendo las mismas
+(`0x41D2E6`/`0x41D6E5`, donde Ghidra fusiona `WAIT` en `FSTCW`, y `0x40D994`,
+datos barridos como código).
+
+Los dos falsos positivos eliminados son exactamente los que la auditoría de la
+sección anterior predijo: `_CxxThrowException` (`0x41E748`, 154 sitios, cuerpo que
+termina en `ret`) y `0x41EA1C` (12 sitios, termina en `ret 8`). Al desmarcarlos, el
+flujo atraviesa la llamada y `FUN_42E275` pasa de 2 a 48 instrucciones y
+`FUN_4029E0` cubre la región que Ghidra anota como suya.
+
+Acuerdo con la documentación de ingeniería inversa, **sin cambio**: 37/37
+direcciones del `mapa_funciones_GXSCC.csv` siguen siendo inicios exactos y 63/66
+referencias `FUN_` del bundle siguen siendo función propia (las mismas 3
+interiores: `0x405311`, `0x405354`, `0x414A43`).
+
+### Equivalencia A/B en `/bin/bash` (muestra fijada a símbolos)
+
+| métrica | base (HEAD) | nueva |
+| --- | --- | --- |
+| instrucciones / xrefs | 193.628 / 74.671 | 193.628 / 74.671 |
+| funciones | 2.722 | **3.225** (+503) |
+| funciones perdidas | — | **0** |
+| cuerpos idénticos / reducidos / crecidos | — | 2.713 / 2 / 7 |
+| thunks | 336 | 365 |
+| marcas no retornantes | 60 | **58** |
+| pseudocódigo de la muestra (80 símbolos) | — | **0 cambiados** |
+| análisis | 10,75 s | 11,35 s (+5,6 %) |
+
+Las 503 funciones nuevas coinciden una a una con las 503 semillas
+`noreturn fall-through`; ningún otro origen de semillas cambia. Los 7 cuerpos que
+crecen son funciones cuyo flujo ahora atraviesa una llamada que antes se daba por
+no retornante.
+
+### Desviaciones nuevas (todas a favor de cobertura, ninguna oculta)
+
+- **5 líneas `XR()` que Ghidra marca `ORFANO` ahora discrepan** (`0x402A32`,
+  `0x402C60`, `0x40EB4A`, `0x4135F8`, `0x413637`): la promoción crea función donde
+  Ghidra no la tiene. Es el precio de recuperar 13.075 instrucciones; antes
+  coincidían porque ninguno de los dos tenía función ahí.
+- `0x402A04` **sigue sin ser inicio propio**: ahora cae dentro de `0x4029F1` (307
+  instrucciones) en vez de no tener función. Ghidra lo anota como `FUN_00402a04`.
+  Su única referencia entrante es un `je` desde código huérfano.
+- Las direcciones anotadas que caen en una función **distinta** suben de 98 a 162:
+  hay más direcciones con función, no siempre la misma que Ghidra.
+- Los 16 inicios citados que faltan siguen siendo los mismos tipos: 5 funclets SEH
+  de VC6 (nuestra entrada es 3–8 bytes anterior, justo la que el código nombra con
+  `mov eax,<addr>; ret`), 8 copias de inicialización de voz SCC sin ninguna xref y
+  sin ninguna aparición del dword en toda la imagen, y 3 casos más
+  (`0x402A04`, `0x405354`, `0x405440`).
+
+### Herramienta versionada
+
+`tools/diff_asm.py` es la versión reproducible del arnés de validación: no depende
+de rutas absolutas, filtra volcados de bytes, etiquetas de datos, líneas `XR()` y
+de evidencia, aplica las normalizaciones de `canonizar()` y emite los siete
+informes (listado, cobertura, identidad de texto, función contenedora, inicios
+citados, código fuera de función, rangos `D()`). Uso:
+
+```
+python tools/diff_asm.py LISTADO.binario.txt BINARIO [--residual SALIDA.txt]
+```
+
+### Validación
+
+- Suite completa: **444/444 OK** (3 tests nuevos en
+  `FlowResyncAndBoundaryTests`: descarte de evidencia ambigua con cuerpo que
+  retorna, supervivencia de la evidencia fuerte y promoción del *fall-through*).
+- `pyflakes` sin avisos en `analysis.py` y `tools/diff_asm.py`.
+- Sólo análisis estático: GXSCC.exe no se ejecuta nunca, su hash no cambia
+  (`1eeeecf6…4992f7a`), no quedan procesos vivos y **no se afirma paridad total con
+  Ghidra**.
