@@ -596,7 +596,7 @@ oráculo enriquecido, con el código anterior y con el nuevo.
 | thunks | 357 | 359 |
 | instrucciones decodificadas | 94.774 | 94.774 |
 | marcas no retornantes | 383 | **381** (`0x41E748`, `0x41EA1C` fuera) |
-| semillas `noreturn fall-through` | — | **303** |
+| semillas `noreturn fall-through` | — | **286** |
 | instrucciones fuera del span de toda función | 17.374 (18,33 %) | **4.299 (4,54 %)** |
 | huérfanas explicadas por cortes tras llamada | 15.008 (76,2 % de las huérfanas) | **44 (1,0 %)** |
 | función contenedora igual (span) | 1.241/1.484 (83,6 %) | **1.322/1.484 (89,1 %)** |
