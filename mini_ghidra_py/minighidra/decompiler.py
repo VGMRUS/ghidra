@@ -77,6 +77,12 @@ from .sleigh import SleighInstruction, SleighTranslator, SleighVarnode
 from .ssa import SSAFunction, SSAHeritage, SSAOperand, SSAOperation, SSALocation
 from .typesys import StorageLocation, TypeDatabase, TypeKind
 
+# Patrones de phi precompilados: `_prune_dead_phis` los aplica a cada línea del
+# cuerpo y construirlos a mano por cada nombre de phi hacía que el decompilador
+# no terminara en funciones grandes (GXSCC FUN_4139E0, 1.592 instrucciones).
+_PHI_DEFINITION = re.compile(r"^\s*(phi_[A-Za-z0-9_]+)\s*=\s*phi\(")
+_PHI_REFERENCE = re.compile(r"\bphi_[A-Za-z0-9_]+\b")
+
 
 @dataclass(frozen=True, slots=True)
 class _Expr:
@@ -6440,7 +6446,14 @@ class SemanticDecompiler:
             elif isinstance(b, BlockCondition):
                 # Cada clausula se orienta respecto a la salida verdadera del
                 # bloque combinado (De Morgan si hace falta negar el conjunto).
-                true_entry = front_addr(b.get_true_out() if b.size_out() else None)
+                # Si el nodo es interior a otro, copyIn le ha retirado las
+                # aristas que salian del grupo y puede quedar con una sola
+                # salida: ahi no se puede consultar getTrueOut() (Ghidra tampoco
+                # lo hace) y la etiqueta del goto la descarta extract_condition
+                # del padre, asi que se deja la polaridad sin inventar.
+                true_entry = (
+                    front_addr(b.get_true_out()) if b.size_out() > 1 else None
+                )
                 cond1, stmts1 = extract_condition(render_block(b.cond1))
                 cond2, stmts2 = extract_condition(render_block(b.cond2))
                 if needs_negation(b.cond1, true_entry):
@@ -8733,13 +8746,17 @@ class SemanticDecompiler:
 
         phi_names = set(phi_values)
         live: set[str] = set()
+        # Una sola expresión regular por línea en vez de una por cada nombre de
+        # phi: con funciones grandes (1.592 instrucciones en FUN_4139E0 de
+        # GXSCC) el bucle anterior hacía cientos de miles de re.match con
+        # patrones construidos a mano y el decompilador no terminaba.
+        definition = _PHI_DEFINITION.match
+        references = _PHI_REFERENCE.findall
         for line in body:
-            if any(
-                re.match(rf"^\s*{re.escape(name)}\s*=\s*phi\(", line)
-                for name in phi_names
-            ):
+            match = definition(line)
+            if match is not None and match.group(1) in phi_names:
                 continue
-            live.update(re.findall(r"\bphi_[A-Za-z0-9_]+\b", line))
+            live.update(references(line))
         live.intersection_update(phi_names)
 
         pending = list(live)
@@ -8753,15 +8770,11 @@ class SemanticDecompiler:
 
         result = []
         for line in body:
-            definition = next(
-                (
-                    name
-                    for name in phi_names
-                    if re.match(rf"^\s*{re.escape(name)}\s*=\s*phi\(", line)
-                ),
-                None,
-            )
-            if definition is None or definition in live:
+            match = definition(line)
+            defined = match.group(1) if match is not None else None
+            if defined is not None and defined not in phi_names:
+                defined = None
+            if defined is None or defined in live:
                 result.append(line)
         return result
 
