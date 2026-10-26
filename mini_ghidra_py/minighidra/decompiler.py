@@ -6146,7 +6146,24 @@ class SemanticDecompiler:
         return f"phi_{safe}_loc_{block_start:X}"
 
     def _structure_control_flow(self, body: list[str]) -> list[str]:
-        from .block import BlockGraph, FlowBlock, BlockBasic, BlockList, BlockIf, BlockIfElse, BlockWhileDo, BlockDoWhile, BlockInfLoop, BlockSwitch, BlockIfNoExit, BlockCondition
+        from .block import (
+            BlockGraph,
+            FlowBlock,
+            BlockBasic,
+            BlockList,
+            BlockIf,
+            BlockIfElse,
+            BlockWhileDo,
+            BlockDoWhile,
+            BlockInfLoop,
+            BlockSwitch,
+            BlockIfNoExit,
+            BlockCondition,
+            BlockGoto,
+            BlockIfGoto,
+            BlockMultiGoto,
+            StructureError,
+        )
         from .collapse import CollapseStructure
         import re
 
@@ -6175,31 +6192,159 @@ class SemanticDecompiler:
 
         # Build graph
         graph = BlockGraph()
-        graph.build_copy(self._blocks)
-        
-        collapse = CollapseStructure(graph)
-
-
-
-        collapse.collapse_all()
+        try:
+            graph.build_copy(self._blocks)
+            collapse = CollapseStructure(graph)
+            collapse.collapse_all()
+        except (StructureError, RecursionError):
+            # Ghidra lanza LowlevelError cuando no puede terminar de colapsar la
+            # estructura; aquí se vuelve a la impresion plana con etiquetas/goto
+            # (el mismo ``body`` que ya genera el trazado plano del CFG).
+            self._structured_graph = None
+            self._structure_fallback = "structure-error"
+            return body
         self._structured_graph = graph
-        
+
+        self._structure_fallback = None
+
         def extract_condition(lines: list[str]) -> tuple[str, list[str]]:
-            new_lines = []
+            """Condicion del ultimo salto condicional + resto de sentencias.
+
+            Solo se retira esa ultima linea: las llaves y los ``goto`` de los
+            nodos interiores forman parte del codigo y deben conservarse.
+            """
+            pattern = re.compile(r"^\s*if \(.*\) goto .+;\s*$")
+            deciding = -1
+            for index, line in enumerate(lines):
+                if pattern.match(line):
+                    deciding = index
             cond = "true"
-            for line in lines:
-                m = re.search(r"if \((.*)\) goto", line)
-                if m:
-                    cond = m.group(1)
-                elif line.strip() == "}" or line.strip().startswith("goto "):
-                    pass
+            new_lines: list[str] = []
+            for index, line in enumerate(lines):
+                if index == deciding:
+                    match = re.search(r"if \((.*)\) goto", line)
+                    cond = match.group(1) if match else "true"
                 else:
                     new_lines.append(line)
             return cond, new_lines
-            
+
         def indent(lines: list[str], spaces: int = 4) -> list[str]:
             prefix = " " * spaces
             return [prefix + line for line in lines]
+
+        def label_for(addr: int | None) -> str:
+            return f"loc_{addr:X}" if isinstance(addr, int) else "loc_unknown"
+
+        def leaves_of(bl: FlowBlock | None) -> list[FlowBlock]:
+            """Hojas ``basic`` de un nodo estructurado, en orden de emision."""
+            if bl is None:
+                return []
+            if isinstance(bl, BlockBasic):
+                return [bl]
+            out: list[FlowBlock] = []
+            for child in getattr(bl, "blocks", None) or ():
+                out.extend(leaves_of(child))
+            return out
+
+        def front_addr(bl: FlowBlock | None) -> int | None:
+            leaves = leaves_of(bl)
+            return leaves[0].start_addr if leaves else None
+
+        def deciding_leaf(bl: FlowBlock | None) -> FlowBlock | None:
+            """Hoja cuyo salto condicional decide la salida de ``bl``.
+
+            Ghidra imprime la condicion del ultimo CBRANCH del bloque
+            condicional y deduce de el la polaridad; un bloque condicional
+            puede ser un ``BlockList`` o un ``BlockCondition`` completos.
+            """
+            leaves = leaves_of(bl)
+            for leaf in reversed(leaves):
+                term = self._terminators.get(leaf.start_addr)
+                if term is not None and term.kind in ("cbranch", "cbranch_indirect"):
+                    return leaf
+            return leaves[-1] if leaves else None
+
+        def needs_negation(cond_block: FlowBlock | None, entry: int | None) -> bool:
+            """``isFallthruTrue``: la rama estructurada es la caida, no el salto."""
+            leaf = deciding_leaf(cond_block)
+            if leaf is None or entry is None:
+                return False
+            term = self._terminators.get(leaf.start_addr)
+            if term is None or term.kind not in ("cbranch", "cbranch_indirect"):
+                return False
+            if getattr(term, "true_target", None) == entry:
+                return False
+            return getattr(term, "fallthrough", None) == entry
+
+        def negate_text(text: str) -> str:
+            """Negacion textual: invierte el comparador o envuelve en ``!(...)``.
+
+            Equivale al ``negatetoken``/``check_print_negation`` de PrintC.
+            """
+            complement = {
+                "<=": ">",
+                ">=": "<",
+                "<": ">=",
+                ">": "<=",
+                "==": "!=",
+                "!=": "==",
+            }
+            stripped = text.strip()
+            if stripped.startswith("!(") and stripped.endswith(")"):
+                # !(!(x)) == x: se retira la negacion exterior si cierra todo.
+                depth = 0
+                for index, char in enumerate(stripped[1:], start=1):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0:
+                            if index == len(stripped) - 1:
+                                return stripped[2:index]
+                            break
+            depth = 0
+            found: tuple[int, str] | None = None
+            compound = False
+            index = 0
+            length = len(text)
+            while index < length:
+                char = text[index]
+                if char in "([":
+                    depth += 1
+                elif char in ")]":
+                    depth -= 1
+                elif depth == 0:
+                    if text.startswith("&&", index) or text.startswith("||", index):
+                        # !(a || b) no es !(a) || !(b): hay que negar todo.
+                        compound = True
+                        index += 1
+                    elif text.startswith("?", index):
+                        compound = True
+                    else:
+                        previous = text[index - 1] if index else " "
+                        for op in ("<=", ">=", "==", "!=", "<", ">"):
+                            if not text.startswith(op, index):
+                                continue
+                            following = text[index + len(op) : index + len(op) + 1]
+                            if previous in "<>=!&|" or following in "<>=&|":
+                                break  # desplazamientos u operadores compuestos
+                            found = (index, op)
+                            index += len(op) - 1
+                            break
+                index += 1
+            if found is not None and not compound:
+                start, op = found
+                return text[:start] + complement[op] + text[start + len(op) :]
+            return f"!({text})"
+
+        def branch_condition(
+            cond_block: FlowBlock | None, entry: int | None
+        ) -> tuple[str, list[str]]:
+            """Condicion orientada a la rama estructurada + sentencias previas."""
+            cond, statements = extract_condition(render_block(cond_block))
+            if needs_negation(cond_block, entry):
+                cond = negate_text(cond)
+            return cond, statements
 
         def render_block(b: FlowBlock) -> list[str]:
             if isinstance(b, BlockBasic):
@@ -6213,15 +6358,43 @@ class SemanticDecompiler:
                 for child in b.blocks:
                     res.extend(render_block(child))
                 return res
-            elif isinstance(b, BlockIf):
-                cond, body_stmts = extract_condition(render_block(b.cond_block))
+            elif isinstance(b, BlockMultiGoto):
+                # BlockGoto con varias aristas no estructuradas: se imprimen las
+                # sentencias del bloque y un goto por cada arista (PrintC hace lo
+                # mismo en emitBlockMultiGoto).
+                res = []
+                for child in b.blocks:
+                    res.extend(render_block(child))
+                seen: set[int] = set()
+                for target in list(getattr(b, "gotoedges", None) or ()):
+                    addr = front_addr(target)
+                    if addr is None or addr in seen:
+                        continue
+                    seen.add(addr)
+                    res.append(f"goto {label_for(addr)};")
+                return res
+            elif isinstance(b, BlockGoto):
+                res = []
+                for child in b.blocks:
+                    res.extend(render_block(child))
+                target = getattr(b, "gototarget", None)
+                addr = front_addr(target if isinstance(target, FlowBlock) else None)
+                if addr is not None:
+                    res.append(f"goto {label_for(addr)};")
+                return res
+            elif isinstance(b, BlockIfGoto):
+                # Debe comprobarse antes que BlockIf (BlockIfGoto lo hereda).
+                target = getattr(b, "gototarget", None)
+                addr = front_addr(target if isinstance(target, FlowBlock) else None)
+                cond, body_stmts = branch_condition(b.cond_block, addr)
                 res = body_stmts
-                res.append(f"if ({cond}) {{")
-                res.extend(indent(render_block(b.true_block)))
-                res.append("}")
+                res.append(f"if ({cond}) goto {label_for(addr)};")
                 return res
             elif isinstance(b, BlockIfElse):
-                cond, body_stmts = extract_condition(render_block(b.cond_block))
+                # Debe comprobarse antes que BlockIf (BlockIfElse lo hereda).
+                cond, body_stmts = branch_condition(
+                    b.cond_block, front_addr(b.true_block)
+                )
                 res = body_stmts
                 res.append(f"if ({cond}) {{")
                 res.extend(indent(render_block(b.true_block)))
@@ -6229,8 +6402,19 @@ class SemanticDecompiler:
                 res.extend(indent(render_block(b.false_block)))
                 res.append("}")
                 return res
+            elif isinstance(b, BlockIf):
+                cond, body_stmts = branch_condition(
+                    b.cond_block, front_addr(b.true_block)
+                )
+                res = body_stmts
+                res.append(f"if ({cond}) {{")
+                res.extend(indent(render_block(b.true_block)))
+                res.append("}")
+                return res
             elif isinstance(b, BlockWhileDo):
-                cond, body_stmts = extract_condition(render_block(b.cond_block))
+                cond, body_stmts = branch_condition(
+                    b.cond_block, front_addr(b.body_block)
+                )
                 res = []
                 res.append(f"while ({cond}) {{")
                 res.extend(indent(body_stmts))
@@ -6238,13 +6422,14 @@ class SemanticDecompiler:
                 res.append("}")
                 return res
             elif isinstance(b, BlockDoWhile):
-                res = []
-                res.append("do {")
-                res.extend(indent(render_block(b.body_block)))
-                # The condition is inside body_block's end
-                # We need to extract it
-                # For now, just generic do-while
-                res.append("} while (true);")
+                # La condicion esta al final del cuerpo y repite el bucle cuando
+                # es verdadera (la arista de vuelta es la salida verdadera).
+                cond, body_stmts = branch_condition(
+                    b.body_block, front_addr(b.body_block)
+                )
+                res = ["do {"]
+                res.extend(indent(body_stmts))
+                res.append(f"}} while ({cond});")
                 return res
             elif isinstance(b, BlockInfLoop):
                 res = []
@@ -6253,13 +6438,24 @@ class SemanticDecompiler:
                 res.append("}")
                 return res
             elif isinstance(b, BlockCondition):
+                # Cada clausula se orienta respecto a la salida verdadera del
+                # bloque combinado (De Morgan si hace falta negar el conjunto).
+                true_entry = front_addr(b.get_true_out() if b.size_out() else None)
                 cond1, stmts1 = extract_condition(render_block(b.cond1))
                 cond2, stmts2 = extract_condition(render_block(b.cond2))
+                if needs_negation(b.cond1, true_entry):
+                    cond1 = negate_text(cond1)
+                if needs_negation(b.cond2, true_entry):
+                    cond2 = negate_text(cond2)
                 res = stmts1 + stmts2
-                res.append(f"if (({cond1}) {b.op} ({cond2})) goto placeholder;")
+                res.append(
+                    f"if (({cond1}) {b.op} ({cond2})) goto {label_for(true_entry)};"
+                )
                 return res
             elif isinstance(b, BlockIfNoExit):
-                cond, body_stmts = extract_condition(render_block(b.cond_block))
+                cond, body_stmts = branch_condition(
+                    b.cond_block, front_addr(b.true_block)
+                )
                 res = body_stmts
                 res.append(f"if ({cond}) {{")
                 res.extend(indent(render_block(b.true_block)))
@@ -6270,8 +6466,20 @@ class SemanticDecompiler:
                     res.append("}")
                 return res
             elif isinstance(b, BlockSwitch):
+                # cases[0] es el bloque que decide; el resto son los casos.
                 res = []
-                res.extend(render_block(b.cases[0]))
+                head = render_block(b.cases[0]) if b.cases else []
+                res.extend(head[:1] if head else ["switch (?) {"])
+                for case in b.cases[1:]:
+                    addr = front_addr(case)
+                    res.append(
+                        f"case {addr:#x}:" if addr is not None else "default:"
+                    )
+                    body = render_block(case)
+                    res.extend(indent(body))
+                    if not body or not body[-1].strip().startswith("goto "):
+                        res.append("    break;")
+                res.append("}")
                 return res
             return []
 

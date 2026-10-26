@@ -1,279 +1,495 @@
-from __future__ import annotations
-from typing import Any
-from .block import FlowBlock, BlockGraph
+"""Puerto de ``LoopBody`` y ``CollapseStructure`` (``blockaction.cc`` de Ghidra).
 
+Correspondencia con el C++:
+
+    LoopBody::extendToContainer   -> blockaction.cc:46
+    LoopBody::update              -> :94
+    LoopBody::findBase            -> :119
+    LoopBody::extend              -> :150
+    LoopBody::findExit            -> :182
+    LoopBody::orderTails          -> :245
+    LoopBody::labelExitEdges      -> :270
+    LoopBody::labelContainments   -> :327
+    LoopBody::emitLikelyEdges     -> :364
+    LoopBody::setExitMarks        -> :416
+    LoopBody::clearExitMarks      -> :430
+    LoopBody::mergeIdenticalHeads -> :446
+    LoopBody::compare_ends        -> :473
+    LoopBody::compare_head        -> :489
+    LoopBody::find                -> :1021
+    LoopBody::clearMarks          -> :1039
+    CollapseStructure::onlyReachableFromRoot -> :1052
+    CollapseStructure::markExitsAsGotos      -> :1083
+    CollapseStructure::clipExtraRoots        -> :1108
+    CollapseStructure::labelLoops            -> :1126
+    CollapseStructure::orderLoopBodies       -> :1148
+    CollapseStructure::updateLoopBody        -> :1193
+    CollapseStructure::selectGoto            -> :1260
+    CollapseStructure::ruleBlock*            -> :1284-1731
+    CollapseStructure::collapseInternal      -> :1780
+    CollapseStructure::collapseConditions    -> :1848
+    CollapseStructure::collapseAll           -> :1875
+
+Desviaciones documentadas (ver ``PORTING_NOTES.md``):
+
+* Ghidra usa ``list<...>::iterator`` para ``likelyiter`` y ``loopbodyiter``; aquí
+  son índices enteros sobre las listas equivalentes.
+* ``negateCondition`` no reescribe el ``CBRANCH`` (los ``FlowBlock`` del puerto
+  no llevan p-code): sólo invierte el orden de las aristas y no contabiliza
+  cambios de dataflow, así que ``getChangeCount()`` refleja sólo los cambios que
+  sí existen en este modelo.
+* ``ruleBlockSwitch`` no construye ``CaseOrder``/``JumpTable`` (no hay tabla de
+  saltos en el modelo de bloques); el impresor reconstruye las etiquetas.
+* ``collapseAll`` y ``collapseInternal`` tienen un presupuesto de pasos: si se
+  agota lanzan ``StructureError`` en lugar de colgar.  Ghidra lanza
+  ``LowlevelError`` cuando ``selectGoto`` no encuentra salida; aquí ese caso
+  también se convierte en ``StructureError`` para que el decompilador pueda
+  volver a la impresión plana con ``goto``.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from .block import (
+    BlockGraph,
+    FlowBlock,
+    StructureError,
+)
+from .tracedag import FloatingEdge, TraceDAG, push_budget
+
+# Presupuesto de pasos de los bucles de estructuración (defensa anti-cuelgue).
+_STEPS_PER_BLOCK = 64
+_STEPS_MIN = 4096
+
+
+def _budget(graph: BlockGraph) -> int:
+    edges = sum(len(bl.out_edges) for bl in graph.blocks)
+    return _STEPS_MIN + _STEPS_PER_BLOCK * (len(graph.blocks) + edges)
 
 
 class LoopBody:
-    def __init__(self, h: 'FlowBlock') -> None:
-        self.head = h
-        self.tails: list['FlowBlock'] = []
-        self.depth: int = 0
-        self.uniquecount: int = 0
-        self.exitblock: 'FlowBlock' | None = None
-        self.immed_container: 'LoopBody' | None = None
-        self.exit_edges: list[tuple['FlowBlock', int]] = []
+    """Cuerpo de bucle según Tarjan: ``head`` + una o más ``tails``."""
 
-    def add_tail(self, bl: 'FlowBlock') -> None:
+    def __init__(self, h: Optional[FlowBlock]) -> None:
+        self.head: Optional[FlowBlock] = h
+        self.tails: list[FlowBlock] = []
+        self.depth = 0
+        self.uniquecount = 0
+        self.exitblock: Optional[FlowBlock] = None
+        self.exitedges: list[FloatingEdge] = []
+        self.immed_container: Optional[LoopBody] = None
+
+    def get_head(self) -> Optional[FlowBlock]:
+        return self.head
+
+    def get_exit_block(self) -> Optional[FlowBlock]:
+        return self.exitblock
+
+    def add_tail(self, bl: FlowBlock) -> None:
         self.tails.append(bl)
 
-    
-    def find_base(self, body: list['FlowBlock']) -> None:
-        self.head.mark = 1
-        body.append(self.head)
-        for tail in self.tails:
-            if tail.mark == 0:
-                tail.mark = 1
+    def __lt__(self, op2: "LoopBody") -> bool:
+        # Ghidra: operator< ordena por profundidad decreciente.
+        return self.depth > op2.depth
+
+    def extend_to_container(self, container: "LoopBody", body: list[FlowBlock]) -> None:
+        """``LoopBody::extendToContainer`` (blockaction.cc:46)."""
+        head = self.head
+        i = 0
+        if container.head is not None and not container.head.is_mark():
+            container.head.set_mark()
+            body.append(container.head)
+            i = 1
+        for tail in container.tails:
+            if not tail.is_mark():
+                tail.set_mark()
                 body.append(tail)
-                
+        if head is not None and container.head is not None and head is not container.head:
+            for k in range(head.size_in()):
+                if head.is_goto_in(k):
+                    continue
+                bl = head.get_in(k)
+                if bl.is_mark():
+                    continue
+                bl.set_mark()
+                body.append(bl)
+        while i < len(body):
+            curblock = body[i]
+            i += 1
+            for k in range(curblock.size_in()):
+                if curblock.is_goto_in(k):
+                    continue
+                bl = curblock.get_in(k)
+                if bl.is_mark():
+                    continue
+                bl.set_mark()
+                body.append(bl)
+
+    def update(self, graph: FlowBlock) -> Optional[FlowBlock]:
+        """``LoopBody::update`` (blockaction.cc:94)."""
+        head = self.head
+        if head is None:
+            return None
+        while head.parent is not graph:
+            head = head.parent
+            if head is None:
+                raise StructureError("LoopBody.update lost the graph")
+        self.head = head
+        for i, bottom in enumerate(self.tails):
+            while bottom.parent is not graph:
+                bottom = bottom.parent
+                if bottom is None:
+                    raise StructureError("LoopBody.update lost the graph")
+            self.tails[i] = bottom
+            if bottom is not head:
+                return bottom
+        for i in range(head.size_out() - 1, -1, -1):
+            if head.get_out(i) is head:
+                return head
+        return None
+
+    def find_base(self, body: list[FlowBlock]) -> None:
+        """``LoopBody::findBase`` (blockaction.cc:119)."""
+        head = self.head
+        assert head is not None
+        head.set_mark()
+        body.append(head)
+        for tail in self.tails:
+            if not tail.is_mark():
+                tail.set_mark()
+                body.append(tail)
         self.uniquecount = len(body)
         i = 1
         while i < len(body):
             curblock = body[i]
             i += 1
-            for k in range(len(curblock.in_edges)):
-                if curblock.is_goto_branch(k): # actually we need to check if the edge from parent is goto
+            for k in range(curblock.size_in()):
+                if curblock.is_goto_in(k):
                     continue
-                # in minighidra we check if parent's out edge to curblock is goto
-                parent = curblock.in_edges[k]
-                if parent.mark == 1:
+                bl = curblock.get_in(k)
+                if bl.is_mark():
                     continue
-                # simplified goto check: if any of parent's out edges targeting curblock are not goto, we trace
-                is_goto = True
-                for out_idx in range(len(parent.out_edges)):
-                    if parent.out_edges[out_idx] == curblock and not parent.is_goto_branch(out_idx):
-                        is_goto = False
-                        break
-                if is_goto:
-                    continue
-                    
-                parent.mark = 1
-                body.append(parent)
-                
-    
-    def find(looptop: 'FlowBlock', looporder: list['LoopBody']) -> 'LoopBody | None':
-        for lb in looporder:
-            if lb.head == looptop:
-                return lb
-        return None
+                bl.set_mark()
+                body.append(bl)
 
-    def label_containments(self, body: list['FlowBlock'], looporder: list['LoopBody']) -> None:
-        containlist = []
-        for curblock in body:
-            if curblock != self.head:
-                subloop = LoopBody.find(curblock, looporder)
-                if subloop is not None:
-                    containlist.append(subloop)
-                    subloop.depth += 1
-                    
-        for lb in containlist:
-            if lb.immed_container is None or lb.immed_container.depth < self.depth:
-                lb.immed_container = self
-
-    
-    def extend_to_container(self, container: 'LoopBody', body: list['FlowBlock']) -> None:
-        self.head.mark = 1
-        body.append(self.head)
-        for tail in self.tails:
-            if tail.mark == 0:
-                tail.mark = 1
-                body.append(tail)
-                
-        i = 1
+    def extend(self, body: list[FlowBlock]) -> None:
+        """``LoopBody::extend`` (blockaction.cc:150)."""
+        trial: list[FlowBlock] = []
+        i = 0
         while i < len(body):
-            curblock = body[i]
+            bl = body[i]
             i += 1
-            for k in range(len(curblock.in_edges)):
-                if curblock.is_goto_branch(k):
+            for j in range(bl.size_out()):
+                if bl.is_goto_out(j):
                     continue
-                parent = curblock.in_edges[k]
-                if parent.mark == 1:
+                curbl = bl.get_out(j)
+                if curbl.is_mark():
                     continue
-                if parent == container.exitblock:
+                if curbl is self.exitblock:
                     continue
-                    
-                is_goto = True
-                for out_idx in range(len(parent.out_edges)):
-                    if parent.out_edges[out_idx] == curblock and not parent.is_goto_branch(out_idx):
-                        is_goto = False
-                        break
-                if is_goto:
-                    continue
-                    
-                parent.mark = 1
-                body.append(parent)
+                count = curbl.get_visit_count()
+                if count == 0:
+                    trial.append(curbl)
+                count += 1
+                curbl.set_visit_count(count)
+                if count == curbl.size_in():
+                    curbl.set_mark()
+                    body.append(curbl)
+        for bl in trial:
+            bl.set_visit_count(0)
 
-    def find_exit(self, body: list['FlowBlock']) -> None:
-        trialexit = []
+    def find_exit(self, body: list[FlowBlock]) -> None:
+        """``LoopBody::findExit`` (blockaction.cc:182)."""
+        trialexit: list[FlowBlock] = []
         for tail in self.tails:
-            for j, out_bl in enumerate(tail.out_edges):
-                if tail.is_goto_branch(j):
+            for i in range(tail.size_out()):
+                if tail.is_goto_out(i):
                     continue
-                if out_bl.mark == 0:
+                curbl = tail.get_out(i)
+                if not curbl.is_mark():
                     if self.immed_container is None:
-                        self.exitblock = out_bl
+                        self.exitblock = curbl
                         return
-                    trialexit.append(out_bl)
-                    
+                    trialexit.append(curbl)
+
         for i, bl in enumerate(body):
-            if i > 0 and i < self.uniquecount:
-                continue
-            for j, out_bl in enumerate(bl.out_edges):
-                if bl.is_goto_branch(j):
+            if 0 < i < self.uniquecount:
+                continue  # Descarta las tails (ya procesadas)
+            for j in range(bl.size_out()):
+                if bl.is_goto_out(j):
                     continue
-                if out_bl.mark == 0:
+                curbl = bl.get_out(j)
+                if not curbl.is_mark():
                     if self.immed_container is None:
-                        self.exitblock = out_bl
+                        self.exitblock = curbl
                         return
-                    trialexit.append(out_bl)
-                    
+                    trialexit.append(curbl)
+
         self.exitblock = None
         if not trialexit:
             return
-            
         if self.immed_container is not None:
-            extension = []
+            extension: list[FlowBlock] = []
             self.extend_to_container(self.immed_container, extension)
             for bl in trialexit:
-                if bl.mark == 1:
+                if bl.is_mark():
                     self.exitblock = bl
                     break
             LoopBody.clear_marks(extension)
 
     def order_tails(self) -> None:
-        if len(self.tails) <= 1 or self.exitblock is None:
+        """``LoopBody::orderTails`` (blockaction.cc:245)."""
+        if len(self.tails) <= 1:
             return
-            
-        prefindex = -1
-        for i, trial in enumerate(self.tails):
-            found = False
-            for out_bl in trial.out_edges:
-                if out_bl == self.exitblock:
-                    found = True
+        if self.exitblock is None:
+            return
+        prefindex = 0
+        trial: Optional[FlowBlock] = None
+        while prefindex < len(self.tails):
+            trial = self.tails[prefindex]
+            j = 0
+            sizeout = trial.size_out()
+            while j < sizeout:
+                if trial.get_out(j) is self.exitblock:
                     break
-            if found:
-                prefindex = i
+                j += 1
+            if j < sizeout:
                 break
-                
-        if prefindex > 0:
-            self.tails[0], self.tails[prefindex] = self.tails[prefindex], self.tails[0]
-            
-    def extend(self, body: list['FlowBlock']) -> None:
-        trial = []
-        i = 0
-        while i < len(body):
-            bl = body[i]
-            i += 1
-            for j, curbl in enumerate(bl.out_edges):
-                if bl.is_goto_branch(j):
-                    continue
-                if curbl.mark == 1 or curbl == self.exitblock:
-                    continue
-                    
-                if curbl.visit_count == 0:
-                    trial.append(curbl)
-                curbl.visit_count += 1
-                
-                if curbl.visit_count == len(curbl.in_edges):
-                    curbl.mark = 1
-                    body.append(curbl)
-                    
-        for bl in trial:
-            bl.visit_count = 0
-            
-    def label_exit_edges(self, body: list['FlowBlock']) -> None:
-        for bl in body:
-            for j, curbl in enumerate(bl.out_edges):
-                if bl.is_goto_branch(j):
-                    continue
-                if curbl.mark == 0 and curbl == self.exitblock:
-                    self.exit_edges.append((bl, j))
+            prefindex += 1
+        if prefindex >= len(self.tails):
+            return
+        if prefindex == 0:
+            return
+        self.tails[prefindex] = self.tails[0]
+        self.tails[0] = trial
 
-    def clear_marks(body: list['FlowBlock']) -> None:
-        for b in body:
-            b.mark = 0
+    def label_exit_edges(self, body: list[FlowBlock]) -> None:
+        """``LoopBody::labelExitEdges`` (blockaction.cc:270)."""
+        toexitblock: list[FlowBlock] = []
+        for i in range(self.uniquecount, len(body)):
+            curblock = body[i]
+            for k in range(curblock.size_out()):
+                if curblock.is_goto_out(k):
+                    continue
+                bl = curblock.get_out(k)
+                if bl is self.exitblock:
+                    toexitblock.append(curblock)
+                    continue
+                if not bl.is_mark():
+                    self.exitedges.append(FloatingEdge(curblock, bl))
+        head = self.head
+        if head is not None:
+            for k in range(head.size_out()):
+                if head.is_goto_out(k):
+                    continue
+                bl = head.get_out(k)
+                if bl is self.exitblock:
+                    toexitblock.append(head)
+                    continue
+                if not bl.is_mark():
+                    self.exitedges.append(FloatingEdge(head, bl))
+        for i in range(len(self.tails) - 1, -1, -1):
+            curblock = self.tails[i]
+            if curblock is head:
+                continue
+            for k in range(curblock.size_out()):
+                if curblock.is_goto_out(k):
+                    continue
+                bl = curblock.get_out(k)
+                if bl is self.exitblock:
+                    toexitblock.append(curblock)
+                    continue
+                if not bl.is_mark():
+                    self.exitedges.append(FloatingEdge(curblock, bl))
+        for bl in toexitblock:
+            self.exitedges.append(FloatingEdge(bl, self.exitblock))
 
-    def merge_identical_heads(looporder: list['LoopBody']) -> None:
+    def label_containments(
+        self, body: list[FlowBlock], looporder: list["LoopBody"]
+    ) -> None:
+        """``LoopBody::labelContainments`` (blockaction.cc:327)."""
+        containlist: list[LoopBody] = []
+        for curblock in body:
+            if curblock is not self.head:
+                subloop = LoopBody.find(curblock, looporder)
+                if subloop is not None:
+                    containlist.append(subloop)
+                    subloop.depth += 1
+        for lb in containlist:
+            if lb.immed_container is None or lb.immed_container.depth < self.depth:
+                lb.immed_container = self
+
+    def emit_likely_edges(self, likely: list[FloatingEdge], graph: FlowBlock) -> None:
+        """``LoopBody::emitLikelyEdges`` (blockaction.cc:364)."""
+        head = self.head
+        assert head is not None
+        while head.parent is not graph:
+            head = head.parent
+            if head is None:
+                raise StructureError("emitLikelyEdges lost the graph")
+        self.head = head
+        if self.exitblock is not None:
+            exitblock: Optional[FlowBlock] = self.exitblock
+            while exitblock is not None and exitblock.parent is not graph:
+                exitblock = exitblock.parent
+            self.exitblock = exitblock
+        for i, tail in enumerate(self.tails):
+            while tail.parent is not graph:
+                tail = tail.parent
+                if tail is None:
+                    raise StructureError("emitLikelyEdges lost the graph")
+            self.tails[i] = tail
+            if tail is self.exitblock:
+                self.exitblock = None
+        holdin: Optional[FlowBlock] = None
+        holdout: Optional[FlowBlock] = None
+        for pos, edge in enumerate(self.exitedges):
+            startbl, outedge = edge.get_current_edge(graph)
+            if startbl is None:
+                continue
+            outbl = startbl.get_out(outedge)
+            if pos == len(self.exitedges) - 1:
+                if outbl is self.exitblock:
+                    holdin = startbl
+                    holdout = outbl
+                    break
+            likely.append(FloatingEdge(startbl, outbl))
+        for i in range(len(self.tails) - 1, -1, -1):
+            if holdin is not None and i == 0:
+                likely.append(FloatingEdge(holdin, holdout))
+            tail = self.tails[i]
+            for j in range(tail.size_out()):
+                bl = tail.get_out(j)
+                if bl is head:
+                    likely.append(FloatingEdge(tail, head))
+
+    def set_exit_marks(self, graph: FlowBlock) -> None:
+        """``LoopBody::setExitMarks`` (blockaction.cc:416)."""
+        for edge in self.exitedges:
+            inloop, outedge = edge.get_current_edge(graph)
+            if inloop is not None:
+                inloop.set_loop_exit(outedge)
+
+    def clear_exit_marks(self, graph: FlowBlock) -> None:
+        """``LoopBody::clearExitMarks`` (blockaction.cc:430)."""
+        for edge in self.exitedges:
+            inloop, outedge = edge.get_current_edge(graph)
+            if inloop is not None:
+                inloop.clear_loop_exit(outedge)
+
+    # -- estáticos ---------------------------------------------------------
+    @staticmethod
+    def merge_identical_heads(looporder: list["LoopBody"]) -> None:
+        """``LoopBody::mergeIdenticalHeads`` (blockaction.cc:446)."""
         if not looporder:
             return
-        
         i = 0
-        while i < len(looporder) - 1:
-            if looporder[i].head == looporder[i+1].head:
-                looporder[i].tails.extend(looporder[i+1].tails)
-                looporder.pop(i+1)
+        j = i + 1
+        curbody = looporder[i]
+        while j < len(looporder):
+            nextbody = looporder[j]
+            j += 1
+            if nextbody.head is curbody.head:
+                curbody.add_tail(nextbody.tails[0])
+                nextbody.head = None  # Marcado como subsumido
             else:
                 i += 1
-                
-    def compare_ends(a: 'LoopBody', b: 'LoopBody') -> int:
-        if a.head.index != b.head.index:
-            return a.head.index - b.head.index
-        # comparing tails is slightly complex, skip strict sorting for now if identical head
+                looporder[i] = nextbody
+                curbody = nextbody
+        i += 1
+        del looporder[i:]
+
+    @staticmethod
+    def compare_ends(a: "LoopBody", b: "LoopBody") -> bool:
+        """``LoopBody::compare_ends`` (blockaction.cc:473)."""
+        aindex = a.head.index
+        bindex = b.head.index
+        if aindex != bindex:
+            return aindex < bindex
+        return a.tails[0].index < b.tails[0].index
+
+    @staticmethod
+    def compare_head(a: "LoopBody", looptop: FlowBlock) -> int:
+        """``LoopBody::compare_head`` (blockaction.cc:489)."""
+        aindex = a.head.index if a.head is not None else -1
+        bindex = looptop.index
+        if aindex != bindex:
+            return -1 if aindex < bindex else 1
         return 0
 
+    @staticmethod
+    def find(looptop: FlowBlock, looporder: list["LoopBody"]) -> Optional["LoopBody"]:
+        """``LoopBody::find`` (blockaction.cc:1021): búsqueda binaria."""
+        minimum = 0
+        maximum = len(looporder) - 1
+        while minimum <= maximum:
+            mid = (minimum + maximum) // 2
+            comp = LoopBody.compare_head(looporder[mid], looptop)
+            if comp == 0:
+                return looporder[mid]
+            if comp < 0:
+                minimum = mid + 1
+            else:
+                maximum = mid - 1
+        return None
+
+    @staticmethod
+    def clear_marks(body: list[FlowBlock]) -> None:
+        for bl in body:
+            bl.clear_mark()
+
+
 class CollapseStructure:
-    """Recovers hierarchical control flow from flat blocks."""
+    """Construye la estructura de código a partir del grafo (``CollapseStructure``)."""
 
     def __init__(self, graph: BlockGraph) -> None:
         self.graph = graph
-        self.change_count = 0
+        self.finaltrace = False
+        self.likelylistfull = False
+        self.likelygoto: list[FloatingEdge] = []
+        self.likelyiter = 0
+        self.loopbody: list[LoopBody] = []
+        self.loopbodyiter = 0
         self.dataflow_changecount = 0
+        # Compatibilidad con el nombre antiguo del puerto.
+        self.change_count = 0
 
-    def collapse_all(self) -> None:
-        """
-        The core of the control-flow structuring algorithm.
-        Repeatedly applies rules to collapse block graph nodes.
-        """
-        self.order_loop_bodies()
-        self.collapse_conditions()
+    def get_change_count(self) -> int:
+        return self.dataflow_changecount
 
-        isolated_count = self._collapse_internal(None)
-        while isolated_count < len(self.graph.blocks):
-            targetbl = self.select_goto()
-            if targetbl is None:
-                break
-            isolated_count = self._collapse_internal(targetbl)
-
-    
+    # -- bucles ------------------------------------------------------------
     def label_loops(self, looporder: list[LoopBody]) -> None:
-        self.loopbody = [] # Keep track of all bodies
-        
-        for bl in self.graph.blocks:
-            for j in range(len(bl.in_edges)):
+        """``CollapseStructure::labelLoops`` (blockaction.cc:1126)."""
+        for i in range(self.graph.get_size()):
+            bl = self.graph.get_block(i)
+            for j in range(bl.size_in()):
                 if bl.is_back_edge_in(j):
-                    loopbottom = bl.in_edges[j]
+                    loopbottom = bl.get_in(j)
                     curbody = LoopBody(bl)
                     curbody.add_tail(loopbottom)
                     self.loopbody.append(curbody)
                     looporder.append(curbody)
-                    
-        # sorting by head index to merge later
-        looporder.sort(key=lambda x: x.head.index)
+        looporder.sort(key=lambda lb: (lb.head.index, lb.tails[0].index))
 
     def order_loop_bodies(self) -> None:
-        self.graph.calc_forward_dominator([self.graph.blocks[0]] if self.graph.blocks else [])
-        
-        looporder = []
+        """``CollapseStructure::orderLoopBodies`` (blockaction.cc:1148)."""
+        looporder: list[LoopBody] = []
         self.label_loops(looporder)
         if self.loopbody:
             oldsize = len(looporder)
             LoopBody.merge_identical_heads(looporder)
-            
-            # Remove subsumed bodies
             if oldsize != len(looporder):
-                self.loopbody = [lb for lb in self.loopbody if lb in looporder]
-                
-            # Rest of loop ordering relies on deep graph logic, parity for now
-            
-
+                self.loopbody = [
+                    lb for lb in self.loopbody if lb.get_head() is not None
+                ]
             for lb in self.loopbody:
-                body = []
+                body: list[FlowBlock] = []
                 lb.find_base(body)
                 lb.label_containments(body, looporder)
                 LoopBody.clear_marks(body)
-                
-            self.loopbody.sort(key=lambda lb: lb.depth, reverse=True)
-            
+            # loopbody.sort() con operator< (profundidad decreciente, estable)
+            self.loopbody = sorted(self.loopbody, key=lambda item: -item.depth)
             for lb in self.loopbody:
                 body = []
                 lb.find_base(body)
@@ -282,77 +498,565 @@ class CollapseStructure:
                 lb.extend(body)
                 lb.label_exit_edges(body)
                 LoopBody.clear_marks(body)
-
-    def collapse_conditions(self) -> None:
-        change = True
-        while change:
-            change = False
-            for i in range(len(self.graph.blocks)):
-                if i < len(self.graph.blocks) and self.rule_block_or(self.graph.blocks[i]):
-                    change = True
-                    break
-
-    def select_goto(self) -> FlowBlock | None:
-        return None
+        self.likelylistfull = False
+        self.loopbodyiter = 0
 
     def update_loop_body(self) -> bool:
-        from minighidra.tracedag import TraceDAG, FloatingEdge
-        
-        likelygoto = []
-        tracer = TraceDAG(likelygoto)
-        
-        for bl in self.graph.blocks:
-            if len(bl.in_edges) == 0 and len(bl.out_edges) > 0:
-                tracer.add_root(bl)
-                
-        if len(tracer.rootlist) == 0 and len(self.graph.blocks) > 0:
-            tracer.add_root(self.graph.blocks[0])
-            
+        """``CollapseStructure::updateLoopBody`` (blockaction.cc:1193)."""
+        if self.finaltrace:
+            return False
+        loopbottom: Optional[FlowBlock] = None
+        looptop: Optional[FlowBlock] = None
+        while self.loopbodyiter < len(self.loopbody):
+            cur_body = self.loopbody[self.loopbodyiter]
+            loopbottom = cur_body.update(self.graph)
+            if loopbottom is not None:
+                looptop = cur_body.get_head()
+                if loopbottom is looptop:
+                    # Un único nodo que bucle sobre sí mismo: probable switch.
+                    self.likelygoto.clear()
+                    self.likelygoto.append(FloatingEdge(looptop, looptop))
+                    self.likelyiter = 0
+                    self.likelylistfull = True
+                    return True
+                if not self.likelylistfull or self.likelyiter != len(self.likelygoto):
+                    break  # El bucle sigue existiendo
+            self.loopbodyiter += 1
+            self.likelylistfull = False
+            loopbottom = None
+        if self.likelylistfull and self.likelyiter != len(self.likelygoto):
+            return True
+
+        self.likelygoto.clear()
+        tracer = TraceDAG(self.likelygoto, max_iterations=push_budget(self.graph))
+        if loopbottom is not None:
+            tracer.add_root(looptop)
+            tracer.set_finish_block(loopbottom)
+            self.loopbody[self.loopbodyiter].set_exit_marks(self.graph)
+        else:
+            for i in range(self.graph.get_size()):
+                bl = self.graph.get_block(i)
+                if bl.size_in() == 0:
+                    tracer.add_root(bl)
         tracer.initialize()
         tracer.push_branches()
-        
-        if not likelygoto:
+        self.likelylistfull = True
+        if loopbottom is not None:
+            self.loopbody[self.loopbodyiter].emit_likely_edges(
+                self.likelygoto, self.graph
+            )
+            self.loopbody[self.loopbodyiter].clear_exit_marks(self.graph)
+        elif not self.likelygoto:
+            self.finaltrace = True
             return False
-            
-        # Convert floating edges into gotos in the graph
-        for edge in likelygoto:
-            b = edge.bottom
-            d = edge.destnode
-            if d in b.out_edges:
-                idx = b.out_edges.index(d)
-                b.set_goto_branch(idx)
+        self.likelyiter = 0
         return True
 
-    def _collapse_internal(self, targetbl: FlowBlock | None) -> int:
-        isolated_count = 0
-        fullchange = False
+    def select_goto(self) -> Optional[FlowBlock]:
+        """``CollapseStructure::selectGoto`` (blockaction.cc:1260)."""
+        while self.update_loop_body():
+            while self.likelyiter != len(self.likelygoto):
+                edge = self.likelygoto[self.likelyiter]
+                startbl, outedge = edge.get_current_edge(self.graph)
+                self.likelyiter += 1
+                if startbl is not None:
+                    startbl.set_goto_branch(outedge)
+                    return startbl
+        if not self.clip_extra_roots():
+            raise StructureError("Could not finish collapsing block structure")
+        return None
 
+    # -- raíces extra ------------------------------------------------------
+    def only_reachable_from_root(
+        self, root: FlowBlock, body: list[FlowBlock]
+    ) -> None:
+        """``CollapseStructure::onlyReachableFromRoot`` (blockaction.cc:1052)."""
+        trial: list[FlowBlock] = []
+        i = 0
+        root.set_mark()
+        body.append(root)
+        while i < len(body):
+            bl = body[i]
+            i += 1
+            for j in range(bl.size_out()):
+                curbl = bl.get_out(j)
+                if curbl.is_mark():
+                    continue
+                count = curbl.get_visit_count()
+                if count == 0:
+                    trial.append(curbl)
+                count += 1
+                curbl.set_visit_count(count)
+                if count == curbl.size_in():
+                    curbl.set_mark()
+                    body.append(curbl)
+        for bl in trial:
+            bl.set_visit_count(0)
+
+    def mark_exits_as_gotos(self, body: list[FlowBlock]) -> int:
+        """``CollapseStructure::markExitsAsGotos`` (blockaction.cc:1083)."""
+        changecount = 0
+        for bl in body:
+            for j in range(bl.size_out()):
+                curbl = bl.get_out(j)
+                if not curbl.is_mark():
+                    bl.set_goto_branch(j)
+                    changecount += 1
+        return changecount
+
+    def clip_extra_roots(self) -> bool:
+        """``CollapseStructure::clipExtraRoots`` (blockaction.cc:1108)."""
+        for i in range(1, self.graph.get_size()):
+            bl = self.graph.get_block(i)
+            if bl.size_in() != 0:
+                continue
+            body: list[FlowBlock] = []
+            self.only_reachable_from_root(bl, body)
+            count = self.mark_exits_as_gotos(body)
+            LoopBody.clear_marks(body)
+            if count != 0:
+                return True
+        return False
+
+    # -- reglas ------------------------------------------------------------
+    def rule_block_goto(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockGoto`` (blockaction.cc:1443)."""
+        sizeout = bl.size_out()
+        for i in range(sizeout):
+            if bl.is_goto_out(i):
+                if bl.is_switch_out():
+                    self.graph.new_block_multigoto(bl, i)
+                    return True
+                if sizeout == 2:
+                    if not bl.is_goto_out(1):
+                        if bl.negate_condition(True):
+                            self.dataflow_changecount += 1
+                    self.graph.new_block_if_goto(bl)
+                    return True
+                if sizeout == 1:
+                    self.graph.new_block_goto(bl)
+                    return True
+        return False
+
+    def rule_block_cat(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockCat`` (blockaction.cc:1284)."""
+        if bl.size_out() != 1:
+            return False
+        if bl.is_switch_out():
+            return False
+        if bl.size_in() == 1 and bl.get_in(0).size_out() == 1:
+            return False  # Debe ser el inicio de la cadena
+        outblock = bl.get_out(0)
+        if outblock is bl:
+            return False
+        if outblock.size_in() != 1:
+            return False
+        if not bl.is_decision_out(0):
+            return False
+        if outblock.is_switch_out():
+            return False
+
+        nodes = [bl, outblock]
+        while outblock.size_out() == 1:
+            outbl2 = outblock.get_out(0)
+            if outbl2 is bl:
+                break
+            if outbl2.size_in() != 1:
+                break
+            if not outblock.is_decision_out(0):
+                break
+            if outbl2.is_switch_out():
+                break
+            outblock = outbl2
+            nodes.append(outblock)
+
+        self.graph.new_block_list(nodes)
+        return True
+
+    def rule_block_or(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockOr`` (blockaction.cc:1317)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.is_goto_out(1):
+            return False
+        if bl.is_switch_out():
+            return False
+        for i in range(2):
+            orblock = bl.get_out(i)
+            if orblock is bl:
+                continue
+            if orblock.size_in() != 1:
+                continue
+            if orblock.size_out() != 2:
+                continue
+            if orblock.is_interior_goto_target():
+                continue
+            if orblock.is_switch_out():
+                continue
+            if bl.is_back_edge_out(i):
+                continue
+            if orblock.is_complex():
+                continue
+            clauseblock = bl.get_out(1 - i)
+            if clauseblock is bl:
+                continue
+            if clauseblock is orblock:
+                continue
+            j = 0
+            while j < 2:
+                if clauseblock is orblock.get_out(j):
+                    break
+                j += 1
+            if j == 2:
+                continue
+            if orblock.get_out(1 - j) is bl:
+                continue
+            if i == 1:
+                if bl.negate_condition(True):
+                    self.dataflow_changecount += 1
+            if j == 0:
+                if orblock.negate_condition(True):
+                    self.dataflow_changecount += 1
+            self.graph.new_block_condition(bl, orblock)
+            return True
+        return False
+
+    def rule_block_proper_if(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockProperIf`` (blockaction.cc:1377)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_switch_out():
+            return False
+        if bl.get_out(0) is bl:
+            return False
+        if bl.get_out(1) is bl:
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.is_goto_out(1):
+            return False
+        for i in range(2):
+            clauseblock = bl.get_out(i)
+            if clauseblock.size_in() != 1:
+                continue
+            if clauseblock.size_out() != 1:
+                continue
+            if clauseblock.is_switch_out():
+                continue
+            if not bl.is_decision_out(i):
+                continue
+            if clauseblock.is_goto_out(0):
+                continue
+            outblock = clauseblock.get_out(0)
+            if outblock is not bl.get_out(1 - i):
+                continue
+            if i == 0:
+                if bl.negate_condition(True):
+                    self.dataflow_changecount += 1
+            self.graph.new_block_if(bl, clauseblock)
+            return True
+        return False
+
+    def rule_block_if_else(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockIfElse`` (blockaction.cc:1410)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_switch_out():
+            return False
+        if not bl.is_decision_out(0):
+            return False
+        if not bl.is_decision_out(1):
+            return False
+        tc = bl.get_true_out()
+        fc = bl.get_false_out()
+        if tc.size_in() != 1:
+            return False
+        if fc.size_in() != 1:
+            return False
+        if tc.size_out() != 1:
+            return False
+        if fc.size_out() != 1:
+            return False
+        outblock = tc.get_out(0)
+        if outblock is bl:
+            return False
+        if outblock is not fc.get_out(0):
+            return False
+        if tc.is_switch_out():
+            return False
+        if fc.is_switch_out():
+            return False
+        if tc.is_goto_out(0):
+            return False
+        if fc.is_goto_out(0):
+            return False
+        self.graph.new_block_if_else(bl, tc, fc)
+        return True
+
+    def rule_block_if_no_exit(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockIfNoExit`` (blockaction.cc:1478)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_switch_out():
+            return False
+        if bl.get_out(0) is bl:
+            return False
+        if bl.get_out(1) is bl:
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.is_goto_out(1):
+            return False
+        for i in range(2):
+            clauseblock = bl.get_out(i)
+            if clauseblock.size_in() != 1:
+                continue
+            if clauseblock.size_out() != 0:
+                continue
+            if clauseblock.is_switch_out():
+                continue
+            if not bl.is_decision_out(i):
+                continue
+            if i == 0:
+                otherblock = bl.get_out(1)
+                if (
+                    otherblock.size_in() == 1
+                    and otherblock.size_out() == 0
+                    and not otherblock.is_switch_out()
+                    and bl.is_decision_out(1)
+                ):
+                    if bl.negate_condition(True):
+                        self.dataflow_changecount += 1
+                    self.graph.new_block_if_no_exit(bl, clauseblock, otherblock)
+                    return True
+            if i == 0:
+                if bl.negate_condition(True):
+                    self.dataflow_changecount += 1
+            self.graph.new_block_if(bl, clauseblock)
+            return True
+        return False
+
+    def rule_block_while_do(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockWhileDo`` (blockaction.cc:1525)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_switch_out():
+            return False
+        if bl.get_out(0) is bl:
+            return False
+        if bl.get_out(1) is bl:
+            return False
+        if bl.is_interior_goto_target():
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.is_goto_out(1):
+            return False
+        for i in range(2):
+            clauseblock = bl.get_out(i)
+            if clauseblock.size_in() != 1:
+                continue
+            if clauseblock.size_out() != 1:
+                continue
+            if clauseblock.is_switch_out():
+                continue
+            if clauseblock.get_out(0) is not bl:
+                continue
+            overflow = bl.is_complex()
+            if (i == 0) != overflow:
+                if bl.negate_condition(True):
+                    self.dataflow_changecount += 1
+            newbl = self.graph.new_block_while_do(bl, clauseblock)
+            if overflow:
+                newbl.set_overflow_syntax()
+            return True
+        return False
+
+    def rule_block_do_while(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockDoWhile`` (blockaction.cc:1566)."""
+        if bl.size_out() != 2:
+            return False
+        if bl.is_switch_out():
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.is_goto_out(1):
+            return False
+        for i in range(2):
+            if bl.get_out(i) is not bl:
+                continue
+            if i == 0:
+                if bl.negate_condition(True):
+                    self.dataflow_changecount += 1
+            self.graph.new_block_do_while(bl)
+            return True
+        return False
+
+    def rule_block_inf_loop(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockInfLoop`` (blockaction.cc:1590)."""
+        if bl.size_out() != 1:
+            return False
+        if bl.is_goto_out(0):
+            return False
+        if bl.get_out(0) is not bl:
+            return False
+        self.graph.new_block_inf_loop(bl)
+        return True
+
+    def check_switch_skips(
+        self, switchbl: FlowBlock, exitblock: Optional[FlowBlock]
+    ) -> bool:
+        """``CollapseStructure::checkSwitchSkips`` (blockaction.cc:1613)."""
+        if exitblock is None:
+            return True
+        sizeout = switchbl.size_out()
+        defaultnottoexit = False
+        anyskiptoexit = False
+        for edgenum in range(sizeout):
+            if switchbl.get_out(edgenum) is exitblock:
+                if not switchbl.is_default_branch(edgenum):
+                    anyskiptoexit = True
+            else:
+                if switchbl.is_default_branch(edgenum):
+                    defaultnottoexit = True
+        if not anyskiptoexit:
+            return True
+        if not defaultnottoexit and switchbl.get_type() == "multigoto":
+            if switchbl.has_default_goto():  # type: ignore[attr-defined]
+                defaultnottoexit = True
+        if not defaultnottoexit:
+            return True
+        for edgenum in range(sizeout):
+            if switchbl.get_out(edgenum) is exitblock:
+                if not switchbl.is_default_branch(edgenum):
+                    switchbl.set_goto_branch(edgenum)
+        return False
+
+    def rule_block_switch(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleBlockSwitch`` (blockaction.cc:1657)."""
+        if not bl.is_switch_out():
+            return False
+        exitblock: Optional[FlowBlock] = None
+        sizeout = bl.size_out()
+        for i in range(sizeout):
+            curbl = bl.get_out(i)
+            if curbl is bl:
+                exitblock = curbl
+                break
+            if curbl.size_out() > 1:
+                exitblock = curbl
+                break
+            if curbl.size_in() > 1:
+                exitblock = curbl
+                break
+        if exitblock is None:
+            for i in range(sizeout):
+                curbl = bl.get_out(i)
+                if curbl.size_in() > 0 and curbl.is_goto_in(0):
+                    return False
+                if curbl.is_switch_out():
+                    return False
+                if curbl.size_out() == 1:
+                    if curbl.is_goto_out(0):
+                        return False
+                    if exitblock is not None:
+                        if exitblock is not curbl.get_out(0):
+                            return False
+                    else:
+                        exitblock = curbl.get_out(0)
+        else:
+            for i in range(exitblock.size_in()):
+                if exitblock.is_goto_in(i):
+                    return False
+            for i in range(exitblock.size_out()):
+                if exitblock.is_goto_out(i):
+                    return False
+            for i in range(sizeout):
+                curbl = bl.get_out(i)
+                if curbl is exitblock:
+                    continue
+                if curbl.size_in() > 1:
+                    return False
+                if curbl.size_in() > 0 and curbl.is_goto_in(0):
+                    return False
+                if curbl.size_out() > 1:
+                    return False
+                if curbl.size_out() == 1:
+                    if curbl.is_goto_out(0):
+                        return False
+                    if curbl.get_out(0) is not exitblock:
+                        return False
+                if curbl.is_switch_out():
+                    return False
+
+        if not self.check_switch_skips(bl, exitblock):
+            return True
+
+        cases = [bl]
+        for i in range(sizeout):
+            curbl = bl.get_out(i)
+            if curbl is exitblock:
+                continue
+            cases.append(curbl)
+        self.graph.new_block_switch(cases, exitblock is not None)
+        return True
+
+    def rule_case_fallthru(self, bl: FlowBlock) -> bool:
+        """``CollapseStructure::ruleCaseFallthru`` (blockaction.cc:1737)."""
+        if not bl.is_switch_out():
+            return False
+        sizeout = bl.size_out()
+        nonfallthru = 0
+        fallthru: list[FlowBlock] = []
+        for i in range(sizeout):
+            curbl = bl.get_out(i)
+            if curbl is bl:
+                return False
+            if curbl.size_in() > 2 or curbl.size_out() > 1:
+                nonfallthru += 1
+            elif curbl.size_out() == 1:
+                target = curbl.get_out(0)
+                if target.size_in() == 2 and target.size_out() <= 1:
+                    inslot = curbl.get_out_rev_index(0)
+                    if target.get_in(1 - inslot) is bl:
+                        fallthru.append(curbl)
+            if nonfallthru > 1:
+                return False
+        if not fallthru:
+            return False
+        for curbl in fallthru:
+            curbl.set_goto_branch(0)
+        return True
+
+    # -- bucles principales ------------------------------------------------
+    def collapse_internal(self, targetbl: Optional[FlowBlock]) -> int:
+        """``CollapseStructure::collapseInternal`` (blockaction.cc:1780)."""
+        steps = 0
+        budget = _budget(self.graph)
+        isolated_count = 0
         while True:
-            change = True
-            while change:
+            while True:
                 change = False
                 index = 0
                 isolated_count = 0
-
-                while index < len(self.graph.blocks):
+                while index < self.graph.get_size():
                     if targetbl is None:
-                        bl = self.graph.blocks[index]
+                        bl = self.graph.get_block(index)
                         index += 1
                     else:
                         bl = targetbl
                         change = True
                         targetbl = None
-                        index = len(self.graph.blocks)
-
-                    if len(bl.in_edges) == 0 and len(bl.out_edges) == 0:
+                        index = self.graph.get_size()
+                    if bl.size_in() == 0 and bl.size_out() == 0:
                         isolated_count += 1
                         continue
-
-                    # Try each rule on the block
+                    steps += 1
+                    if steps > budget:
+                        raise StructureError("collapseInternal exceeded its budget")
                     if self.rule_block_goto(bl):
-                        change = True
-                        continue
-                    if self.rule_block_or(bl):
                         change = True
                         continue
                     if self.rule_block_cat(bl):
@@ -367,325 +1071,61 @@ class CollapseStructure:
                     if self.rule_block_while_do(bl):
                         change = True
                         continue
-                    if self.rule_case_fallthru(bl):
-                        fullchange = True
-                        break
                     if self.rule_block_do_while(bl):
                         change = True
                         continue
                     if self.rule_block_inf_loop(bl):
                         change = True
                         continue
-                    if self.rule_block_if_no_exit(bl):
-                        change = True
-                        continue
                     if self.rule_block_switch(bl):
                         change = True
                         continue
-
-                if change:
+                if not change:
+                    break
+            # IfNoExit y CaseFallthru sólo se aplican cuando nada más encaja.
+            fullchange = False
+            index = 0
+            while index < self.graph.get_size():
+                bl = self.graph.get_block(index)
+                index += 1
+                steps += 1
+                if steps > budget:
+                    raise StructureError("collapseInternal exceeded its budget")
+                if self.rule_block_if_no_exit(bl):
                     fullchange = True
-
-            if not self.update_loop_body():
+                    break
+                if self.rule_case_fallthru(bl):
+                    fullchange = True
+                    break
+            if not fullchange:
                 break
-
-        if fullchange:
-            self.dataflow_changecount += 1
-
         return isolated_count
 
-    def rule_block_goto(self, bl: FlowBlock) -> bool:
-        sizeout = len(bl.out_edges)
-        for i in range(sizeout):
-            if bl.is_goto_branch(i):
-                if bl.block_type == "switch_out":
-                    self.graph.new_block_multigoto(bl, i)
-                    return True
-                if sizeout == 2:
-                    if not bl.is_goto_branch(1):
-                        # True branch must be goto
-                        # In full ghidra: if bl.negateCondition(True): dataflow_changecount += 1
-                        pass
-                    self.graph.new_block_if_goto(bl)
-                    return True
-                if sizeout == 1:
-                    self.graph.new_block_goto(bl)
-                    return True
-        return False
-
-    def rule_block_or(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
-        if bl.block_type == "switch_out": return False
-        
-        for i in range(2):
-            orblock = bl.out_edges[i]
-            if orblock == bl: continue
-            if len(orblock.in_edges) != 1: continue
-            if len(orblock.out_edges) != 2: continue
-            if orblock.block_type == "switch_out": continue
-            
-            clauseblock = bl.out_edges[1 - i]
-            if clauseblock == bl: continue
-            if clauseblock == orblock: continue
-            
-            j = 0
-            match = False
-            for j in range(2):
-                if clauseblock == orblock.out_edges[j]:
-                    match = True
-                    break
-                    
-            if not match: continue
-            if orblock.out_edges[1 - j] == bl: continue
-            
-            self.graph.new_block_condition(bl, orblock, "&&" if i == 0 else "||")
-            return True
-            
-        return False
-
-    def rule_block_cat(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 1: return False
-        if bl.block_type == "switch_out": return False
-        if len(bl.in_edges) == 1 and len(bl.in_edges[0].out_edges) == 1:
-            return False # Must be start of chain
-            
-        outblock = bl.out_edges[0]
-        if outblock == bl: return False
-        if len(outblock.in_edges) != 1: return False
-        # In ghidra: if not bl.isDecisionOut(0): return False
-        if outblock.block_type == "switch_out": return False
-        
-        nodes = [bl, outblock]
-        
-        while len(outblock.out_edges) == 1:
-            outbl2 = outblock.out_edges[0]
-            if outbl2 == bl: break
-            if len(outbl2.in_edges) != 1: break
-            if outbl2.block_type == "switch_out": break
-            outblock = outbl2
-            nodes.append(outblock)
-            
-        self.graph.new_block_list(nodes)
-        return True
-
-    def rule_block_proper_if(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch_out": return False
-        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
-        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
-
-        for i in range(2):
-            clauseblock = bl.out_edges[i]
-            if len(clauseblock.in_edges) != 1: continue
-            if len(clauseblock.out_edges) != 1: continue
-            if getattr(clauseblock, "block_type", "") == "switch_out": continue
-            if clauseblock.is_goto_branch(0): continue
-            
-            outblock = clauseblock.out_edges[0]
-            if outblock != bl.out_edges[1 - i]: continue
-
-            self.graph.new_block_if(bl, clauseblock)
-            return True
-            
-        return False
-
-    def rule_block_if_else(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch_out": return False
-        
-        tc = bl.out_edges[0]
-        fc = bl.out_edges[1]
-        
-        if len(tc.in_edges) != 1: return False
-        if len(fc.in_edges) != 1: return False
-        if len(tc.out_edges) != 1: return False
-        if len(fc.out_edges) != 1: return False
-        
-        outblock = tc.out_edges[0]
-        if outblock == bl: return False
-        if outblock != fc.out_edges[0]: return False
-        
-        if tc.block_type == "switch_out": return False
-        if fc.block_type == "switch_out": return False
-        if tc.is_goto_branch(0): return False
-        if fc.is_goto_branch(0): return False
-        
-        self.graph.new_block_if_else(bl, tc, fc)
-        return True
-
-    def rule_block_do_while(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch_out": return False
-        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
-        
-        for i in range(2):
-            if bl.out_edges[i] != bl: continue
-            
-            self.graph.new_block_do_while(bl)
-            return True
-        return False
-
-    def rule_block_inf_loop(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 1: return False
-        if bl.out_edges[0] != bl: return False
-        self.graph.new_block_inf_loop(bl)
-        return True
-
-    def rule_block_if_no_exit(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch_out": return False
-        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
-        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
-        
-        for i in range(2):
-            clauseblock = bl.out_edges[i]
-            if len(clauseblock.in_edges) != 1: continue
-            if len(clauseblock.out_edges) != 0: continue
-            if clauseblock.block_type == "switch_out": continue
-            
-            if i == 0:
-                otherblock = bl.out_edges[1]
-                if len(otherblock.in_edges) == 1 and len(otherblock.out_edges) == 0 and otherblock.block_type != "switch_out":
-                    self.graph.new_block_if_no_exit(bl, clauseblock, otherblock)
-                    return True
-                    
-            self.graph.new_block_if(bl, clauseblock)
-            return True
-            
-        return False
-
-    def rule_block_switch(self, bl: FlowBlock) -> bool:
-        if bl.block_type != "switch_out" and len(bl.out_edges) <= 2: return False
-        
-        exitblock = None
-        sizeout = len(bl.out_edges)
-        
-        for i in range(sizeout):
-            curbl = bl.out_edges[i]
-            if curbl == bl:
-                exitblock = curbl
+    def collapse_conditions(self) -> None:
+        """``CollapseStructure::collapseConditions`` (blockaction.cc:1848)."""
+        while True:
+            change = False
+            i = 0
+            while i < self.graph.get_size():
+                if self.rule_block_or(self.graph.get_block(i)):
+                    change = True
+                i += 1
+            if not change:
                 break
-            if len(curbl.out_edges) > 1:
-                exitblock = curbl
-                break
-            if len(curbl.in_edges) > 1:
-                exitblock = curbl
-                break
-                
-        if exitblock is None:
-            for i in range(sizeout):
-                curbl = bl.out_edges[i]
-                if curbl.block_type == "switch": return False
-                if len(curbl.out_edges) == 1:
-                    if exitblock is not None:
-                        if exitblock != curbl.out_edges[0]: return False
-                    else:
-                        exitblock = curbl.out_edges[0]
-        else:
-            for i in range(sizeout):
-                curbl = bl.out_edges[i]
-                if curbl == exitblock: continue
-                if len(curbl.in_edges) > 1: return False
-                if len(curbl.out_edges) > 1: return False
-                if len(curbl.out_edges) == 1:
-                    if curbl.out_edges[0] != exitblock: return False
-                if curbl.block_type == "switch": return False
-                
-        if not self._check_switch_skips(bl, exitblock):
-            return True
-            
-        cases = [bl]
-        for i in range(sizeout):
-            curbl = bl.out_edges[i]
-            if curbl == exitblock: continue
-            cases.append(curbl)
-            
-        self.graph.new_block_switch(cases, exitblock is not None)
-        return True
 
-    
-    def rule_block_while_do(self, bl: FlowBlock) -> bool:
-        if len(bl.out_edges) != 2: return False
-        if bl.block_type == "switch_out": return False
-        if bl.out_edges[0] == bl or bl.out_edges[1] == bl: return False
-        if bl.is_goto_branch(0) or bl.is_goto_branch(1): return False
-
-        for i in range(2):
-            clauseblock = bl.out_edges[i]
-            if len(clauseblock.in_edges) != 1: continue
-            if len(clauseblock.out_edges) != 1: continue
-            if clauseblock.block_type == "switch_out": continue
-            if clauseblock.out_edges[0] != bl: continue
-
-            self.graph.new_block_while_do(bl, clauseblock)
-            return True
-            
-        return False
-
-
-
-
-    def rule_case_fallthru(self, bl: FlowBlock) -> bool:
-        if bl.block_type != "switch_out": return False
-        sizeout = len(bl.out_edges)
-        nonfallthru = 0
-        fallthru = []
-        
-        for i in range(sizeout):
-            curbl = bl.out_edges[i]
-            if curbl == bl: return False
-            if len(curbl.in_edges) > 2 or len(curbl.out_edges) > 1:
-                nonfallthru += 1
-            elif len(curbl.out_edges) == 1:
-                target = curbl.out_edges[0]
-                if len(target.in_edges) == 2 and len(target.out_edges) <= 1:
-                    inslot = target.in_edges.index(curbl)
-                    if target.in_edges[1 - inslot] == bl:
-                        fallthru.append(curbl)
-            
-            if nonfallthru > 1: return False
-            
-        if not fallthru: return False
-        
-        for curbl in fallthru:
-            curbl.set_goto_branch(0)
-            
-        return True
-
-
-    def _check_switch_skips(self, switchbl: FlowBlock, exitblock: FlowBlock | None) -> bool:
-        if exitblock is None:
-            return True
-            
-        sizeout = len(switchbl.out_edges)
-        defaultnottoexit = False
-        anyskiptoexit = False
-        
-        for edgenum in range(sizeout):
-            if switchbl.out_edges[edgenum] == exitblock:
-                if not switchbl.is_default_branch(edgenum):
-                    anyskiptoexit = True
-            else:
-                if switchbl.is_default_branch(edgenum):
-                    defaultnottoexit = True
-                    
-        if not anyskiptoexit:
-            return True
-            
-        if not defaultnottoexit and getattr(switchbl, "block_type", "") == "multigoto":
-            if getattr(switchbl, "has_default_goto", lambda: False)():
-                defaultnottoexit = True
-                
-        if not defaultnottoexit:
-            return True
-            
-        for edgenum in range(sizeout):
-            if switchbl.out_edges[edgenum] == exitblock:
-                if not switchbl.is_default_branch(edgenum):
-                    switchbl.set_goto_branch(edgenum)
-                    
-        return False
-
-    def get_change_count(self) -> int:
-        return self.change_count
+    def collapse_all(self) -> None:
+        """``CollapseStructure::collapseAll`` (blockaction.cc:1875)."""
+        self.finaltrace = False
+        self.graph.clear_visit_count()
+        self.order_loop_bodies()
+        self.collapse_conditions()
+        budget = _budget(self.graph)
+        steps = 0
+        isolated_count = self.collapse_internal(None)
+        while isolated_count < self.graph.get_size():
+            steps += 1
+            if steps > budget:
+                raise StructureError("collapseAll exceeded its budget")
+            targetbl = self.select_goto()
+            isolated_count = self.collapse_internal(targetbl)
+        self.change_count = self.dataflow_changecount

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -1095,15 +1096,51 @@ class Analyzer:
             return self.functions[address].name
         return None
 
+    def _function_span_index(self):
+        """Funciones ordenadas por dirección, con finales y máximos prefijo.
+
+        Se construye una vez por tamaño de ``self.functions``: ``Analyzer``
+        completa el análisis en su constructor, así que el índice se considera
+        estable durante la vida del objeto.
+        """
+        token = len(self.functions)
+        cached = getattr(self, "_function_span_cache", None)
+        if cached is not None and cached[0] == token:
+            return cached[1]
+        ordered = sorted(self.functions.values(), key=lambda item: item.address)
+        starts = [item.address for item in ordered]
+        ends = [item.end for item in ordered]
+        prefix_max: list[int] = [0] * (len(ordered) + 1)
+        for position, end in enumerate(ends):
+            previous = prefix_max[position]
+            prefix_max[position + 1] = end if end > previous else previous
+        index = (ordered, starts, ends, prefix_max)
+        self._function_span_cache = (token, index)
+        return index
+
     def function_at(self, value: str | int) -> Function:
         address = self.resolve_address(value)
         function = self.functions.get(address)
         if function is not None:
             return function
         # Permit a user to select an instruction inside a recovered function.
-        for candidate in self.functions.values():
-            if candidate.address <= address < candidate.end:
-                return candidate
+        # Con funciones solapadas se elige la de menor luz (la más específica),
+        # en lugar de la primera en orden de descubrimiento, y la búsqueda es
+        # binaria: 11.4 µs -> ~1 µs en el caso interior del informe.
+        ordered, starts, ends, prefix_max = self._function_span_index()
+        position = bisect_right(starts, address)
+        best: Function | None = None
+        best_span = 0
+        while position > 0 and prefix_max[position] > address:
+            candidate = ordered[position - 1]
+            end = ends[position - 1]
+            if end > address:
+                span = end - candidate.address
+                if best is None or span < best_span:
+                    best, best_span = candidate, span
+            position -= 1
+        if best is not None:
+            return best
         raise ValueError(f"No hay una función recuperada en {address:#x}.")
 
     def name_at(self, address: int) -> str | None:
