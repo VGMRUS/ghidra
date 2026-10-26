@@ -1,7 +1,7 @@
 from __future__ import annotations
 from .paramid import PcodeLikeGraph
 from .action import Action
-from .block import BlockGraph
+from .block import BlockGraph, FlowBlock, StructureError
 from .collapse import CollapseStructure
 
 def _get_block_graph(data: PcodeLikeGraph) -> BlockGraph:
@@ -20,9 +20,17 @@ class ActionBlockStructure(Action):
         if len(graph.blocks) != 0:
             return 0
         
-        graph.build_copy(data.ssa_function.blocks)
-        collapse = CollapseStructure(graph)
-        collapse.collapse_all()
+        try:
+            graph.build_copy(data.ssa_function.blocks)
+            collapse = CollapseStructure(graph)
+            collapse.collapse_all()
+        except StructureError:
+            # Ghidra lanza LowlevelError si la estructura no se puede completar;
+            # aqui se deja el grafo sin estructurar para que el impresor use el
+            # camino plano con goto.
+            graph.blocks = []
+            self.count = 0
+            return 0
         self.count = collapse.get_change_count()
         return 0
 
@@ -33,10 +41,9 @@ class ActionFinalStructure(Action):
         super().__init__(group, "finalstructure")
 
     def apply(self, data: PcodeLikeGraph) -> int:
-        graph = _get_block_graph(data)
-        # graph.order_blocks()
-        # graph.scope_break()
-        # graph.mark_unstructured()
+        # Garantiza que data.structure exista; order_blocks()/scope_break()/
+        # mark_unstructured() siguen sin portar (ver PORTING_NOTES.md).
+        _get_block_graph(data)
         self.count = 0
         return 0
 

@@ -1803,29 +1803,29 @@ class PrintC(PrintLanguage):
         if isinstance(bl, BlockBasic):
             self.emit_block_basic(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, (BlockGraph,)):
-            self.emit_block_graph(bl)
+            self.emit_block_graph(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockList):
-            self.emit_block_ls(bl)
+            self.emit_block_ls(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockIfGoto):
-            self.emit_block_if(bl)
+            self.emit_block_if(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockIfElse):
-            self.emit_block_if(bl)
+            self.emit_block_if(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockIfNoExit):
-            self.emit_block_if(bl)
+            self.emit_block_if(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockIf):
-            self.emit_block_if(bl)
+            self.emit_block_if(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockWhileDo):
-            self.emit_block_while_do(bl)
+            self.emit_block_while_do(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockDoWhile):
-            self.emit_block_do_while(bl)
+            self.emit_block_do_while(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockInfLoop):
             self.emit_block_inf_loop(bl)
         elif isinstance(bl, BlockSwitch):
             self.emit_block_switch(bl)
         elif isinstance(bl, BlockCondition):
-            self.emit_block_condition(bl)
+            self.emit_block_condition(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockMultiGoto):
-            self.emit_block_multi_goto(bl)
+            self.emit_block_multi_goto(bl, boolean_flip=boolean_flip)
         elif isinstance(bl, BlockGoto):
             self.emit_block_goto(bl)
         else:  # pragma: no cover - defensive
@@ -1833,8 +1833,15 @@ class PrintC(PrintLanguage):
                 f"unsupported block structure: {block_type}", None
             )
 
-    def emit_block_graph(self, bl: Any) -> None:
-        for item in _sub_blocks(bl):
+    def emit_block_graph(self, bl: Any, boolean_flip: bool = False) -> None:
+        children = _sub_blocks(bl)
+        if boolean_flip and self.is_set(Modifier.only_branch.value):
+            # Solo decide la rama el ultimo hijo con salto condicional.
+            for item in reversed(children):
+                if item is not None:
+                    self.emit_block(item, boolean_flip=True)
+                    return
+        for item in children:
             id = self.emit.begin_block(item)
             self.emit_block(item)
             self.emit.end_block(id)
@@ -2223,11 +2230,15 @@ class PrintC(PrintLanguage):
         if target is not None:
             self.emit.tag_line()
             id = self.emit.begin_statement(None)
-            self.emit_goto_statement(bl, getattr(target, "start_addr", None), F_GOTO_GOTO)
+            self.emit_goto_statement(
+                bl, getattr(front_leaf(target), "start_addr", None), F_GOTO_GOTO
+            )
             self.emit.end_statement(id)
 
-    def emit_block_multi_goto(self, bl: Any) -> None:
-        self.emit_block_goto(bl)
+    def emit_block_multi_goto(self, bl: Any, boolean_flip: bool = False) -> None:
+        # BlockMultiGoto::emit => getBlock(0)->emit(lng): los goto se imprimen
+        # dentro del propio bloque, no como una sentencia adicional.
+        self.emit_block_graph(bl)
 
     def falls_through(self, first: Any, second: Any) -> bool:
         """Does control flow naturally from ``first`` into ``second``?
@@ -2249,11 +2260,13 @@ class PrintC(PrintLanguage):
                 return tuple(block.successors) == (entry,)
         return False
 
-    def emit_block_ls(self, bl: Any) -> None:
+    def emit_block_ls(self, bl: Any, boolean_flip: bool = False) -> None:
         children = _sub_blocks(bl)
         if self.is_set(Modifier.only_branch.value):
             if children:
-                self.emit_block(children[-1])
+                # Ghidra imprime solo el ultimo salto condicional del bloque;
+                # la polaridad estructurada se aplica sobre ese mismo salto.
+                self.emit_block(children[-1], boolean_flip=boolean_flip)
             return
         if not children:
             return
@@ -2297,7 +2310,7 @@ class PrintC(PrintLanguage):
         self.emit_block(subbl)
         self.emit.end_block(id3)
 
-    def emit_block_condition(self, bl: Any) -> None:
+    def emit_block_condition(self, bl: Any, boolean_flip: bool = False) -> None:
         children = (bl.cond1, bl.cond2)
         if self.is_set(Modifier.no_branch.value):
             id = self.emit.begin_block(children[0])
@@ -2307,28 +2320,33 @@ class PrintC(PrintLanguage):
         if self.is_set(Modifier.only_branch.value) or self.is_set(
             Modifier.comma_separate.value
         ):
+            op = getattr(bl, "op", "&&")
+            if boolean_flip:
+                # Sin p-code no hay BOOL_NEGATE que imprimir: se aplica De
+                # Morgan, !(a && b) == !a || !b, negando cada clausula y el
+                # operador (check_print_negation invierte el token de
+                # comparacion cuando puede).
+                op = "||" if op == "&&" else "&&"
             id = self.emit.open_paren(self.OPEN_PAREN)
-            self.emit_block(children[0])
+            self.emit_block(children[0], boolean_flip=boolean_flip)
             self.push_mod()
             self.unset_mod(Modifier.only_branch.value)
             self.set_mod(Modifier.comma_separate.value)
             pol = ReversePolish(
                 tok=(
-                    PrintC.boolean_and
-                    if getattr(bl, "op", "&&") == "&&"
-                    else PrintC.boolean_or
+                    PrintC.boolean_and if op == "&&" else PrintC.boolean_or
                 ),
                 visited=1,
                 op=None,
             )
             self.emit_op(pol)
             id2 = self.emit.open_paren(self.OPEN_PAREN)
-            self.emit_block(children[1])
+            self.emit_block(children[1], boolean_flip=boolean_flip)
             self.emit.close_paren(self.CLOSE_PAREN, id2)
             self.pop_mod()
             self.emit.close_paren(self.CLOSE_PAREN, id)
 
-    def emit_block_if(self, bl: Any) -> None:
+    def emit_block_if(self, bl: Any, boolean_flip: bool = False) -> None:
         pending_brace = PendingBrace(self.option_brace_ifelse)
         if self.is_set(Modifier.pending_brace.value):
             self.emit.set_pending_print(pending_brace)
@@ -2358,7 +2376,10 @@ class PrintC(PrintLanguage):
         self.emit.spaces(1)
         self.push_mod()
         self.set_mod(Modifier.only_branch.value)
-        self.emit_block(cond_block, boolean_flip=_if_condition_flipped(self, bl))
+        self.emit_block(
+            cond_block,
+            boolean_flip=_if_condition_flipped(self, bl) != boolean_flip,
+        )
         self.pop_mod()
 
         block_type = getattr(bl, "block_type", "if")
@@ -2408,7 +2429,7 @@ class PrintC(PrintLanguage):
         if pending_brace.get_indent_id() >= 0:
             self.emit.close_brace_indent(self.CLOSE_CURLY, pending_brace.get_indent_id())
 
-    def emit_block_while_do(self, bl: Any) -> None:
+    def emit_block_while_do(self, bl: Any, boolean_flip: bool = False) -> None:
         form = _for_loop_form(self, bl)
         if form is not None:
             self.emit_for_loop(bl, form)
@@ -2430,7 +2451,8 @@ class PrintC(PrintLanguage):
             cond_block,
             boolean_flip=_loop_condition_flipped(
                 self, cond_block, getattr(front_leaf(bl.body_block), "start_addr", None)
-            ),
+            )
+            != boolean_flip,
         )
         deferred = self._phi_defer.pop()
         self.pop_mod()
@@ -2499,7 +2521,7 @@ class PrintC(PrintLanguage):
             self.emit.tag_line()
             self.emit_statement(stmt)
 
-    def emit_block_do_while(self, bl: Any) -> None:
+    def emit_block_do_while(self, bl: Any, boolean_flip: bool = False) -> None:
         self.push_mod()
         self.unset_mod(Modifier.no_branch.value | Modifier.only_branch.value)
         self.emit_any_label_statement(bl)
@@ -2523,7 +2545,8 @@ class PrintC(PrintLanguage):
                 self,
                 _last_leaf(bl.body_block),
                 getattr(front_leaf(bl.body_block), "start_addr", None),
-            ),
+            )
+            != boolean_flip,
         )
         self.emit.print(self.SEMICOLON)
         self.pop_mod()
@@ -3140,7 +3163,7 @@ def _loop_condition_flipped(
     to be negated (Ghidra's ``isFallthruTrue``/``isBooleanFlip``).
     """
     doc = printer.doc
-    start = getattr(front_leaf(cond_block), "start_addr", None)
+    start = getattr(_deciding_leaf(printer, cond_block), "start_addr", None)
     if doc is None or start is None or repeat_target is None:
         return False
     term = doc.terminators.get(start)
@@ -3151,6 +3174,38 @@ def _loop_condition_flipped(
     return term.fallthrough == repeat_target
 
 
+def _leaves(bl: Any) -> list[Any]:
+    """Basic blocks of a structured node, in emission order."""
+    if bl is None:
+        return []
+    if isinstance(bl, BlockBasic):
+        return [bl]
+    out: list[Any] = []
+    for child in _sub_blocks(bl):
+        out.extend(_leaves(child))
+    return out
+
+
+def _deciding_leaf(printer: "PrintC", bl: Any) -> Any:
+    """Leaf whose CBRANCH decides the branch out of ``bl``.
+
+    Ghidra prints the condition of the last CBRANCH of the conditional block
+    (``emitBlockBasic`` in ``only_branch`` mode) and derives the polarity from
+    that very op.  A conditional block can be a whole ``BlockList`` or a
+    ``BlockCondition``, so the deciding leaf is the last one with a conditional
+    terminator, not the front leaf.
+    """
+    doc = printer.doc
+    leaves = _leaves(bl)
+    if doc is not None:
+        for leaf in reversed(leaves):
+            start = getattr(leaf, "start_addr", None)
+            term = doc.terminators.get(start) if start is not None else None
+            if term is not None and term.kind in ("cbranch", "cbranch_indirect"):
+                return leaf
+    return leaves[-1] if leaves else None
+
+
 def _if_condition_flipped(printer: "PrintC", bl: Any) -> bool:
     """Is the structured if-body the fall-through edge of the condition block?"""
     doc = printer.doc
@@ -3158,7 +3213,7 @@ def _if_condition_flipped(printer: "PrintC", bl: Any) -> bool:
     body = getattr(bl, "true_block", None)
     if doc is None or cond_block is None or body is None:
         return False
-    start = getattr(front_leaf(cond_block), "start_addr", None)
+    start = getattr(_deciding_leaf(printer, cond_block), "start_addr", None)
     entry = getattr(front_leaf(body), "start_addr", None)
     if start is None or entry is None:
         return False
@@ -3250,7 +3305,9 @@ def _sub_blocks(bl: Any) -> list[Any]:
     if isinstance(bl, BlockSwitch):
         return list(getattr(bl, "cases", ()) or ())
     if isinstance(bl, (BlockGoto, BlockMultiGoto)):
-        return []
+        # Ghidra: BlockGoto::emit imprime subBlock(0) y despues el goto;
+        # BlockMultiGoto::emit imprime subBlock(0).
+        return list(getattr(bl, "blocks", ()) or ())
     return list(getattr(bl, "blocks", ()) or ())
 
 

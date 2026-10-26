@@ -19,18 +19,26 @@ class Section:
     readable: bool = True
     writable: bool = False
 
+    def __post_init__(self) -> None:
+        # Los extremos se consultan millones de veces (section_at/contains):
+        # se calculan una sola vez.  El dataclass es congelado, así que se
+        # escribe por la vía baja; no son campos y no afectan a eq/hash.
+        data_length = len(self.data)
+        object.__setattr__(self, "_end", self.start + max(self.virtual_size, data_length))
+        object.__setattr__(self, "_data_end", self.start + data_length)
+
     @property
     def end(self) -> int:
         """End of the mapped section, excluding the address at ``end``."""
-        return self.start + max(self.virtual_size, len(self.data))
+        return self._end
 
     @property
     def data_end(self) -> int:
         """End of file-backed bytes in the section."""
-        return self.start + len(self.data)
+        return self._data_end
 
     def contains(self, address: int, *, file_backed: bool = False) -> bool:
-        end = self.data_end if file_backed else self.end
+        end = self._data_end if file_backed else self._end
         return self.start <= address < end
 
 
@@ -67,6 +75,10 @@ class AddressTable:
         return self.address + self.entry_size * len(self.targets)
 
 
+_TRAP_MNEMONICS = frozenset({"int3", "ud2", "hlt"})
+_UNCONDITIONAL_JUMPS = frozenset({"jmp", "ljmp"})
+
+
 @dataclass(frozen=True)
 class Instruction:
     address: int
@@ -81,29 +93,47 @@ class Instruction:
     scalar_references: tuple[int, ...] = ()
     computed_targets: tuple[int, ...] = ()
 
+    def __post_init__(self) -> None:
+        # Clasificación calculada una vez: el mnemónico normalizado y las
+        # banderas se consultan por cada instrucción en varios recorridos.
+        groups = self.groups
+        mnemonic = self.mnemonic.lower()
+        is_jump = "jump" in groups
+        object.__setattr__(self, "_next_address", self.address + self.size)
+        object.__setattr__(self, "_mnemonic", mnemonic)
+        object.__setattr__(self, "_is_call", "call" in groups)
+        object.__setattr__(self, "_is_jump", is_jump)
+        object.__setattr__(self, "_is_return", "ret" in groups)
+        object.__setattr__(self, "_is_trap", mnemonic in _TRAP_MNEMONICS)
+        object.__setattr__(
+            self,
+            "_is_conditional_jump",
+            is_jump and mnemonic not in _UNCONDITIONAL_JUMPS,
+        )
+
     @property
     def next_address(self) -> int:
-        return self.address + self.size
+        return self._next_address
 
     @property
     def is_call(self) -> bool:
-        return "call" in self.groups
+        return self._is_call
 
     @property
     def is_jump(self) -> bool:
-        return "jump" in self.groups
+        return self._is_jump
 
     @property
     def is_return(self) -> bool:
-        return "ret" in self.groups
+        return self._is_return
 
     @property
     def is_trap(self) -> bool:
-        return self.mnemonic.lower() in {"int3", "ud2", "hlt"}
+        return self._is_trap
 
     @property
     def is_conditional_jump(self) -> bool:
-        return self.is_jump and self.mnemonic.lower() not in {"jmp", "ljmp"}
+        return self._is_conditional_jump
 
 
 @dataclass(frozen=True)

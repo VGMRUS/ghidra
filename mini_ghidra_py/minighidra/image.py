@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -42,6 +43,7 @@ class BinaryImage:
     ) -> None:
         self.path = path
         self.raw = raw
+        self._section_index_cache: dict[bool, tuple] = {}
         self.format = format_name
         self.architecture = architecture
         self.bits = bits
@@ -275,11 +277,50 @@ class BinaryImage:
             raise ValueError(f"Read out of bounds at {address:#x}")
         return bytes(section.data[offset:offset+size])
 
+    def _section_index(self, file_backed: bool):
+        """Índice ordenado de secciones para ``section_at`` (P1 del informe).
+
+        Devuelve ``(orden, arranques, máximos_prefijo, finales)`` donde
+        ``orden[k]`` es el índice original de la k-ésima sección por dirección
+        de inicio y ``máximos_prefijo[k]`` el mayor ``end`` de las ``k``
+        primeras, que es lo que permite podar la búsqueda hacia atrás.
+        """
+        cached = self._section_index_cache.get(file_backed)
+        if cached is not None:
+            return cached
+        sections = self.sections
+        ends = [
+            section.data_end if file_backed else section.end
+            for section in sections
+        ]
+        order = sorted(range(len(sections)), key=lambda i: sections[i].start)
+        starts = [sections[i].start for i in order]
+        prefix_max = [0] * (len(order) + 1)
+        for position, original in enumerate(order):
+            previous = prefix_max[position]
+            end = ends[original]
+            prefix_max[position + 1] = end if end > previous else previous
+        cached = (order, starts, prefix_max, ends)
+        self._section_index_cache[file_backed] = cached
+        return cached
+
     def section_at(self, address: int, *, file_backed: bool = False):
-        for section in self.sections:
-            if section.contains(address, file_backed=file_backed):
-                return section
-        return None
+        """Sección que contiene ``address``, o ``None``.
+
+        Equivalente al recorrido lineal anterior (devuelve la primera sección
+        en el orden de ``self.sections`` que la contiene), pero con búsqueda
+        binaria sobre los arranques: era el punto caliente del análisis
+        (385.927 llamadas y 1,49 M de ``Section.contains`` en el informe).
+        """
+        order, starts, prefix_max, ends = self._section_index(file_backed)
+        position = bisect_right(starts, address)
+        best: int | None = None
+        while position > 0 and prefix_max[position] > address:
+            original = order[position - 1]
+            if ends[original] > address and (best is None or original < best):
+                best = original
+            position -= 1
+        return None if best is None else self.sections[best]
 
     def patch_to_file(self, address: int, patch: bytes, output_path: str | Path) -> Path:
         """Write a patched copy; never modifies the input image."""

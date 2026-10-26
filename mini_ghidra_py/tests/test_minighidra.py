@@ -1029,10 +1029,12 @@ class MiniGhidraTests(unittest.TestCase):
 
         pseudocode = analyzer.pseudocode(analyzer.functions[0xA000])
 
-
-        # self.assertIn("} while (", pseudocode)
+        # El bucle de un solo bloque se estructura como do/while: la condicion
+        # sale del salto condicional que vuelve a la cabecera, sin gotos.
+        self.assertIn("do {", pseudocode)
+        self.assertIn("} while ((uint32_t)param_1 != 0);", pseudocode)
         self.assertIn("*(uint32_t *)0xc00c = 1;", pseudocode)
-        self.assertEqual(pseudocode.count("goto loc_A002;"), 1)
+        self.assertNotIn("goto loc_A002;", pseudocode)
 
     def test_semantic_pseudocode_keeps_gotos_for_loop_cfg(self) -> None:
         path = self.root / "loop-fallback.bin"

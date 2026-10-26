@@ -116,8 +116,8 @@ class ActionNormalizeBranches(Action):
                 
             data.op_flip_in_place_execute(fliplist)
             
-            # flip out edges
-            bb.out_edges = [bb.out_edges[1], bb.out_edges[0]]
+            # flip out edges (FlowBlock::swapEdges: also flips the edge labels)
+            bb._swap_edges()
             
             self.count += 1
             
