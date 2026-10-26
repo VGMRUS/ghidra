@@ -65,6 +65,12 @@ _SCALAR_SENTINELS = frozenset(
 #: ``_discard_returning_noreturns``).
 _NORETURN_AMBIGUOUS_INDICATOR = "function entry at call fall-through"
 
+#: Evidencia de la regla de propagación por *wrappers*. Se revalida tras cada
+#: recuperación de cuerpos (ver ``_revalidate_wrapper_marks``).
+_NORETURN_WRAPPER_EVIDENCE = (
+    "all recovered terminal paths call or jump to a no-return function"
+)
+
 
 class Analyzer:
     """Build an in-memory static-analysis index for one :class:`BinaryImage`."""
@@ -1048,9 +1054,49 @@ class Analyzer:
             wrappers_added = True
         if wrappers_added:
             self._recover_functions()
-        self._discard_returning_noreturns()
+        # Punto fijo: descartar una marca alarga los cuerpos de quien la llamaba
+        # (el flujo atraviesa la llamada), y un cuerpo más largo puede invalidar
+        # otras marcas. Se itera hasta que ninguna regla cambie de opinión.
+        for _ in range(8):
+            descartadas = self._discard_returning_noreturns()
+            revalidadas = self._revalidate_wrapper_marks()
+            if not (descartadas or revalidadas):
+                break
 
-    def _discard_returning_noreturns(self) -> None:
+    def _revalidate_wrapper_marks(self) -> bool:
+        """Exige a las marcas de *wrappers* que sigan cumpliendo su predicado.
+
+        La regla de propagación marca una función cuando todos sus caminos
+        terminales llaman o saltan a una función no retornante. Si otra marca se
+        descarta después, el flujo atraviesa esa llamada y el cuerpo crece hasta
+        un ``ret``: la marca queda obsoleta. En GXSCC.exe pasaba con 102 de las
+        380 marcas inferidas al desmarcar ``_CxxThrowException`` (154 sitios),
+        todas pequeñas funciones de 11-18 instrucciones que terminaban en throw.
+
+        No es una heurística nueva: se reevalúa exactamente el predicado que
+        generó la marca (``_function_paths_only_call_no_return``), que ya
+        devuelve ``False`` ante un ``ret`` o una trampa alcanzables.
+        """
+        changed = False
+        for address in sorted(self.no_return_addresses - self._catalog_noreturns):
+            evidence = self.no_return_evidence.get(address, [])
+            if not any(item == _NORETURN_WRAPPER_EVIDENCE for item in evidence):
+                continue
+            function = self.functions.get(address)
+            if function is None or not function.instructions:
+                continue
+            if self._function_paths_only_call_no_return(function):
+                continue
+            self.no_return_addresses.discard(address)
+            evidence.append(
+                "descartada: el cuerpo recuperado ya tiene un camino que retorna"
+            )
+            changed = True
+        if changed:
+            self._recover_functions()
+        return changed
+
+    def _discard_returning_noreturns(self) -> bool:
         """Descarta marcas *inferidas* cuyo cuerpo recuperado contiene un ``ret``.
 
         El indicador ``function entry at call fall-through`` es ambiguo: VC6
@@ -1085,13 +1131,14 @@ class Analyzer:
                 continue
             dudosas.add(address)
         if not dudosas:
-            return
+            return False
         for address in dudosas:
             self.no_return_addresses.discard(address)
             self.no_return_evidence[address].append(
                 "descartada: el cuerpo recuperado termina en `ret`"
             )
         self._recover_functions()
+        return True
 
     def _infer_no_return_from_call_sites(self, threshold: int) -> bool:
         evidence: dict[int, dict[int, str]] = defaultdict(dict)
@@ -1222,9 +1269,7 @@ class Analyzer:
                 continue
             self.no_return_addresses.add(function.address)
             self.no_return_matches[function.address] = function.name
-            self.no_return_evidence[function.address] = [
-                "all recovered terminal paths call or jump to a no-return function"
-            ]
+            self.no_return_evidence[function.address] = [_NORETURN_WRAPPER_EVIDENCE]
             added = True
         return added
 
