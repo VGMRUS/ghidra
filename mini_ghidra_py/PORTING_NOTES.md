@@ -416,3 +416,295 @@ Extremo a extremo sobre dos ELF x86-64 `gcc -O0`/`-O1` (`e2e/sample.c`, 12 funci
 Equivalencia de las optimizaciones comprobada contra la implementación de referencia (recorrido lineal y fórmulas originales) sobre `e2e/sample`, `e2e/sample_o1` y `/bin/ls`: `section_at` en 11.300 direcciones × 2 modos con **0 discrepancias**, banderas de `Instruction` en 14.310 instrucciones con **0 discrepancias**, y `function_at` en 5.700 direcciones con 205 cambios de elección (sólo donde hay funciones solapadas), todos con la función elegida conteniendo la dirección y con luz menor o igual que la anterior. La salida extremo a extremo de las 48 ejecuciones es **idéntica byte a byte** antes y después de las optimizaciones.
 
 Como en el resto del proyecto: sólo análisis estático, el binario analizado no se ejecuta nunca y su hash no cambia, no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
+
+## Dos defectos encontrados al verificar contra un binario real: GXSCC.exe (2026-10-26)
+
+Verificación con `GXSCC.exe` (PE x86-32, 1,77 MB, 94.768 instrucciones, 1.715 funciones) contra la documentación de ingeniería inversa del propio programa (bundle Ghidrathon de 12 documentos y `mapa_funciones_GXSCC.csv`). La comparación sacó dos defectos reales, ambos corregidos aquí.
+
+- **`IndexError` del renderizador sobre un `BlockCondition` interno.** `_structure_control_flow` calculaba la entrada de la rama verdadera con `front_addr(b.get_true_out() if b.size_out() else None)`. `FlowBlock.get_true_out()` devuelve `out_edges[1]`, y un nodo que la maquinaria de colapso vuelve *interno* puede quedarse con una sola arista de salida (`copyIn` más `BlockIfGoto`, que elimina la arista de goto); el `if b.size_out()` sólo descartaba el caso de **cero** aristas. Ahora se exige `size_out() > 1` y en caso contrario `true_entry = None`, con lo que la polaridad la decide el `needs_negation` del padre. Reproducción real: `FUN_401910`, `FUN_4035A0`, `FUN_40CE20`, `FUN_40D3E0` y `FUN_411F60` de GXSCC.exe (las cinco pasaban de `IndexError` a pseudocódigo correcto); el único punto de llamada afectado era el renderizador, `printc.py` no usa `get_true_out()`. `tests/test_collapse.py::TestInternalConditionEdges` fija el contrato: con una arista de salida `get_true_out()` lanza `IndexError` y la forma protegida devuelve `None`.
+- **`_prune_dead_phis` era cuadrático y no terminaba en funciones grandes.** El barrido construía `re.match(rf"^\s*{re.escape(name)}\s*=\s*phi\(", line)` **por cada nombre `phi` y por cada línea del cuerpo**, de modo que el coste era O(líneas × phis) con recompilación/sondeo de la caché de `re` en cada iteración. En `FUN_4139E0` (1.592 instrucciones, ~3.700 líneas de cuerpo, decenas de phis) no terminaba ni en 90 s. Se sustituyó por dos patrones precompilados a nivel de módulo (`_PHI_DEFINITION` captura el nombre definido, `_PHI_REFERENCE` localiza cualquier uso) y una sola pasada por línea con pertenencia a un conjunto: **12,29 s** para esa función, y el volcado completo de 32 funciones pasó de 602 s (540 s en seis tiempos muertos) a **134 s**. La salida de todas las funciones que ya la producían es **idéntica byte a byte** antes y después (comprobado con `diff -rq`); sólo cambian las tres que comparten código con `FUN_4139E0`.
+
+Desviaciones frente a Ghidra observadas en la misma verificación (preexistentes, no introducidas por estas correcciones, y documentadas para no repetirlas como sospecha):
+
+- **Sin CSE ni reducción de fuerza.** Las cadenas `lea`/`shl`/`sub` que el compilador usa para multiplicar (por ejemplo ×69069 en la siembra MT19937) se expanden literalmente en el pseudocódigo; Ghidra las reconoce y las contrae. El desensamblado sí coincide instrucción a instrucción con la documentación.
+- **Vías MMX/SSE por carril.** Las máscaras de templado MT19937 aparecen duplicadas por carril (`0x9d2c56809d2c5680`) y las operaciones se expanden por componente; semánticamente correcto, mucho más verboso que Ghidra.
+- **Barrido lineal sin resincronización.** `_disassemble_sections` recorre la sección con Capstone de corrido: tras un `ret` sigue decodificando datos/alineación y puede perder el límite de instrucciones de una función a la que sólo se llega por `call` indirecta o por vtable (en GXSCC, `0x4058A0` queda sin desensamblar y `0x401070` —entrada de vtable, ranura 20 de la tabla en `0x443760`, que MiniGhidraPy sí detecta— no se promueve a función). Ghidra sigue el flujo y reinicia en los destinos referenciados.
+- **Fusión excesiva de funciones.** Algunas funciones recuperadas absorben código ajeno (`FUN_401500`: 23 instrucciones con luz `0x401500..0x40EEC4`; `FUN_409960`: 5 instrucciones hasta `0x411EBE`), lo que deja direcciones documentadas "dentro de otra función". El código está desensamblado; falla el límite.
+- **CRT estático sin identificar.** Las funciones de tiempo de ejecución enlazadas estáticamente (VC6) siguen apareciendo como `FUN_xxxxxx`: no hay emparejamiento de firmas (equivalente a Ghidra FID).
+
+Como en el resto del proyecto: sólo análisis estático, el binario analizado no se ejecuta nunca y su hash no cambia, no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
+
+## Barrido lineal con resincronización por flujo y fronteras de función (2026-10-26)
+
+La verificación contra GXSCC.exe dejó tres defectos de recuperación que comparten causa raíz: `_disassemble_sections` barre la sección de corrido con Capstone y nada vuelve a cuadrar el desensamblado ni a crear funciones donde sólo hay punteros o saltos de cola. Se corrigen con cinco reglas nuevas en `analysis.py`, todas inspiradas en analizadores concretos de Ghidra y todas **dirigidas**: cuando no hay nada que corregir no tocan nada.
+
+1. **`_resync_flow_boundaries`** — desensambla **siguiendo el flujo** desde cada destino de `call` directo que el barrido no alcanzó como inicio de instrucción: borra la instrucción desalineada que lo cubre y vuelve a decodificar hasta re-sincronizar con código ya alineado (o con un `ret`). Es el equivalente de `DisassembleCommand` de Ghidra reiniciando en los destinos conocidos. En GXSCC.exe corrige 9 fronteras, entre ellas `0x4058A0` (`SynthModeToggleFeedback`, 58 instrucciones recuperadas; antes ni siquiera estaba desensamblada porque la basura `add byte ptr [eax+0x56909090], dl` de `0x40589B` se comía su `push esi`). En `/bin/bash` no hay ninguna frontera desalineada (23.415 destinos de flujo) y el método devuelve 0 **sin modificar el mapa de instrucciones**.
+   - **Desviación deliberada:** sólo se re-sincroniza en destinos de `call`, no de `jmp`. Saltar a mitad de una instrucción es un modismo x86 legítimo (trucos de alineación, `jmp $+5` para saltarse un inmediato, parcheo en caliente) y el propio banco de pruebas lo usa (`GOTO_SAMPLE` en `tests/test_clangdoc.py`); hacerlo ahí destruía código válido. Ghidra sí desensambla en los destinos de salto.
+2. **`_promote_boundary_jump_targets`** — un `jmp` **incondicional** cuyo destino empieza justo tras un `ret`/trampa es un salto de cola a *otra* función: el destino se promueve a semilla (`after-return jump target`) en vez de absorberse. Los saltos **condicionales** sólo se aceptan con dos guardas: que el destino no pertenezca ya a una función y que su primera instrucción no sea `call`/`ret`/`jmp`. Sin esas guardas la regla partía bucles (en GXSCC.exe pasaba de 46 a 454 semillas y creaba 77 funciones que empiezan por `call`, un prólogo imposible).
+3. **`_detect_thunk` acepta thunks ajustadores de `this`** — además de `nop`/`endbr`, se admite un prefijo acotado (8 instrucciones, como la comprobación de Ghidra) de `mov`/`lea`/`xor`/`movzx`/`movsx` **con destino en registro** antes del único `jmp` incondicional directo. Es la forma que genera VC6: `mov ecx, <global>` + `jmp <impl>`. `_promote_thunk_targets` promueve además el destino a función (`thunk target`), sin lo cual el thunk se quedaba con todo el cuerpo del destino.
+4. **`_promote_pointer_table_targets`** — equivalente conservador del análisis de vtable/RTTI: los destinos de tablas de punteros (sin `jump_sources`, que ésas las enlaza `_resolve_computed_jumps`) que son inicio de instrucción, viven en sección ejecutable y no pertenecen ya a otra función se promueven a semilla (`pointer table`). Recupera `0x401070` (`InitInstance`), que está en la ranura 20 —offset `0x50`— de la tabla de `0x443760` y sólo se invoca por `call [vtable+N]`.
+5. **`_promote_data_pointer_targets`** — equivalente del `PointerReferenceAnalyzer`: un puntero suelto de datos a código también es una entrada de función, con las mismas tres guardas. Los mapas de mensajes de MFC **no** son corridas de punteros consecutivos, así que `_discover_address_tables` no los reconoce; esta regla recupera `0x4051F0` (`Skin_OnLButtonDblClk`, cuya única referencia es el puntero en `0x443A24`).
+
+**Orden del pipeline.** Las promociones van *después* de `_record_scalar_reference_xrefs` (cuando ya están reunidas todas las semillas) y las de punteros *después* de `_resolve_computed_jumps` (para poder excluir las tablas de salto); cada promoción que añade semillas reejecuta `_recover_functions`. Ponerlas antes dejaba thunks sin destino promovido, porque las semillas `scalar` aún no existían.
+
+### Medición
+
+| | GXSCC.exe | `/bin/bash` |
+| --- | --- | --- |
+| funciones recuperadas | 1.715 → **2.586** | 2.434 → **2.722** (0 perdidas) |
+| thunks | 11 → **357** | 248 → **336** |
+| instrucciones | 94.768 → 94.774 | 193.628 → **193.628** |
+| xrefs | — | 74.671 → **74.671** |
+| fronteras resincronizadas | 9 | **0** |
+| análisis | 4,35 → 5,33 s | 8,65 → 10,50 s (+21 %) |
+
+Equivalencia en `/bin/bash` (misma muestra determinista de 80 funciones con símbolo, antes y después con `git stash`): **80/80 pseudocódigos idénticos byte a byte**, 2.412 de 2.434 cuerpos idénticos y los 22 restantes con `nuevo ⊆ anterior` (sólo se encogen: 16 quedan reducidos a thunk de ≤4 instrucciones), 0 funciones perdidas.
+
+Contra la documentación de GXSCC: mapa de 37 funciones **33/37 → 37/37 exactas** (0 anidadas, 0 ausentes); de las 66 direcciones `FUN_` del bundle **59 → 63** son inicio de función; volcado de 32 funciones documentadas **31/32 → 32/32** y de 134 s a 69 s. Las funciones nuevas llevan dentro la evidencia documentada: `FUN_414084` la tabla de batería `0x41512C`, `FUN_4058A0` cuatro escrituras a `0x4C6ABC`, `FUN_40EE90` la vtable OPLL `0x444F28` y el bucle `phi(5`, `FUN_401070` la cadena `GXSCC SHARED MEMORY V101` en `0x450168`, `FUN_4051F0` dos escrituras a `0x4C6ABC`.
+
+### Desviaciones y ruido conocido
+
+- **El renderizado de thunks no cambia**: sigue siendo la forma preexistente `void f(void) { goto <destino>; }` con el comentario `/* Tail thunk; … */`, que **no** muestra el reenvío de argumentos. Al clasificar ahora más funciones como thunks (248 → 336 en `/bin/bash`), ese renderizado se ve más a menudo; la vía normal de llamada de cola sí imprime `return destino(/* argumentos reenviados, firma desconocida */)`. `tests/test_minighidra.py::test_direct_jump_thunk_has_a_separate_body` fija la forma actual, así que no se ha tocado.
+- **Ruido esperable de las promociones por puntero:** en GXSCC.exe 50 de las 721 semillas nuevas (`data pointer`/`pointer table`) empiezan por `call`/`ret`/`jmp`. Los `ret` son stubs vacíos de vtable y los `jmp` thunks encadenados (legítimos); los que empiezan por `call` son punteros de datos que apuntan a mitad de una función. Ghidra produce el mismo ruido con su `PointerReferenceAnalyzer`. La guarda `no pertenece ya a otra función` impide que trunquen funciones bien recuperadas.
+- **Validación de calidad de las promociones** en `/bin/bash` (oráculo de prólogos): las 221 semillas por tabla de punteros empiezan **todas** por `push`, y ninguna de las 282 promovidas empieza por `call`/`ret`/`jmp`.
+- Siguen sin promoverse destinos de salto **condicional** a mitad de función (`0x414A43` en GXSCC, 18 saltos internos, precedido por `fld`): son etiquetas internas, y la documentación las trata como funciones por descomposición lógica, no por frontera de CFG.
+
+Suite completa **441/441 OK** (434 previos + 7 nuevos en `tests/test_minighidra.py::FlowResyncAndBoundaryTests`: resincronización de un `call` tragado por una instrucción larga, barrido ya alineado que no se toca, salto de cola tras `ret` que crea función propia, salto condicional que **no** parte la función, thunk ajustador de `this` que promueve su destino, prefijo que escribe memoria que **no** es thunk, y puntero de datos a código huérfano que crea función). `pyflakes` limpio en `analysis.py` y en los tests.
+
+Como en el resto del proyecto: sólo análisis estático, el binario analizado no se ejecuta nunca y su hash no cambia, no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
+## Validación contra la salida real de Ghidra: listado Ghidrathon de GXSCC.exe (2026-10-26)
+
+Hasta ahora todas las validaciones del puerto eran internas (tests, equivalencia A/B, documentación *derivada*). Se ha conseguido un oráculo externo: `Raw Asemmbly parts 1 to 8 GXSCC_Recreation.txt` (5.429.283 B), un volcado de Ghidrathon con el desensamblado que imprimió Ghidra línea a línea sobre `GXSCC.exe`, más la función contenedora de cada dirección anotada como `-> FUN_xxxxxxxx`. Copia local: `/home/user/gxscc/GXSCC_RawAssembly.txt`; arneses `diff_asm.py` y `diag_*.py` en `/home/user/gxscc/` (fuera del repositorio, como el resto de artefactos de GXSCC).
+
+Contenido del oráculo: 13 sub-documentos, 851 secciones `=== ASM a-b ===` (389 rangos distintos, 207.395 bytes), 1.323 directivas `D(a,b)`/`XR(a)`, 25.275 direcciones con instrucción. Hay que descartar cuatro tipos de línea que no son instrucciones: volcados de bytes del operando (`0x00414C50: -41 -10 -5 4C`), volcados en línea tras `|`, etiquetas de datos (`PTR_RegDeleteValueA_0044300c`) y las líneas `XR()`.
+
+### Desensamblado: 25.211 de 25.214 idénticos
+
+| medida | resultado |
+| --- | --- |
+| direcciones del listado presentes en la misma dirección | **25.214 / 25.275 (99,76 %)** |
+| las 61 restantes | todas **datos** (`None`, palabras sueltas, vtables `0x444F30`/`0x445438`, cadenas Shift-JIS). Ninguna dirección de código sin decodificar |
+| texto idéntico en crudo | 5.142 (20,39 %) |
+| texto idéntico tras normalizar formato | **25.211 (99,99 %)** |
+| mismo mnemotécnico | 25.211 (99,99 %) |
+| direcciones listadas 2+ veces | 4.002 → sólo 13 difieren tras normalizar |
+
+El 20,39 % "en crudo" es formato, no contenido: `JZ`/`JE`, `dword ptr` que Ghidra omite a veces, hexadecimales con ceros y en minúscula, inmediatos de un dígito en decimal (Capstone) frente a hex (`ADD ESP,0x4`), registros FPU (`FSTP ST0`/`FXCH`/`FADDP` frente a `fstp st(0)`/`fxch st(1)`/`faddp st(1)`), instrucciones de cadena (`MOVSD.REP ES:EDI,ESI` frente a `rep movsd …`), escala 1 y desplazamiento nulo explícitos (`[EDX + EDI*0x1 + 0xffffff7c]` frente a `[edx + ebp - 0x84]`) y la anotación `-> FUN_x`.
+
+Quedan **3 diferencias reales**:
+
+- `0x41D2E6` y `0x41D6E5`: bytes `9B D9 7D FE`. Ghidra fusiona el prefijo `WAIT` en la instrucción FPU siguiente (`FSTCW word ptr [EBP + -0x2]`); Capstone emite `wait` y `fstcw` por separado. Mismos bytes, distinta tokenización.
+- `0x40D994`: los bytes son `E2 D8 40 00`, el puntero `0x0040D8E2` de una tabla. Ghidra lo mantiene como dato (`None -> ?`); el **barrido lineal lo decodifica como `loop 0x40d96e`**. Artefacto real del barrido sin seguimiento de flujo, único en todo el oráculo.
+
+### Fronteras de función: 83,7 % de acuerdo, 93,9 % de funciones recuperadas
+
+Criterio de contención: el *span* `[inicio, fin]`, el mismo de `function_at()` y el de Ghidra.
+
+| comparación | resultado |
+| --- | --- |
+| misma función contenedora | **1.064 / 1.271 (83,7 %)** — 82,3 % si se exige pertenencia al flujo |
+| sin función en MiniGhidraPy | 133 (10,5 %); en 110 la función de Ghidra **sí existe** pero su cuerpo es más corto |
+| función contenedora distinta | 74 (5,8 %); en 24 la función existe (extensión/solape) |
+| inicios de función citados por Ghidra | 230 → **216 recuperados (93,9 %)** |
+| líneas `XR()` | 17 coincidencias exactas, 5 `ORFANO` en acuerdo, 1 `ORFANO` donde se creó función (`0x40EAE0`), 1 ausente |
+
+Los 14 inicios que faltan se clasifican con evidencia:
+
+- **5 funclets SEH de VC6** (`0x40ACEF`, `0x4169FF`, `0x41A108`, `0x41A170`, `0x42F381`): la entrada elegida es 3–8 bytes **anterior** a la de Ghidra y es exactamente la dirección que el propio código nombra (`mov eax,0x41a105; ret`). Ghidra arranca en el `mov/or dword ptr [ebp-4],…` siguiente. Desensamblado idéntico; sólo difiere la frontera.
+- **7 copias internas del bloque de voz SCC** (`0x4141A3`, `0x414395`, `0x4144DF`, `0x4146BB`, `0x414892`, `0x414BBA`, `0x414C50`), todas con el mismo `mov edi,0x4cfbf0; mov ecx,0x20; mov esi,0x4510d8; rep movsd`, más `0x405354`: **cero llamadas, cero saltos y cero punteros** que las nombren (se buscó el dword little-endian en las cuatro secciones: ninguna aparición). Se mantienen dentro de `FUN_414084`/`FUN_405310`.
+- **1 fallo real**: `FUN_00402a04` (23 líneas anotadas), alcanzada sólo por un `je` desde código ya huérfano.
+
+El oráculo no es un artefacto del script: sólo el 26,5 % de los inicios `FUN_` citados coincide con un arranque de rango `D(a,b)`, y 266 de los 327 arranques de rango nunca se citan como función.
+
+### Desviación nueva documentada: cuerpos truncados por llamadas no retornantes
+
+Es la causa principal del 16 % de desacuerdo de fronteras y **no está corregida**.
+
+| medida | valor |
+| --- | --- |
+| instrucciones fuera del span de toda función | **17.374 / 94.774 (18,33 %)** |
+| instrucciones no alcanzadas por el flujo de ninguna función | 19.698 (20,78 %) |
+| llamadas a funciones marcadas *no retornantes* | 696 (661 seguidas de código huérfano) |
+| huérfanas explicadas por esos cortes | **15.008 (76,2 %)** |
+
+Mecanismo: VC6 coloca el bloque de `throw` **inmediatamente antes** de la función a la que pertenece, así que el *fall-through* de la llamada no retornante es la entrada real de una función. El seguimiento de flujo cierra el cuerpo en la llamada y esa entrada nunca se siembra:
+
+```
+0x0042E275  mov eax, 0x4428ed     <- FUN_42E275 (2 instrucciones)
+0x0042E27A  call 0x41e748         <- _CxxThrowException (154 llamadas), no retorna
+0x0042E27F  sub esp, 0x74         <- prólogo real: 341 instrucciones huérfanas
+```
+
+Ghidra anota `0x42E2F7`…`0x42E61D` como dentro de `FUN_0042e275`.
+
+Auditoría de las 383 marcas *no retornantes*: 380 coherentes (ningún `ret` en el cuerpo); 2 con `ret`: `0x41E748` (correcta de todos modos) y **`0x41EA1C`** (24 instrucciones, termina en `ret 8`, 12 llamadas → **falso positivo**). Ambas se generaron con la evidencia `function entry at call fall-through`, que es justo la regla que la disposición de VC6 rompe.
+
+Corrección propuesta en su día y **aplicada en la sección siguiente** (con la validación completa repetida): sembrar función en el *fall-through* de una llamada no retornante cuando está decodificado y no pertenece a nadie —la misma forma que la regla C2 de "salto tras `ret`"— y endurecer la inferencia *no-return* para descartar candidatas cuyo cuerpo termina en `ret`.
+
+Como en el resto del proyecto: sólo análisis estático, el binario no se ejecuta nunca y su hash no cambia (`1eeeecf6…4992f7a` verificado antes y después), no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
+
+## Llamadas no retornantes: auditoría, revalidación y promoción del *fall-through* (2026-10-26)
+
+Aplica la corrección que la sección anterior dejaba propuesta. Tres mecanismos en
+`minighidra/analysis.py`, iterados hasta punto fijo, todos medidos contra el
+listado real de Ghidra para GXSCC.exe y contra `/bin/bash`:
+
+1. **`_discard_returning_noreturns()`** — descarta marcas *inferidas* cuyo cuerpo
+   recuperado contiene un `ret`, pero **sólo** cuando toda su evidencia es el
+   indicador ambiguo `function entry at call fall-through`. El catálogo de nombres
+   conocidos (`ExitProcess`, `abort`…) no se audita: una importación no tiene
+   cuerpo en la imagen.
+2. **`_revalidate_wrapper_marks()`** — exige a las marcas de la regla de
+   propagación por *wrappers* que sigan cumpliendo el predicado que las generó
+   (`_function_paths_only_call_no_return`), que ya devuelve `False` ante un `ret`
+   o una trampa alcanzables.
+3. **`_promote_noreturn_fallthroughs()`** — siembra función en el *fall-through*
+   de una llamada no retornante cuando está decodificado, no es una trampa, no
+   empieza por `call`/`ret`/`jmp` y no pertenece a ninguna función (ni por flujo
+   ni por span). Es la misma forma que la regla C2 de "salto tras `ret`". Se
+   ejecuta después de `_infer_no_return_functions()`, con el conjunto de marcas
+   estable, y relanza `_recover_functions()` si siembra algo.
+
+Las dos primeras se iteran en `_infer_no_return_functions()` (máximo 8 rondas)
+hasta que ninguna regla cambia de opinión.
+
+### Tres decisiones de diseño que impuso la medición
+
+- **La auditoría por cuerpo no puede hacerse durante la inferencia.** Los cuerpos
+  se recuperan *antes* de marcar, de modo que el recorrido atraviesa la llamada y
+  absorbe el `ret` de la función vecina: aplicada dentro de
+  `_infer_no_return_from_call_sites`, la regla descartaba **383 → 2** marcas en
+  cascada. Con las marcas ya puestas, 380 de 383 cuerpos no tienen `ret`.
+- **El `ret` del cuerpo no veta la evidencia fuerte.** Los tres tests existentes
+  de inferencia dinámica usan un objetivo cuyo cuerpo es un `ret` desnudo con tres
+  trampas `INT3` tras las llamadas, y allí la marca es correcta. La auditoría sólo
+  deshace el empate cuando la evidencia es *únicamente* la ambigua; una trampa, el
+  fin del código decodificado o la propagación por wrappers siguen ganando
+  (`test_strong_evidence_survives_a_returning_body`). Ghidra también agrega
+  evidencia en vez de descartarla.
+- **Descartar una marca obliga a revalidar las demás: punto fijo.** Al desmarcar
+  `_CxxThrowException` el flujo atraviesa sus 154 llamadas y los cuerpos de quien
+  la llamaba crecen hasta un `ret`; esas marcas quedaron obsoletas. Medido: **104
+  de 381** marcas inferidas tenían un `ret` alcanzable desde la entrada, las 104
+  generadas por la regla de *wrappers*, y **102 terminaban en `ret`**. Sin
+  revalidar, esas marcas obsoletas no eran inocuas: sembraban **286 funciones
+  espurias** que partían cuerpos que Ghidra mantiene enteros, y el acuerdo de
+  función contenedora bajaba de 91,2 % a 89,1 %. Con el punto fijo no queda ninguna
+  marca que incumpla su propia regla.
+
+En GXSCC.exe la cascada es total y correcta: las 381 marcas inferidas colgaban
+todas, transitivamente, de los dos falsos positivos (`0x41E748` y `0x41EA1C`), así
+que al desmarcarlos sólo sobreviven **2**: `ExitProcess` (`0x443174`, catálogo) y
+`0x41E681` (wrappers, que sí satisface su predicado). En `/bin/bash`, en cambio,
+la inferencia cuelga de importaciones reales del catálogo y sobrevive: 60 → 58
+marcas y **503** funciones nuevas por la regla 3.
+
+El filtro de prólogo plausible (no sembrar un *fall-through* que empiece por
+`call`/`ret`/`jmp`) **no cambia ninguna cifra del oráculo** y evita 17 funciones
+con entrada inverosímil; se mantiene por coherencia con la regla C2.
+
+### Medición en GXSCC.exe (mismo oráculo en los tres estados)
+
+La herramienta versionada `tools/diff_asm.py` enriqueció además el oráculo: ahora
+también lee las líneas indentadas `0xADDR (FUN_x): …`, `0xADDR in FUN_x: …`,
+`0xADDR (?): …` y `0xADDR (in FUN_x)`, que son sitios de referencia con su función
+contenedora. Las direcciones anotadas pasan de 1.271 a **1.484** y los inicios de
+función citados por Ghidra de 230 a **281**. Ese crecimiento es del *oráculo*, no
+del código: los inicios recuperados son 265/281 (94,3 %) antes y después de la
+corrección (con el analizador antiguo la cifra equivalente era 216/230).
+
+| métrica | base (`0d01f071`) | sin punto fijo | **final** |
+| --- | --- | --- | --- |
+| funciones recuperadas | 2.586 | 2.872 | **2.586** |
+| thunks | 357 | 359 | **357** |
+| instrucciones decodificadas | 94.774 | 94.774 | **94.774** |
+| marcas no retornantes | 383 | 381 | **2** |
+| marcas que incumplen su propia regla | 2 | 104 | **0** |
+| semillas `noreturn fall-through` | — | 286 | **0** |
+| instrucciones fuera del span de toda función | 17.374 (18,33 %) | 4.299 (4,54 %) | **4.231 (4,46 %)** |
+| huérfanas tras una llamada no retornante | 15.008 (76,2 %) | 44 (1,0 %) | **0 (0,0 %)** |
+| función contenedora igual (span) | 1.241/1.484 (83,6 %) | 1.322 (89,1 %) | **1.354 (91,2 %)** |
+| función contenedora igual (pertenencia) | 1.221 (82,3 %) | 1.286 (86,7 %) | **1.346 (90,7 %)** |
+| direcciones anotadas **sin** función (span / pertenencia) | 145 / 157 | 0 / 28 | **0 / 0** |
+| direcciones anotadas en función distinta | 98 | 162 | **130** |
+| inicios citados por Ghidra recuperados | 265/281 (94,3 %) | 265/281 | **265/281** |
+| líneas `XR()` coincidentes | 22/24 | 17/24 | **17/24** |
+| texto idéntico tras normalizar | 25.893/25.896 (99,99 %) | igual | **igual** |
+
+El desensamblado no cambia en absoluto: las 3 diferencias residuales siguen siendo
+las mismas (`0x41D2E6`/`0x41D6E5`, donde Ghidra fusiona `WAIT` en `FSTCW`, y
+`0x40D994`, datos barridos como código).
+
+Efecto sobre los dos casos que motivaron la corrección: `FUN_42E275` pasa de **2 a
+343** instrucciones (Ghidra anota `0x42E2F7`…`0x42E61D` dentro de `FUN_0042e275`) y
+`FUN_413560` de **9 a 87**. Acuerdo con la documentación de ingeniería inversa,
+**sin cambio en los tres estados**: 37/37 direcciones del
+`mapa_funciones_GXSCC.csv` son inicios exactos y 63/66 referencias `FUN_` del
+bundle son función propia (las mismas 3 interiores: `0x405311`, `0x405354`,
+`0x414A43`). Las 37 producen pseudocódigo (23,1 s).
+
+### Equivalencia A/B en `/bin/bash` (muestra fijada a símbolos)
+
+| métrica | base (`0d01f071`) | final |
+| --- | --- | --- |
+| instrucciones / xrefs | 193.628 / 74.671 | **193.628 / 74.671** |
+| funciones | 2.722 | **3.225** (+503) |
+| funciones perdidas | — | **0** |
+| cuerpos idénticos / reducidos / crecidos / reordenados | — | **2.713 / 2 / 7 / 0** |
+| thunks | 336 | 365 |
+| marcas no retornantes | 60 | **58** |
+| pseudocódigo de la muestra (80 símbolos) | — | **0 cambiados** |
+| análisis | 10,75 s | 11,33 s (+5,4 %) |
+
+Las 503 funciones nuevas coinciden una a una con las 503 semillas
+`noreturn fall-through`; ningún otro origen de semillas cambia. Los 7 cuerpos que
+crecen son funciones cuyo flujo ahora atraviesa una llamada que antes se daba por
+no retornante.
+
+### Desviaciones y límites nuevos (ninguno oculto)
+
+- **5 líneas `XR()` que Ghidra marca `ORFANO` ahora discrepan** (`0x402A32`,
+  `0x402C60`, `0x40EB4A`, `0x4135F8`, `0x413637`): MiniGhidraPy las incluye en una
+  función (`0x4029E0`, `0x40EAE0`, `0x413560`) donde Ghidra no la tiene. Antes
+  coincidían porque ninguno de los dos tenía función ahí. Las líneas `XR()`
+  coincidentes bajan de 22/24 a 17/24.
+- `0x402A04` **sigue sin ser inicio propio**: pasa de no tener función a caer
+  dentro de `0x4029E0` (382 instrucciones). Ghidra lo anota como `FUN_00402a04`; su
+  única referencia entrante es un `je` desde código huérfano.
+- Las direcciones anotadas que caen en una función **distinta** suben de 98 a 130:
+  hay más direcciones con función, no siempre la misma que Ghidra.
+- Los 16 inicios citados que faltan siguen siendo los mismos tipos: 5 funclets SEH
+  de VC6 (nuestra entrada es 3–8 bytes anterior, justo la que el código nombra con
+  `mov eax,<addr>; ret`), 8 copias de inicialización de voz SCC sin ninguna xref y
+  sin ninguna aparición del dword en toda la imagen, y 3 casos más (`0x402A04`,
+  `0x405354`, `0x405440`).
+- **La regla 3 no aporta nada en GXSCC.exe** (0 semillas): tras la auditoría sólo
+  quedan 2 marcas y sus *fall-through* son trampas o código ya poseído. Sí aporta
+  503 funciones en `/bin/bash`. Se mantiene porque es correcta en principio, tiene
+  test propio y se ejerce en ELF.
+- **Limitación del catálogo de nombres:** `TerminateProcess` (`0x443310`) y
+  `TerminateThread` (`0x443218`) están presentes en la IAT y **no** se marcan como
+  no retornantes; el catálogo del puerto sólo reconoce `ExitProcess`. Ghidra las
+  incluye en su lista. Pendiente, fuera del alcance de esta corrección.
+
+### Herramienta versionada
+
+`tools/diff_asm.py` es la versión reproducible del arnés de validación: no depende
+de rutas absolutas, filtra volcados de bytes, etiquetas de datos, líneas `XR()` y
+de evidencia, aplica las normalizaciones de `canonizar()` y emite siete informes
+(listado, cobertura, identidad de texto, función contenedora, inicios citados,
+código fuera de función, rangos `D()`). Uso:
+
+```
+python tools/diff_asm.py LISTADO.txt BINARIO [--residual SALIDA.txt]
+```
+
+### Validación
+
+- Suite completa: **444/444 OK** (3 tests nuevos en `FlowResyncAndBoundaryTests`:
+  descarte de evidencia ambigua con cuerpo que retorna, supervivencia de la
+  evidencia fuerte y promoción del *fall-through*).
+- `pyflakes` sin avisos en `analysis.py`, `tools/diff_asm.py` y los tests.
+- Sólo análisis estático: GXSCC.exe no se ejecuta nunca, su hash no cambia
+  (`1eeeecf6…4992f7a`, verificado antes y después), no quedan procesos vivos y
+  **no se afirma paridad total con Ghidra**.

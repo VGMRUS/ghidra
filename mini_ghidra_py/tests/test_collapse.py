@@ -468,3 +468,34 @@ class PseudocodePolarityTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestInternalConditionEdges(unittest.TestCase):
+    """``get_true_out()`` needs two out-edges; callers must guard it.
+
+    A node that the collapse machinery makes *internal* can end up with a
+    single out-edge (``copyIn`` plus ``BlockIfGoto`` dropping the goto edge),
+    and the pseudocode renderer used to ask such a node for its true
+    out-block unconditionally.  Real-world repro: GXSCC.exe functions
+    0x401910, 0x4035A0, 0x40CE20, 0x40D3E0 and 0x411F60, all of which raised
+    ``IndexError: list index out of range`` from ``block.py:get_true_out``.
+    """
+
+    def test_single_out_block_has_no_true_out(self):
+        graph = _graph_from_spec({"n": 2, "edges": [(0, 1)]})
+        block = _by_address(graph, 0x1000)
+        self.assertEqual(block.size_out(), 1)
+        with self.assertRaises(IndexError):
+            block.get_true_out()
+        # The guarded form used by the renderer stays safe.
+        self.assertIsNone(
+            block.get_true_out() if block.size_out() > 1 else None
+        )
+
+    def test_two_out_block_exposes_its_true_out(self):
+        graph = _graph_from_spec(
+            {"n": 3, "edges": [(0, 1), (0, 2), (1, 2)]}
+        )
+        block = _by_address(graph, 0x1000)
+        self.assertEqual(block.size_out(), 2)
+        self.assertIsNotNone(block.get_true_out())
