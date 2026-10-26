@@ -1324,5 +1324,109 @@ class MiniGhidraTests(unittest.TestCase):
             BinaryImage.load(path, raw_arch="arm64")
 
 
+class FlowResyncAndBoundaryTests(unittest.TestCase):
+    """Desensamblado con resincronización por flujo y fronteras de función.
+
+    Regresiones de la verificación contra GXSCC.exe: el barrido lineal se
+    desalineaba tras un ``ret`` y se tragaba el prólogo de una función sólo
+    alcanzada por ``call`` (``0x4058A0``), los thunks ajustadores de ``this``
+    absorbían todo el cuerpo de su destino (``FUN_401500`` con luz hasta
+    ``0x40EEC4``) y las entradas de vtable no se promovían a función
+    (``0x401070``, ``InitInstance``).
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+
+    def _analyze(self, name: str, hexbytes: str, base: int, arch: str = "x86_64"):
+        path = self.root / name
+        path.write_bytes(bytes.fromhex(hexbytes))
+        return Analyzer(BinaryImage.load(path, raw_arch=arch, base=base))
+
+    def test_call_target_swallowed_by_a_long_instruction_is_resynced(self) -> None:
+        # 9000: call 0x900b ; 9005: ret ;
+        # 9006: mov dword [0x900b], 0x2a   <- 10 bytes, cubre 0x900b
+        # 9010: push rbp ; 9011: ret
+        analyzer = self._analyze(
+            "resync.bin",
+            "e806000000" "c3" "c7050b9000002a000000" "55" "c3",
+            0x9000,
+        )
+        self.assertGreaterEqual(analyzer.resynced_flow_boundaries, 1)
+        self.assertIn(0x900B, analyzer.instructions)
+        # La instrucción desalineada que cubría el destino desaparece.
+        self.assertNotIn(0x9006, analyzer.instructions)
+        self.assertIn(0x900B, analyzer.functions)
+
+    def test_linear_sweep_without_desync_is_left_untouched(self) -> None:
+        # Todo destino de ``call`` cuadra: la resincronización no toca nada.
+        analyzer = self._analyze("alineado.bin", "5548 89e5 e802000000 5d c3 90 c3".replace(" ", ""), 0x9400)
+        self.assertEqual(analyzer.resynced_flow_boundaries, 0)
+
+    def test_unconditional_jump_target_after_return_is_its_own_function(self) -> None:
+        # 9100: jmp 0x9103 ; 9102: ret ; 9103: push rbp ; 9104: ret
+        analyzer = self._analyze("frontera.bin", "eb01" "c3" "55" "c3", 0x9100)
+        self.assertIn(0x9103, analyzer.functions)
+        self.assertEqual(
+            analyzer.function_seeds[0x9103][1], "after-return jump target"
+        )
+        # El salto de cola no absorbe el cuerpo del destino.
+        self.assertNotIn(0x9103, {i.address for i in analyzer.functions[0x9100].instructions})
+
+    def test_conditional_jump_target_is_not_split_off(self) -> None:
+        # Un salto condicional hacia delante no crea frontera: sigue siendo una
+        # sola función (si no, la regla partiría bucles y bloques compartidos).
+        analyzer = self._analyze("condicional.bin", "85ff" "7401" "c3" "90" "c3", 0x9150)
+        self.assertEqual(len(analyzer.functions), 1)
+        self.assertNotIn(0x9154, analyzer.function_seeds)
+
+    def test_this_adjustor_thunk_promotes_its_target(self) -> None:
+        # 9200: mov ecx, 0x3e8 ; 9205: jmp 0x920b ; 920a: nop ; 920b: push ebp ; ret
+        analyzer = self._analyze(
+            "thunk-this.bin", "b9e8030000" "e901000000" "90" "55" "c3", 0x9200, arch="x86"
+        )
+        thunk = analyzer.functions[0x9200]
+        self.assertTrue(thunk.is_thunk)
+        self.assertEqual(thunk.thunk_target, 0x920B)
+        self.assertEqual([i.mnemonic for i in thunk.instructions], ["mov", "jmp"])
+        self.assertIn(0x920B, analyzer.functions)
+        self.assertEqual(analyzer.function_seeds[0x920B][1], "thunk target")
+
+    def test_thunk_prefix_that_writes_memory_is_not_a_thunk(self) -> None:
+        # ``mov dword [ecx], 1`` escribe memoria: no es un thunk, es una función.
+        analyzer = self._analyze(
+            "no-thunk.bin", "c70101000000" "e901000000" "90" "55" "c3", 0x9250, arch="x86"
+        )
+        self.assertFalse(analyzer.functions[0x9250].is_thunk)
+
+    def test_data_pointer_to_code_creates_a_function(self) -> None:
+        base = 0x620000
+        orphan = base + 0x20
+        # El huérfano no usa un prólogo reconocible por los patrones de inicio
+        # de función: si no, lo sembrarían ellos y no se vería la regla nueva.
+        code = bytes.fromhex("55c3") + b"\x90" * (0x20 - 2)
+        code += bytes.fromhex("b801000000c3")
+        code += b"\x90" * (0x40 - len(code))
+        table_address = base + 0x100
+        data = orphan.to_bytes(8, "little")
+        payload = code + b"\x90" * (0x100 - len(code)) + data
+        path = self.root / "puntero-de-datos.bin"
+        path.write_bytes(payload)
+        image = BinaryImage.load(path, raw_arch="x86_64", base=base)
+        image.sections = [
+            Section(".text", base, len(code), 0, code, executable=True),
+            Section(".rdata", table_address, len(data), 0x100, data),
+        ]
+        analyzer = Analyzer(image)
+
+        self.assertIn(orphan, analyzer.instructions)
+        self.assertIn(orphan, analyzer.functions)
+        self.assertEqual(analyzer.function_seeds[orphan][1], "data pointer")
+        # La función que apunta no absorbe el cuerpo huérfano.
+        self.assertNotIn(orphan, {i.address for i in analyzer.functions[base].instructions})
+
+
 if __name__ == "__main__":
     unittest.main()

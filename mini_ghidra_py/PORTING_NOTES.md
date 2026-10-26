@@ -433,3 +433,42 @@ Desviaciones frente a Ghidra observadas en la misma verificación (preexistentes
 - **CRT estático sin identificar.** Las funciones de tiempo de ejecución enlazadas estáticamente (VC6) siguen apareciendo como `FUN_xxxxxx`: no hay emparejamiento de firmas (equivalente a Ghidra FID).
 
 Como en el resto del proyecto: sólo análisis estático, el binario analizado no se ejecuta nunca y su hash no cambia, no quedan procesos vivos y **no se afirma paridad total con Ghidra**.
+
+## Barrido lineal con resincronización por flujo y fronteras de función (2026-10-26)
+
+La verificación contra GXSCC.exe dejó tres defectos de recuperación que comparten causa raíz: `_disassemble_sections` barre la sección de corrido con Capstone y nada vuelve a cuadrar el desensamblado ni a crear funciones donde sólo hay punteros o saltos de cola. Se corrigen con cinco reglas nuevas en `analysis.py`, todas inspiradas en analizadores concretos de Ghidra y todas **dirigidas**: cuando no hay nada que corregir no tocan nada.
+
+1. **`_resync_flow_boundaries`** — desensambla **siguiendo el flujo** desde cada destino de `call` directo que el barrido no alcanzó como inicio de instrucción: borra la instrucción desalineada que lo cubre y vuelve a decodificar hasta re-sincronizar con código ya alineado (o con un `ret`). Es el equivalente de `DisassembleCommand` de Ghidra reiniciando en los destinos conocidos. En GXSCC.exe corrige 9 fronteras, entre ellas `0x4058A0` (`SynthModeToggleFeedback`, 58 instrucciones recuperadas; antes ni siquiera estaba desensamblada porque la basura `add byte ptr [eax+0x56909090], dl` de `0x40589B` se comía su `push esi`). En `/bin/bash` no hay ninguna frontera desalineada (23.415 destinos de flujo) y el método devuelve 0 **sin modificar el mapa de instrucciones**.
+   - **Desviación deliberada:** sólo se re-sincroniza en destinos de `call`, no de `jmp`. Saltar a mitad de una instrucción es un modismo x86 legítimo (trucos de alineación, `jmp $+5` para saltarse un inmediato, parcheo en caliente) y el propio banco de pruebas lo usa (`GOTO_SAMPLE` en `tests/test_clangdoc.py`); hacerlo ahí destruía código válido. Ghidra sí desensambla en los destinos de salto.
+2. **`_promote_boundary_jump_targets`** — un `jmp` **incondicional** cuyo destino empieza justo tras un `ret`/trampa es un salto de cola a *otra* función: el destino se promueve a semilla (`after-return jump target`) en vez de absorberse. Los saltos **condicionales** sólo se aceptan con dos guardas: que el destino no pertenezca ya a una función y que su primera instrucción no sea `call`/`ret`/`jmp`. Sin esas guardas la regla partía bucles (en GXSCC.exe pasaba de 46 a 454 semillas y creaba 77 funciones que empiezan por `call`, un prólogo imposible).
+3. **`_detect_thunk` acepta thunks ajustadores de `this`** — además de `nop`/`endbr`, se admite un prefijo acotado (8 instrucciones, como la comprobación de Ghidra) de `mov`/`lea`/`xor`/`movzx`/`movsx` **con destino en registro** antes del único `jmp` incondicional directo. Es la forma que genera VC6: `mov ecx, <global>` + `jmp <impl>`. `_promote_thunk_targets` promueve además el destino a función (`thunk target`), sin lo cual el thunk se quedaba con todo el cuerpo del destino.
+4. **`_promote_pointer_table_targets`** — equivalente conservador del análisis de vtable/RTTI: los destinos de tablas de punteros (sin `jump_sources`, que ésas las enlaza `_resolve_computed_jumps`) que son inicio de instrucción, viven en sección ejecutable y no pertenecen ya a otra función se promueven a semilla (`pointer table`). Recupera `0x401070` (`InitInstance`), que está en la ranura 20 —offset `0x50`— de la tabla de `0x443760` y sólo se invoca por `call [vtable+N]`.
+5. **`_promote_data_pointer_targets`** — equivalente del `PointerReferenceAnalyzer`: un puntero suelto de datos a código también es una entrada de función, con las mismas tres guardas. Los mapas de mensajes de MFC **no** son corridas de punteros consecutivos, así que `_discover_address_tables` no los reconoce; esta regla recupera `0x4051F0` (`Skin_OnLButtonDblClk`, cuya única referencia es el puntero en `0x443A24`).
+
+**Orden del pipeline.** Las promociones van *después* de `_record_scalar_reference_xrefs` (cuando ya están reunidas todas las semillas) y las de punteros *después* de `_resolve_computed_jumps` (para poder excluir las tablas de salto); cada promoción que añade semillas reejecuta `_recover_functions`. Ponerlas antes dejaba thunks sin destino promovido, porque las semillas `scalar` aún no existían.
+
+### Medición
+
+| | GXSCC.exe | `/bin/bash` |
+| --- | --- | --- |
+| funciones recuperadas | 1.715 → **2.586** | 2.434 → **2.722** (0 perdidas) |
+| thunks | 11 → **357** | 248 → **336** |
+| instrucciones | 94.768 → 94.774 | 193.628 → **193.628** |
+| xrefs | — | 74.671 → **74.671** |
+| fronteras resincronizadas | 9 | **0** |
+| análisis | 4,35 → 5,33 s | 8,65 → 10,50 s (+21 %) |
+
+Equivalencia en `/bin/bash` (misma muestra determinista de 80 funciones con símbolo, antes y después con `git stash`): **80/80 pseudocódigos idénticos byte a byte**, 2.412 de 2.434 cuerpos idénticos y los 22 restantes con `nuevo ⊆ anterior` (sólo se encogen: 16 quedan reducidos a thunk de ≤4 instrucciones), 0 funciones perdidas.
+
+Contra la documentación de GXSCC: mapa de 37 funciones **33/37 → 37/37 exactas** (0 anidadas, 0 ausentes); de las 66 direcciones `FUN_` del bundle **59 → 63** son inicio de función; volcado de 32 funciones documentadas **31/32 → 32/32** y de 134 s a 69 s. Las funciones nuevas llevan dentro la evidencia documentada: `FUN_414084` la tabla de batería `0x41512C`, `FUN_4058A0` cuatro escrituras a `0x4C6ABC`, `FUN_40EE90` la vtable OPLL `0x444F28` y el bucle `phi(5`, `FUN_401070` la cadena `GXSCC SHARED MEMORY V101` en `0x450168`, `FUN_4051F0` dos escrituras a `0x4C6ABC`.
+
+### Desviaciones y ruido conocido
+
+- **El renderizado de thunks no cambia**: sigue siendo la forma preexistente `void f(void) { goto <destino>; }` con el comentario `/* Tail thunk; … */`, que **no** muestra el reenvío de argumentos. Al clasificar ahora más funciones como thunks (248 → 336 en `/bin/bash`), ese renderizado se ve más a menudo; la vía normal de llamada de cola sí imprime `return destino(/* argumentos reenviados, firma desconocida */)`. `tests/test_minighidra.py::test_direct_jump_thunk_has_a_separate_body` fija la forma actual, así que no se ha tocado.
+- **Ruido esperable de las promociones por puntero:** en GXSCC.exe 50 de las 721 semillas nuevas (`data pointer`/`pointer table`) empiezan por `call`/`ret`/`jmp`. Los `ret` son stubs vacíos de vtable y los `jmp` thunks encadenados (legítimos); los que empiezan por `call` son punteros de datos que apuntan a mitad de una función. Ghidra produce el mismo ruido con su `PointerReferenceAnalyzer`. La guarda `no pertenece ya a otra función` impide que trunquen funciones bien recuperadas.
+- **Validación de calidad de las promociones** en `/bin/bash` (oráculo de prólogos): las 221 semillas por tabla de punteros empiezan **todas** por `push`, y ninguna de las 282 promovidas empieza por `call`/`ret`/`jmp`.
+- Siguen sin promoverse destinos de salto **condicional** a mitad de función (`0x414A43` en GXSCC, 18 saltos internos, precedido por `fld`): son etiquetas internas, y la documentación las trata como funciones por descomposición lógica, no por frontera de CFG.
+
+Suite completa **441/441 OK** (434 previos + 7 nuevos en `tests/test_minighidra.py::FlowResyncAndBoundaryTests`: resincronización de un `call` tragado por una instrucción larga, barrido ya alineado que no se toca, salto de cola tras `ret` que crea función propia, salto condicional que **no** parte la función, thunk ajustador de `this` que promueve su destino, prefijo que escribe memoria que **no** es thunk, y puntero de datos a código huérfano que crea función). `pyflakes` limpio en `analysis.py` y en los tests.
+
+Como en el resto del proyecto: sólo análisis estático, el binario analizado no se ejecuta nunca y su hash no cambia, no quedan procesos vivos y **no se afirma paridad total con Ghidra**.

@@ -112,6 +112,7 @@ class Analyzer:
         self._name_by_address: dict[int, str] = {}
         self._index_names()
         self._disassemble_sections()
+        self.resynced_flow_boundaries = self._resync_flow_boundaries()
         self._find_strings()
         self._find_function_seeds()
         self._mark_known_noreturns()
@@ -119,9 +120,18 @@ class Analyzer:
         self._discover_macho_function_starts()
         self._discover_pattern_function_starts()
         self._record_scalar_reference_xrefs()
+        # Las promociones van después de haber reunido *todas* las semillas
+        # (símbolos, llamadas, patrones, escalares): si corren antes, un thunk
+        # descubierto por la vía escalar no promueve su destino.
+        if self._promote_boundary_jump_targets() + self._promote_thunk_targets():
+            self._recover_functions()
         self._find_data_pointers()
         self._discover_address_tables()
         self._resolve_computed_jumps()
+        if self._promote_pointer_table_targets():
+            self._recover_functions()
+        if self._promote_data_pointer_targets():
+            self._recover_functions()
         self._infer_no_return_functions()
         self._infer_stack_purge_sizes()
         self.instruction_addresses = sorted(self.instructions)
@@ -420,6 +430,309 @@ class Analyzer:
             pass
         self.instruction_addresses.sort()
 
+
+    def _call_boundaries(self) -> set[int]:
+        """Destinos de ``call`` directo: fronteras donde el barrido debe cuadrar.
+
+        Son los puntos donde Ghidra reinicia el desensamblado al seguir el flujo.
+        Se limitan a ``call`` a propósito: un ``jmp`` **sí** puede caer a mitad
+        de una instrucción de forma legítima (trucos de alineación,
+        ``jmp $+5`` para saltar un inmediato, parcheo en caliente), y
+        re-sincronizar ahí destruiría código válido. Un ``call`` a mitad de
+        instrucción no existe en la práctica: el destino necesita prólogo.
+        """
+        boundaries: set[int] = set()
+        for instruction in self.instructions.values():
+            target = instruction.branch_target
+            if target is None or not instruction.is_call:
+                continue
+            if target == instruction.next_address:
+                # Thunk call-next-PC: captura la dirección de retorno, no llama.
+                continue
+            section = self.image.section_at(target)
+            if section is not None and section.executable:
+                boundaries.add(target)
+        if self.image.entrypoint is not None:
+            boundaries.add(self.image.entrypoint)
+        return boundaries
+
+    def _resync_flow_boundaries(self) -> int:
+        """Vuelve a desensamblar **siguiendo el flujo** donde el barrido se perdió.
+
+        ``_disassemble_sections`` barre la sección de corrido con Capstone: tras
+        un ``ret`` sigue decodificando datos o relleno de alineación y puede
+        tragarse el primer byte de una función a la que sólo se llega por
+        ``call`` o por vtable. En GXSCC.exe eso dejaba ``0x4058A0``
+        (``SynthModeToggleFeedback``, 1 ``call`` entrante desde ``0x4052C8``)
+        sin desensamblar: la basura ``add byte ptr [eax+0x56909090], dl`` de
+        ``0x40589B`` cubría su ``push esi``.
+
+        La corrección es dirigida y no toca nada cuando no hace falta: si todos
+        los destinos de ``call`` son ya inicio de instrucción (caso de
+        ``/bin/bash``, 23.415 fronteras de flujo y 0 desalineadas) el método
+        devuelve 0 sin modificar el mapa de instrucciones.
+        """
+        pending = deque(sorted(
+            boundary
+            for boundary in self._call_boundaries()
+            if boundary not in self.instructions
+        ))
+        if not pending:
+            return 0
+        dropped: set[int] = set()
+        visited: set[int] = set()
+        while pending:
+            address = pending.popleft()
+            if address in visited:
+                continue
+            visited.add(address)
+            dropped |= self._drop_overlapping(address)
+            self._follow_flow(address, pending)
+        self._drop_xrefs_from(dropped)
+        self.instruction_addresses = sorted(self.instructions)
+        return len(visited)
+
+    def _drop_overlapping(self, address: int) -> set[int]:
+        """Borra las instrucciones del barrido cuyo rango cubre ``address``."""
+        ordered = sorted(self.instructions)
+        index = bisect_right(ordered, address) - 1
+        dropped: set[int] = set()
+        # Sólo pueden solapar las pocas instrucciones inmediatamente anteriores.
+        while index >= 0 and len(dropped) < 8:
+            previous = self.instructions.get(ordered[index])
+            if previous is None or previous.address + previous.size <= address:
+                break
+            dropped.add(previous.address)
+            del self.instructions[previous.address]
+            index -= 1
+        return dropped
+
+    def _drop_xrefs_from(self, sources: set[int]) -> None:
+        """Olvida las xrefs cuyo origen era una instrucción desalineada."""
+        if not sources:
+            return
+        self.xrefs = [xref for xref in self.xrefs if xref.source not in sources]
+        self._xref_keys = {(xref.source, xref.target, xref.kind) for xref in self.xrefs}
+        self.xrefs_by_target = defaultdict(list)
+        self.xrefs_by_source = defaultdict(list)
+        for xref in self.xrefs:
+            self.xrefs_by_target[xref.target].append(xref)
+            self.xrefs_by_source[xref.source].append(xref)
+
+    def _follow_flow(self, start: int, pending: deque, max_steps: int = 512) -> None:
+        """Desensambla desde ``start`` siguiendo el flujo hasta re-sincronizar.
+
+        Se para en cuanto alcanza una dirección que ya es inicio de instrucción
+        (código alineado por el barrido), en un ``ret``/trampa, o al salir de una
+        sección ejecutable. Los destinos de ``call`` que tampoco estén alineados
+        se encolan para tratarlos igual.
+        """
+        pc = start
+        for _ in range(max_steps):
+            if pc in self.instructions and pc != start:
+                return
+            section = self.image.section_at(pc, file_backed=True)
+            if section is None or not section.executable:
+                return
+            offset = pc - section.start
+            if offset < 0 or offset >= len(section.data):
+                return
+            chunk = section.data[offset:offset + 16]
+            decoded = next(self._md.disasm(chunk, pc), None)
+            if decoded is None or not decoded.id:
+                return
+            instruction = self._make_instruction(decoded)
+            self.instructions[instruction.address] = instruction
+            self._record_instruction_xrefs(instruction)
+            if instruction.is_return or instruction.is_trap:
+                return
+            target = instruction.branch_target
+            if instruction.is_jump and not instruction.is_conditional_jump:
+                if target is not None and target not in self.instructions:
+                    pc = target
+                    continue
+                return
+            if (
+                instruction.is_call
+                and target is not None
+                and target != instruction.next_address
+                and target not in self.instructions
+            ):
+                pending.append(target)
+            pc = instruction.next_address
+
+    def _promote_boundary_jump_targets(self) -> int:
+        """Un ``jmp`` cuyo destino empieza tras un ``ret`` es otra función.
+
+        Ghidra trata el final de una función (``ret``, trampa o salto
+        incondicional) como frontera: lo que viene justo después no pertenece a
+        la función anterior. Si el recorrido absorbe ese destino como salto de
+        cola, la función resultante tiene una luz enorme y se traga direcciones
+        documentadas. En GXSCC.exe, ``FUN_401500`` eran 23 instrucciones entre
+        ``0x401500`` y ``0x40EEC4`` porque seguía ``jmp 0x40EE90``; al promover
+        esos destinos la función vuelve a tener dos instrucciones y ``0x40EE90``
+        es una función propia.
+        """
+        ordered = sorted(self.instructions)
+        if len(ordered) < 2:
+            return 0
+        positions = {address: index for index, address in enumerate(ordered)}
+        owned: set[int] = set()
+        for function in self.functions.values():
+            for instruction in function.instructions:
+                owned.add(instruction.address)
+        added = 0
+        for instruction in self.instructions.values():
+            if not instruction.is_jump:
+                continue
+            # Un ``jmp`` incondicional cuyo destino empieza tras un ``ret`` es un
+            # salto de cola a otra función. Un salto **condicional** sólo se
+            # acepta con dos condiciones extra (si no, la regla parte bucles: en
+            # GXSCC.exe pasaba de 46 a 454 semillas y creaba 77 funciones que
+            # empiezan por ``call``, un prólogo imposible): que el destino no
+            # pertenezca ya a una función y que su primera instrucción sea un
+            # prólogo plausible.
+            exigente = instruction.is_conditional_jump
+            target = instruction.branch_target
+            if (
+                target is None
+                or target in self.function_seeds
+                or target not in positions
+                or positions[target] == 0
+            ):
+                continue
+            previous = self.instructions.get(ordered[positions[target] - 1])
+            if previous is None:
+                continue
+            # Sólo un ``ret``/trampa marca frontera de verdad: el salto
+            # incondicional de un bucle (``jmp`` hacia atrás) no la marca, y
+            # tomarlo partiría bucles irreducibles y cuerpos con ``goto``.
+            if not (previous.is_return or previous.is_trap):
+                continue
+            if exigente:
+                first = self.instructions.get(target)
+                if first is None or first.mnemonic in {"call", "ret", "jmp", "retn"}:
+                    continue
+                if target in owned:
+                    continue
+            self._add_seed(
+                target,
+                self._name_by_address.get(target, ""),
+                "after-return jump target",
+            )
+            added += 1
+        return added
+
+    @staticmethod
+    def _writes_memory(instruction) -> bool:
+        """True si el primer operando es memoria (o sea, si la instrucción escribe)."""
+        destination = instruction.op_str.split(",", 1)[0].strip()
+        return destination.startswith("[") or " ptr [" in destination
+
+    def _promote_thunk_targets(self, rounds: int = 4) -> int:
+        """Promueve a función el destino de los thunks (incluidos los de ``this``).
+
+        VC6 genera thunks ajustadores de ``this`` (``mov ecx, <global>`` seguido
+        de ``jmp <impl>``). Sin promover su destino, el thunk absorbe todo el
+        cuerpo de la función destino y su luz crece hasta donde llegue el código.
+        """
+        added = 0
+        for _ in range(rounds):
+            nuevos: list[int] = []
+            for start in sorted(self.function_seeds):
+                if start not in self.instructions:
+                    continue
+                thunk = self._detect_thunk(start)
+                if thunk is None:
+                    continue
+                target = thunk[1]
+                if (
+                    target is None
+                    or target in self.function_seeds
+                    or target not in self.instructions
+                ):
+                    continue
+                nuevos.append(target)
+            if not nuevos:
+                break
+            for target in nuevos:
+                self._add_seed(
+                    target, self._name_by_address.get(target, ""), "thunk target"
+                )
+                added += 1
+        return added
+
+    def _promote_pointer_table_targets(self) -> bool:
+        """Crea función en los destinos de tablas de punteros (vtables).
+
+        Equivalente conservador del análisis de vtable/RTTI de Ghidra: una
+        entrada de vtable es código, y si nada lo llama directamente (sólo se
+        invoca por ``call [vtable+N]``) el barrido no lo promueve nunca. En
+        GXSCC.exe eso dejaba fuera ``0x401070`` (``InitInstance``), que está en
+        la ranura 20 (offset ``0x50``) de la tabla de ``0x443760``.
+
+        Sólo se promueven destinos que son inicio de instrucción, viven en una
+        sección ejecutable y **no** pertenecen ya al cuerpo de otra función, para
+        no fragmentar funciones bien recuperadas.
+        """
+        owned: set[int] = set()
+        for function in self.functions.values():
+            for instruction in function.instructions:
+                owned.add(instruction.address)
+        added = False
+        for table in self.address_tables:
+            if table.jump_sources:
+                # Las tablas de salto ya las enlaza `_resolve_computed_jumps`.
+                continue
+            for target in table.targets:
+                if target in self.function_seeds or target in owned:
+                    continue
+                if target not in self.instructions:
+                    continue
+                section = self.image.section_at(target)
+                if section is None or not section.executable:
+                    continue
+                self._add_seed(
+                    target, self._name_by_address.get(target, ""), "pointer table"
+                )
+                added = True
+        return added
+
+    def _promote_data_pointer_targets(self) -> bool:
+        """Crea función donde un puntero de datos apunta a código.
+
+        Equivalente al ``PointerReferenceAnalyzer`` de Ghidra: los mapas de
+        mensajes de MFC y las vtables con huecos **no** son corridas de
+        punteros consecutivos, así que ``_discover_address_tables`` no las
+        reconoce, pero cada puntero suelto a código sigue siendo una entrada de
+        función. En GXSCC.exe esto recupera ``0x4051F0`` (``Skin_OnLButtonDblClk``),
+        cuya única referencia es el puntero de datos en ``0x443A24``.
+
+        Mismo criterio conservador que las tablas de punteros: el destino debe
+        ser inicio de instrucción, vivir en una sección ejecutable y no
+        pertenecer ya al cuerpo de otra función.
+        """
+        owned: set[int] = set()
+        for function in self.functions.values():
+            for instruction in function.instructions:
+                owned.add(instruction.address)
+        added = False
+        for xref in self.xrefs:
+            if xref.kind != "data":
+                continue
+            target = xref.target
+            if target in self.function_seeds or target in owned:
+                continue
+            if target not in self.instructions:
+                continue
+            section = self.image.section_at(target)
+            if section is None or not section.executable:
+                continue
+            self._add_seed(
+                target, self._name_by_address.get(target, ""), "data pointer"
+            )
+            added = True
+        return added
 
     def _find_data_pointers(self) -> None:
         pointer_size = self.image.bits // 8
@@ -910,6 +1223,17 @@ class Analyzer:
                 return None
             mnemonic = instruction.mnemonic.lower()
             if mnemonic in {"nop", "endbr32", "endbr64"}:
+                body.append(instruction)
+                address = instruction.next_address
+                continue
+            if (
+                mnemonic in {"mov", "lea", "xor", "movzx", "movsx"}
+                and not self._writes_memory(instruction)
+            ):
+                # Thunk ajustador de ``this`` (VC6): ``mov ecx, <global>`` o
+                # ``mov ecx, [eax+4]`` seguido de ``jmp <impl>``. Ghidra los
+                # acepta como thunks porque sólo cargan registros: no escriben
+                # memoria ni llaman a nada.
                 body.append(instruction)
                 address = instruction.next_address
                 continue
